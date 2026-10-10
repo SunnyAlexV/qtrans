@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qtrans"
+version = "0.3.0"
+description = "Translate typed quant-finance Python into readable, standalone C++, and prove the translation matches."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+tools = ["mpmath"]
+
+[project.scripts]
+qtrans = "qtrans.cli:main"
+
+[tool.setuptools]
+packages = ["qtrans"]
+
+[tool.setuptools.package-data]
+qtrans = ["runtime/*.hpp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,42 @@
+# Runs the full test suite (translation, compiled semantics, every example) on Linux and Windows.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: python -m pip install numpy scipy pytest
+
+      - name: Install Eigen (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev
+
+      - name: Install Eigen (Windows, through conda, as on an Anaconda machine)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:CONDA\Scripts\conda.exe" install -y -q -c conda-forge eigen
+          "QTRANS_EIGEN=$env:CONDA\Library\include\eigen3" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Show the C++ compiler
+        run: g++ --version
+
+      - name: Run tests
+        run: python -m pytest -q
