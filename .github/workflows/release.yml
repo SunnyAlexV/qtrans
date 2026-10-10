@@ -1,0 +1,71 @@
+# Publishes qtrans to PyPI when a version tag is pushed:  git tag v0.7.0; git push origin v0.7.0
+#
+# No password or token is stored anywhere: PyPI's trusted publishing checks that the upload comes
+# from this workflow in SunnyAlexV/qtrans (the "pending publisher" registered on pypi.org).
+# Before anything is uploaded, the built package is installed in a clean environment, outside
+# the repository, and used end to end (translate, verify, bind), so a missing file can't ship.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: The tag must match the version in pyproject.toml
+        run: |
+          python - <<'EOF'
+          import os, sys, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              sys.exit(f"tag {tag} does not match pyproject.toml version {version}")
+          print(f"releasing {version}")
+          EOF
+
+      - name: Build the sdist and wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+
+      - name: Install the wheel in a clean environment and use it, outside the repository
+        run: |
+          sudo apt-get update && sudo apt-get install -y libeigen3-dev
+          python -m venv /tmp/env
+          /tmp/env/bin/pip install "$(ls dist/*.whl)[bind]"
+          mkdir /tmp/smoke && cp examples/black_scholes.py examples/instruments.py /tmp/smoke/
+          cd /tmp/smoke
+          /tmp/env/bin/qtrans translate black_scholes.py -o out
+          /tmp/env/bin/qtrans verify instruments.py --cases 50
+          /tmp/env/bin/qtrans bind instruments.py --check --cases 50
+          /tmp/env/bin/python -c "import instruments_cpp as m; print(m.Option(100.0, 95.0, 0.5, 0.2, 0.04).price())"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/qtrans/
+    permissions:
+      id-token: write  # what trusted publishing uses instead of a password
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

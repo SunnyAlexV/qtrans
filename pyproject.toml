@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,29 @@ version = "0.7.0"
 description = "Translate typed quant-finance Python into readable, standalone C++, and prove the translation matches."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sunny Vellanikaran" }]
+keywords = ["quant", "finance", "transpiler", "c++", "eigen", "numpy", "pybind11", "code generation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Compilers",
+]
 dependencies = ["numpy", "scipy"]
+
+[project.urls]
+Homepage = "https://github.com/SunnyAlexV/qtrans"
+Source = "https://github.com/SunnyAlexV/qtrans"
+Issues = "https://github.com/SunnyAlexV/qtrans/issues"
+Results = "https://github.com/SunnyAlexV/qtrans/blob/main/examples/RESULTS.md"
 
 [project.optional-dependencies]
 test = ["pytest", "mpmath", "pybind11", "setuptools"]
@@ -19,10 +41,10 @@ tools = ["mpmath"]
 qtrans = "qtrans.cli:main"
 
 [tool.setuptools]
-packages = ["qtrans"]
+packages = ["qtrans", "qtrans.runtime"]  # runtime: the C++ headers the generated code includes
 
 [tool.setuptools.package-data]
-qtrans = ["runtime/*.hpp"]
+"qtrans.runtime" = ["*.hpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
