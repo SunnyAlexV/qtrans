@@ -360,6 +360,8 @@ class FunctionTranslator(ExprTranslator):
                 continue
             if self.qualify(n.func) in lib.MATH_DOMAIN:
                 return True
+            if isinstance(n.func, ast.Name) and n.func.id in self.mod.ext_math_domain:
+                return True  # a function of another module of the project that may raise it
             if isinstance(n.func, ast.Name) and n.func.id in self.mod.fdefs and n.func.id not in seen:
                 seen.add(n.func.id)
                 if self._uses_math_domain(self.mod.fdefs[n.func.id].body, seen):

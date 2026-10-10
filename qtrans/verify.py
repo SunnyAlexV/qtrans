@@ -1,5 +1,6 @@
-"""Proof that the translation is right: run every translated function in Python and in
-compiled C++ on the same inputs and compare.
+"""Differential testing of the translation: run every translated function in Python and in
+compiled C++ on the same inputs and compare. Agreement on every case run is strong evidence,
+not a proof: no finite set of cases rules out a difference elsewhere.
 
 How the comparison stays exact
   * Inputs go to C++ as hexadecimal floats (float.hex), outputs come back via printf("%a").
@@ -13,8 +14,8 @@ Outcome of each test case
   ill-cond  values differ by more than rtol, but by no more than 100x the amount Python's
             own answer moves when the inputs are nudged by 4 ULPs. The problem itself is
             ill-conditioned there (e.g. inverting a nearly singular matrix), so last-bit
-            differences between NumPy/LAPACK and Eigen are amplified; agreement to the
-            problem's own precision is all any two correct implementations can reach.
+            differences between NumPy/LAPACK and Eigen are amplified: two backward-stable
+            implementations can differ by that much (a higher-precision one could do better).
   known     Python raised one of the float errors IEEE-754 arithmetic doesn't raise
             (ZeroDivisionError, OverflowError, math domain error) and C++ returned a
             value. Listed in the README as a deliberate difference.
@@ -136,6 +137,8 @@ class FunctionCheck:
 
     rtol: float = 0.0
     atol: float = 0.0
+    key: str = ""      # how the driver names it ("module:function" in a project)
+    module: str = ""
 
     @property
     def max_rel_err(self):
@@ -580,48 +583,66 @@ _RNG_IO = r"""static void out(qt::Rng& g) {  // the generator's next raw output:
 }"""
 
 
-def driver_source(result: TranslationResult, header_name: str, namespace: str) -> str:
+def driver_source(result, header_name=None, namespace=None, targets=None) -> str:
+    """The test driver: one program for a module, or for a whole project (result a
+    ProjectResult: every header included, the functions of `targets` callable as
+    "module:function", every class of the project readable)."""
+    if isinstance(result, TranslationResult):
+        modules = {result.module: (result, namespace or result.namespace)}
+        headers = [header_name or f"{result.module}.hpp"]
+        classes = [(info, namespace or result.namespace) for info in (result.classes or {}).values()]
+        single = True
+    else:
+        modules = {m: (r, r.namespace) for m, r in result.modules.items() if targets is None or m in targets}
+        headers = [f"{m}.hpp" for m in result.modules]
+        classes = [(info, result.modules[m].namespace) for _, (info, m) in result.classes().items()]
+        single = False
     branches = []
-    for name, sig in result.signatures.items():
-        if sig.owner:
-            continue  # methods are exercised through the functions that call them
-        if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params):
-            continue
-        # read arguments into named locals first: C++ doesn't fix the order in which a
-        # call's arguments are evaluated, and the reader consumes tokens in sequence
-        def read(i, p, volatile):
-            if p.type == RNG:
-                return f"qt::Rng p{i}(I(r));"
-            if isinstance(p.type, (OptionalType, StructType)):
-                return f"auto p{i} = {_reader(p.type, namespace)};"
-            if volatile and p.type in _CTYPE:
-                return f"volatile {_CTYPE[p.type]} p{i} = {_PARSE[p.type]}(r);"
-            return f"auto p{i} = {_PARSE[p.type]}(r);"
-        reads = " ".join(read(i, p, False) for i, p in enumerate(sig.params))
-        vreads = " ".join(read(i, p, True) for i, p in enumerate(sig.params))
-        args = ", ".join(f"p{i}" for i in range(len(sig.params)))
-        opaque = "".join(f"qtrans_opaque(p{i}); " for i, p in enumerate(sig.params) if p.type not in _CTYPE)
-        refs = "".join(f" out(p{i});" for i, p in enumerate(sig.params) if p.mode == "ref")
-        call = f"{namespace}::{sig.cpp}({args})"
-        if sig.ret.cpp() == "void":
-            do_call = f'{call}; std::printf("OK");{refs} std::printf("\\n");'
-            do_bench = f"bench([&] {{ {opaque}{call}; return 0.0; }});"
-        else:
-            do_call = f'auto res = {call}; std::printf("OK"); out(res);{refs} std::printf("\\n");'
-            do_bench = f"bench([&] {{ {opaque}return {call}; }});"
-        branches.append(
-            f'            if (fn == "{name}") {{\n'
+    for module, (res, namespace) in modules.items():
+        for name, sig in res.signatures.items():
+            if sig.owner:
+                continue  # methods are exercised through the functions that call them
+            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params):
+                continue
+            branches.append(_branch(name if single else f"{module}:{name}", sig, namespace))
+    uses_arrays = any(r.uses_arrays for r, _ in modules.values()) if single else result.uses_arrays
+    uses_random = any(r.uses_random for r, _ in modules.values()) if single else result.uses_random
+    io = (_ARRAY_IO if uses_arrays else "") + ("\n" + _RNG_IO if uses_random else "")
+    io += _struct_io(classes)
+    return (_DRIVER_PRELUDE.replace('#include "@@HEADER@@"', "\n".join(f'#include "{h}"' for h in headers))
+            .replace("@@ARRAY_IO@@", io)
+            .replace("@@ARRAY_CATCH@@", '\n        catch (const qt::shape_error&) { std::printf("EXC ShapeError\\n"); }'
+                     if uses_arrays else "")
+            .replace("@@BRANCHES@@", "\n".join(branches)))
+
+
+def _branch(key, sig, namespace) -> str:
+    # read arguments into named locals first: C++ doesn't fix the order in which a
+    # call's arguments are evaluated, and the reader consumes tokens in sequence
+    def read(i, p, volatile):
+        if p.type == RNG:
+            return f"qt::Rng p{i}(I(r));"
+        if isinstance(p.type, (OptionalType, StructType)):
+            return f"auto p{i} = {_reader(p.type, namespace)};"
+        if volatile and p.type in _CTYPE:
+            return f"volatile {_CTYPE[p.type]} p{i} = {_PARSE[p.type]}(r);"
+        return f"auto p{i} = {_PARSE[p.type]}(r);"
+    reads = " ".join(read(i, p, False) for i, p in enumerate(sig.params))
+    vreads = " ".join(read(i, p, True) for i, p in enumerate(sig.params))
+    args = ", ".join(f"p{i}" for i in range(len(sig.params)))
+    opaque = "".join(f"qtrans_opaque(p{i}); " for i, p in enumerate(sig.params) if p.type not in _CTYPE)
+    refs = "".join(f" out(p{i});" for i, p in enumerate(sig.params) if p.mode == "ref")
+    call = f"{namespace}::{sig.cpp}({args})"
+    if sig.ret.cpp() == "void":
+        do_call = f'{call}; std::printf("OK");{refs} std::printf("\\n");'
+        do_bench = f"bench([&] {{ {opaque}{call}; return 0.0; }});"
+    else:
+        do_call = f'auto res = {call}; std::printf("OK"); out(res);{refs} std::printf("\\n");'
+        do_bench = f"bench([&] {{ {opaque}return {call}; }});"
+    return (f'            if (fn == "{key}") {{\n'
             f'                if (mode == "CALL") {{ {reads} {do_call} }}\n'
             f'                else {{ {vreads} {do_bench} }}\n'
             f'            }} else')
-    arrays = result.uses_arrays
-    io = (_ARRAY_IO if arrays else "") + ("\n" + _RNG_IO if result.uses_random else "")
-    io += _struct_io(result, namespace)
-    return (_DRIVER_PRELUDE.replace("@@HEADER@@", header_name)
-            .replace("@@ARRAY_IO@@", io)
-            .replace("@@ARRAY_CATCH@@", '\n        catch (const qt::shape_error&) { std::printf("EXC ShapeError\\n"); }'
-                     if arrays else "")
-            .replace("@@BRANCHES@@", "\n".join(branches)))
 
 
 def _reader(t, ns, r="r") -> str:
@@ -629,33 +650,32 @@ def _reader(t, ns, r="r") -> str:
     if t == RNG:  # inside an object: the generator's exact state (read in order: see RngState)
         return f"RngState({r})"
     if isinstance(t, StructType):
-        return f"read_{t.cpp_name}({r})"
+        return f"read_{t.name}({r})"  # class names are unique across a project
     if isinstance(t, OptionalType):
         inner = t.inner
         return (f"qtrans_optional<{inner.cpp()}>({r}, [](Reader& rr) {{ return {_reader(inner, ns, 'rr')}; }})")
     return f"{_PARSE[t]}({r})"
 
 
-def _struct_io(result, ns) -> str:
-    """read_X / out / num for every class: the fields in declaration order, the object rebuilt
-    through its constructor (so __post_init__ runs, as when Python built it), then any
-    init=False fields set to Python's values."""
-    classes = result.classes or {}
+def _struct_io(classes) -> str:
+    """read_X / out / num for every class (classes: [(ClassInfo, its namespace)]): the fields in
+    declaration order, the object rebuilt through its constructor (so __post_init__ runs, as when
+    Python built it), then any init=False fields set to Python's values."""
     if not classes:
         return ""
     lines = ["", "// objects: fields in declaration order"]
-    if any(f.type == RNG for info in classes.values() for f in info.fields):
+    if any(f.type == RNG for info, _ in classes for f in info.fields):
         # four separate statements: C++ doesn't fix the order of a call's arguments, so
         # from_state(U(r), U(r), ...) could read them in any order (GCC goes right to left)
         lines += ["static qt::Rng RngState(Reader& r) {",
                   "    const std::uint64_t sh = U(r);", "    const std::uint64_t sl = U(r);",
                   "    const std::uint64_t ih = U(r);", "    const std::uint64_t il = U(r);",
                   "    return qt::Rng::from_state(sh, sl, ih, il);", "}"]
-    for info in classes.values():
-        lines.append(f"static {ns}::{info.cpp} read_{info.cpp}(Reader& r);")
-    for info in classes.values():
+    for info, ns in classes:
+        lines.append(f"static {ns}::{info.cpp} read_{info.name}(Reader& r);")
+    for info, ns in classes:
         c = f"{ns}::{info.cpp}"
-        body = [f"static {c} read_{info.cpp}(Reader& r) {{"]
+        body = [f"static {c} read_{info.name}(Reader& r) {{"]
         for k, f in enumerate(info.fields):
             body.append(f"    auto f{k} = {_reader(f.type, ns)};")
         if info.plain:  # Python already ran __init__: set the fields it produced
@@ -889,71 +909,169 @@ def python_sensitivity(fn, case, sig, out_t, rng, trials=3, normwise_too=False):
 # --- main entry point ----------------------------------------------------------------------------
 def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
                 compiler=None, build_dir=None, eigen=None) -> VerifyReport:
-    path = Path(path)
+    """Translate, compile and check one module. The project modules it imports are translated
+    and compiled with it (their own functions are checked by verifying them)."""
+    rep = verify_project([path], n_random, seed, rtol, atol, bench, compiler, build_dir, eigen)
+    return rep.modules[Path(path).resolve().stem]
+
+
+@dataclass
+class ProjectVerifyReport:
+    modules: dict  # module -> VerifyReport
+
+    @property
+    def ok(self):
+        return all(r.ok for r in self.modules.values())
+
+    @property
+    def mismatches(self):
+        return [c for r in self.modules.values() for c in r.mismatches]
+
+    def to_text(self) -> str:
+        return "\n\n".join(r.to_text() for r in self.modules.values())
+
+
+def load_project(project):
+    """The Python modules of a project, imported the way they import each other (by name, from
+    their folder), so a class is the same class wherever it is used. -> {module: module object}"""
+    if len(project.modules) == 1:
+        (name, path), = project.paths.items()
+        return {name: load_module(path)}
+    def package_of(p):  # a folder with __init__.py is a package: its modules import as pkg.mod
+        folder = Path(p).parent
+        return folder.name if (folder / "__init__.py").exists() else None
+    folders = set()
+    for name, p in project.paths.items():
+        pkg = package_of(p)
+        folders.add(str(Path(p).parent.parent if pkg else Path(p).parent))
+        for key in [k for k in sys.modules if k == name or (pkg and (k == pkg or k.startswith(pkg + ".")))]:
+            sys.modules.pop(key, None)  # a module of that name from another folder (or an older run)
+    sys.path[:0] = sorted(folders)
+    try:
+        return {name: importlib.import_module(f"{package_of(p)}.{name}" if package_of(p) else name)
+                for name, p in ((n, project.paths[n]) for n in project.order)}
+    finally:
+        for f in folders:
+            sys.path.remove(f)
+
+
+def setup_inputs(project, pymods):
+    """Point the input generators at this project: its string literals, its classes."""
+    global _STRINGS, _CLASSES, _INIT_PARAMS
+    lits = set()
+    for p in project.paths.values():
+        lits |= {n.value for n in ast.walk(ast.parse(Path(p).read_text(encoding="utf-8")))
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 80}
+    _STRINGS = sorted(lits) + ["", "no such option"]
+    _CLASSES = {n: (info, getattr(pymods[m], n)) for n, (info, m) in project.classes().items()}
+    _INIT_PARAMS = {n: project.modules[m].signatures[f"{n}.__init__"].params
+                    for n, (info, m) in project.classes().items() if info.plain}
+
+
+def module_cases(project, module, pymod) -> tuple[dict, dict]:
+    """The hand-picked cases and tolerances for a module: QTRANS_CASES / QTRANS_TOLERANCE in the
+    module itself, plus those for it in a qtrans_cases.py next to it."""
+    from .project import project_cases
+    given = dict(getattr(pymod, "QTRANS_CASES", {}) or {})
+    tolerances = dict(getattr(pymod, "QTRANS_TOLERANCE", {}) or {})
+    extra_cases, extra_tol = project_cases(Path(project.paths[module]).parent)
+    for name, cases in (extra_cases.get(module) or {}).items():
+        given[name] = list(given.get(name, [])) + list(cases)
+    tolerances.update(extra_tol.get(module) or {})
+    return given, tolerances
+
+
+def project_lapack_functions(project) -> set:
+    """lapack_functions across modules (a function calling an imported one that uses LAPACK)."""
+    direct, calls = set(), {}
+    for p in project.paths.values():
+        tree = ast.parse(Path(p).read_text(encoding="utf-8"))
+        for f in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
+            if any(isinstance(n, ast.Attribute) and n.attr in _LAPACK for n in ast.walk(f)):
+                direct.add(f.name)
+            calls.setdefault(f.name, set()).update(
+                n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+                for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute)))
+    out, changed = set(direct), True
+    while changed:
+        changed = False
+        for name, cs in calls.items():
+            if name not in out and cs & out:
+                out.add(name)
+                changed = True
+    return out
+
+
+def verify_project(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
+                   compiler=None, build_dir=None, eigen=None, all_modules=False) -> ProjectVerifyReport:
+    """Translate the given files (and the project modules they import), compile one driver for
+    all of them, and check the functions of the given files (all_modules=True: of every module)."""
+    from .project import translate_project
     build = Path(build_dir) if build_dir else Path(tempfile.mkdtemp(prefix="qtrans_"))
     build.mkdir(parents=True, exist_ok=True)
-    result = translate_file(path, build)
-    module = load_module(path)
-    global _STRINGS
-    lits = sorted({n.value for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-                   if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 80})
-    _STRINGS = lits + ["", "no such option"]
-    global _CLASSES
-    _CLASSES = {n: (info, getattr(module, n)) for n, info in (result.classes or {}).items()}
-    global _INIT_PARAMS
-    _INIT_PARAMS = {n: result.signatures[f"{n}.__init__"].params for n, info in (result.classes or {}).items()
-                    if info.plain}
-    given = getattr(module, "QTRANS_CASES", {}) or {}
-    tolerances = getattr(module, "QTRANS_TOLERANCE", {}) or {}
+    project = translate_project(paths, build)
+    targets = list(project.order) if all_modules else project.requested
+    pymods = load_project(project)
+    setup_inputs(project, pymods)
+    single = len(project.modules) == 1
     rng = np.random.default_rng(seed)
 
-    checks = []
-    for name, sig in result.signatures.items():
-        if sig.owner:
-            continue  # methods are checked through the functions that use them
-        if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params):
-            continue
-        tol = tolerances.get(name, rtol)
-        f_rtol, f_atol = (tol, atol) if isinstance(tol, (int, float)) else tuple(tol)
-        fc = FunctionCheck(name, rtol=f_rtol, atol=f_atol)
-        fn = getattr(module, name)
-        defaults = [p.default for p in inspect.signature(fn).parameters.values()]
-        for args in given.get(name, []):
-            args = list(args)
-            # cases may leave out trailing arguments that have defaults
-            for i in range(len(args), len(sig.params)):
-                if defaults[i] is inspect.Parameter.empty:
-                    raise ValueError(f"QTRANS_CASES['{name}'] has a case with {len(args)} arguments "
-                                     f"but '{sig.params[i].name}' has no default")
-                args.append(defaults[i])
-            if len(args) != len(sig.params):
-                raise ValueError(f"QTRANS_CASES['{name}'] has a case with {len(args)} arguments; "
-                                 f"{name}() takes {len(sig.params)}")
-            args = tuple(_py_value(a, p.type) for a, p in zip(args, sig.params))
-            fc.cases.append(Case(name, args, "given"))
-        for _ in range(n_random):
-            n = 0 if rng.random() < 0.05 else int(rng.integers(1, 7))
-            try:
-                args = tuple(random_value(rng, p.type, n) for p in sig.params)
-            except _CantBuild:
-                continue  # an object its own checks refuse for every draw tried
-            fc.cases.append(Case(name, args, "random"))
-        for c in fc.cases:
-            c.py = run_python(fn, c.args, sig)
-        checks.append(fc)
+    checks = {m: [] for m in targets}
+    for module in targets:
+        result, pymod = project.modules[module], pymods[module]
+        given, tolerances = module_cases(project, module, pymod)
+        for name, sig in result.signatures.items():
+            if sig.owner:
+                continue  # methods are checked through the functions that use them
+            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params):
+                continue
+            tol = tolerances.get(name, rtol)
+            f_rtol, f_atol = (tol, atol) if isinstance(tol, (int, float)) else tuple(tol)
+            fc = FunctionCheck(name, rtol=f_rtol, atol=f_atol)
+            fc.key = name if single else f"{module}:{name}"
+            fc.module = module
+            fn = getattr(pymod, name)
+            defaults = [p.default for p in inspect.signature(fn).parameters.values()]
+            for args in given.get(name, []):
+                args = list(args)
+                # cases may leave out trailing arguments that have defaults
+                for i in range(len(args), len(sig.params)):
+                    if defaults[i] is inspect.Parameter.empty:
+                        raise ValueError(f"QTRANS_CASES['{name}'] has a case with {len(args)} arguments "
+                                         f"but '{sig.params[i].name}' has no default")
+                    args.append(defaults[i])
+                if len(args) != len(sig.params):
+                    raise ValueError(f"QTRANS_CASES['{name}'] has a case with {len(args)} arguments; "
+                                     f"{name}() takes {len(sig.params)}")
+                args = tuple(_py_value(a, p.type) for a, p in zip(args, sig.params))
+                fc.cases.append(Case(name, args, "given"))
+            for _ in range(n_random):
+                n = 0 if rng.random() < 0.05 else int(rng.integers(1, 7))
+                try:
+                    args = tuple(random_value(rng, p.type, n) for p in sig.params)
+                except _CantBuild:
+                    continue  # an object its own checks refuse for every draw tried
+                fc.cases.append(Case(name, args, "random"))
+            for c in fc.cases:
+                c.py = run_python(fn, c.args, sig)
+            checks[module].append(fc)
 
-    # compile the driver
+    # compile one driver for everything
     cxx = find_compiler(compiler)
-    ns = result.header.split("namespace ", 1)[1].split(" ", 1)[0]
     driver = build / "qtrans_driver.cpp"
-    driver.write_text(driver_source(result, f"{path.stem}.hpp", ns), encoding="utf-8")
+    if single:
+        (module, result), = project.modules.items()
+        src = driver_source(result, f"{module}.hpp", result.namespace)
+    else:
+        src = driver_source(project, targets=targets)
+    driver.write_text(src, encoding="utf-8")
     if not (build / "qtrans_runtime.hpp").exists():
         shutil.copy(RUNTIME_HEADER, build / "qtrans_runtime.hpp")
     system = []
-    if result.uses_arrays:
+    if project.uses_arrays:
         shutil.copy(ARRAYS_HEADER, build / "qtrans_arrays.hpp")
         system.append(find_eigen(eigen))
-    if result.uses_random:
+    if project.uses_random:
         shutil.copy(RANDOM_HEADER, build / "qtrans_random.hpp")
     exe = build / ("qtrans_driver.exe" if os.name == "nt" else "qtrans_driver")
     cmd = cxx.command(driver, exe, build, system)
@@ -961,51 +1079,59 @@ def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
     if proc.returncode != 0:
         raise RuntimeError(f"C++ compilation failed:\n{' '.join(cmd)}\n{proc.stderr}{proc.stdout}")
     diagnostics = (proc.stderr + proc.stdout).splitlines()
-    warns = [w.strip() for w in diagnostics if "warning" in w.lower() and f"{path.stem}.hpp" in w]
 
     # run every case in one process
     lines, index = [], []
-    for fc in checks:
-        sig = result.signatures[fc.name]
-        for c in fc.cases:
-            enc = " ".join(_encode(v, p.type) for v, p in zip(c.args, sig.params))
-            lines.append(f"CALL {fc.name} {enc}")
-            index.append((fc, c))
-    run = subprocess.run([str(exe)], input="\n".join(lines) + "\n", capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+    for module in targets:
+        sigs = project.modules[module].signatures
+        for fc in checks[module]:
+            for c in fc.cases:
+                enc = " ".join(_encode(v, p.type) for v, p in zip(c.args, sigs[fc.name].params))
+                lines.append(f"CALL {fc.key} {enc}")
+                index.append((fc, c))
+    run = subprocess.run([str(exe)], input="\n".join(lines) + "\n", capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=600)
     outputs = run.stdout.splitlines()
     if len(outputs) != len(lines):
         raise RuntimeError(f"C++ driver produced {len(outputs)} results for {len(lines)} cases "
                            f"(exit code {run.returncode}): {run.stderr[-500:]}")
     nudge_rng = np.random.default_rng(seed + 1)
-    normwise = lapack_functions(path)
+    normwise = lapack_functions(project.paths[targets[0]]) if single else project_lapack_functions(project)
     for (fc, c), outline in zip(index, outputs):
-        sig = result.signatures[fc.name]
+        sig = project.modules[fc.module].signatures[fc.name]
         c.cpp = _parse_cpp_line(outline, output_type(sig))
         classify(c, output_type(sig), fc.rtol, fc.atol)
         if c.outcome == "mismatch" and c.py[0] == "ok" and c.cpp[0] == "ok":
-            c.sensitivity = python_sensitivity(getattr(module, fc.name), c, sig, output_type(sig), nudge_rng,
-                                               normwise_too=fc.name in normwise)
+            c.sensitivity = python_sensitivity(getattr(pymods[fc.module], fc.name), c, sig, output_type(sig),
+                                               nudge_rng, normwise_too=fc.name in normwise)
             if c.rel_err <= 100 * c.sensitivity:
                 c.outcome = "illcond"
 
     if bench:
-        for fc in checks:
-            # time a representative call: a hand-picked case if there is one, else the random case
-            # with the most data (the first random case can be an empty array)
-            ok = [c for c in fc.cases if c.py[0] == "ok" and c.cpp[0] == "ok"]
-            pool = [c for c in ok if c.source == "given"] or ok
-            case = max(pool, key=lambda c: sum(np.size(a) for a in c.args if isinstance(a, np.ndarray)),
-                       default=None)
-            if case is None:
-                continue
-            fn = getattr(module, fc.name)
-            fc.py_ns = _bench_python(fn, _call_args(case.args, result.signatures[fc.name]))
-            sig = result.signatures[fc.name]
-            enc = " ".join(_encode(v, p.type) for v, p in zip(case.args, sig.params))
-            r = subprocess.run([str(exe)], input=f"BENCH {fc.name} {enc}\n", capture_output=True, text=True, encoding="utf-8", errors="replace")
-            fc.cpp_ns = float(r.stdout.split()[1])
+        for module in targets:
+            sigs = project.modules[module].signatures
+            for fc in checks[module]:
+                # time a representative call: a hand-picked case if there is one, else the random
+                # case with the most data (the first random case can be an empty array)
+                ok = [c for c in fc.cases if c.py[0] == "ok" and c.cpp[0] == "ok"]
+                pool = [c for c in ok if c.source == "given"] or ok
+                case = max(pool, key=lambda c: sum(np.size(a) for a in c.args if isinstance(a, np.ndarray)),
+                           default=None)
+                if case is None:
+                    continue
+                fn = getattr(pymods[module], fc.name)
+                fc.py_ns = _bench_python(fn, _call_args(case.args, sigs[fc.name]))
+                enc = " ".join(_encode(v, p.type) for v, p in zip(case.args, sigs[fc.name].params))
+                r = subprocess.run([str(exe)], input=f"BENCH {fc.key} {enc}\n", capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace")
+                fc.cpp_ns = float(r.stdout.split()[1])
 
-    return VerifyReport(str(path), result, f"{Path(cxx.path).name}", " ".join(cmd), warns, checks, rtol, atol)
+    reports = {}
+    for module in targets:
+        warns = [w.strip() for w in diagnostics if "warning" in w.lower() and f"{module}.hpp" in w]
+        reports[module] = VerifyReport(str(project.paths[module]), project.modules[module], f"{Path(cxx.path).name}",
+                                       " ".join(cmd), warns, checks[module], rtol, atol)
+    return ProjectVerifyReport(reports)
 
 
 def _bench_python(fn, args):

@@ -53,6 +53,53 @@ def test_semantics_module_matches_python(built):
     assert set(r.extension.binder.bound) >= {"scale_inplace", "draws", "solve2", "maybe", "add_into"}
 
 
+# --- projects (several modules) ----------------------------------------------------------------------
+PROJECT = DATA / "project"
+
+
+def test_project_bindings_match_python(built):
+    r = _check(built, PROJECT / "book.py", n=60)
+    ext = r.extension
+    assert not ext.single and ext.name == "book_cpp"
+    assert {c.name.split(".")[0] for c in r.checks} == {"book"}  # the module asked for
+    from qtrans.bind import check_bindings
+    r_all = check_bindings(PROJECT / "book.py", n_random=40, ext=ext, all_modules=True)
+    assert r_all.ok, r_all.to_text()
+    assert {c.name.split(".")[0] for c in r_all.checks} == {"rates", "core", "book"}
+
+
+def test_project_extension_layout(built):
+    import sys
+    m = built(PROJECT / "book.py").load()
+    subs = m._qtrans_submodules
+    rates, core = subs["rates"], subs["core"]
+    assert m.book(100.0, np.ones(3)) == subs["book"].book(100.0, np.ones(3))  # the module asked for, at the top
+    assert sys.modules["book_cpp.core"] is core                               # import book_cpp.core works
+    assert core.discount is rates.discount                                    # imported names are the same objects
+    assert core.Option is rates.Option and core.Portfolio is rates.Portfolio
+    p = m.fresh(4)
+    assert type(p) is rates.Portfolio                                         # one Python type project-wide
+    assert m.strike_of(rates.Option(1.0, 2.0, 3.0)) == 2.0
+
+
+def test_project_objects_cross_modules(built):
+    import rates as py_rates
+    m = built(PROJECT / "book.py").load()
+    core = m._qtrans_submodules["core"]
+    p = py_rates.Portfolio(np.array([1.0, 2.0]), 1.0)                         # your Python object, from rates
+    w0 = p.w
+    assert core.grow(p, np.array([1.0, 1.0]), 2.0) == 7.0
+    assert p.w.tolist() == [2.0, 4.0] and w0 is p.w                           # scaled in place, as in Python
+    w = np.array([1.0, 3.0])
+    core.weights(w)                                                           # rates.normalise, through core
+    assert w.tolist() == [0.25, 0.75]
+
+
+def test_real_app_project_bindings_match_python(built):
+    r = _check(built, EXAMPLES / "bl_app", n=60)
+    assert len(r.extension.bound) == 22 and r.extension.name == "bl_app_cpp"
+
+
 # --- arrays ---------------------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def sem(built):
@@ -230,7 +277,7 @@ def test_wrong_object_type_is_a_type_error(inst):
 @pytest.fixture(autouse=True, scope="module")
 def _python_modules_importable():
     import sys
-    sys.path[:0] = [str(DATA), str(EXAMPLES)]
+    sys.path[:0] = [str(DATA), str(EXAMPLES), str(PROJECT)]
     yield
-    for p in (str(DATA), str(EXAMPLES)):
+    for p in (str(DATA), str(EXAMPLES), str(PROJECT)):
         sys.path.remove(p)

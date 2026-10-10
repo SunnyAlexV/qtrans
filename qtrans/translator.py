@@ -27,7 +27,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, assignable, is_array)
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
 # code. Reported once per module instead of under every function.
@@ -63,6 +63,7 @@ class Signature:
     owner: str | None = None        # the class, for a method
     kind: str = "function"          # or "instance", "property", "static", "class", "post_init"
     const: bool = False             # a method that doesn't modify self
+    module: str | None = None       # imported from this module of the project (multi-module)
 
 
 @dataclass
@@ -70,6 +71,8 @@ class Constant:
     cpp: str
     type: object
     code: str
+    external: bool = False          # imported from another module of the project: not rendered here
+    lineno: int = 0                 # where it is assigned (its comments are carried over)
 
 
 @dataclass
@@ -82,11 +85,14 @@ class TranslationResult:
     uses_arrays: bool = False
     uses_random: bool = False
     classes: dict = None   # name -> classes.ClassInfo, translated classes only (stage 5)
+    namespace: str = ""    # the C++ namespace
+    deps: list = None      # modules of the project this one imports (their headers are included)
 
 
 def _collect_comments(source):
     """Python's AST drops comments; tokenize keeps them, so they can be carried over."""
     full, inline = {}, {}
+    cols = {}  # line -> (column of its end-of-line comment, the line that comment belongs to)
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     except (tokenize.TokenError, IndentationError, SyntaxError):
@@ -101,9 +107,16 @@ def _collect_comments(source):
         if line == 1 and text.startswith("!"):
             continue  # shebang
         if tok.line[:tok.start[1]].strip() == "":
+            prev = cols.get(line - 1)
+            if prev is not None and prev[0] == tok.start[1]:
+                # lined up under the previous line's end-of-line comment: its continuation
+                inline[prev[1]] += " " + text
+                cols[line] = (tok.start[1], prev[1])
+                continue
             full[line] = text
         else:
             inline[line] = text
+            cols[line] = (tok.start[1], line)
     return full, inline
 
 
@@ -112,7 +125,9 @@ class _ConstTranslator(ExprTranslator):
 
 
 class ModuleTranslator:
-    def __init__(self, source: str, module_name: str, filename: str = "<input>"):
+    def __init__(self, source: str, module_name: str, filename: str = "<input>", deps: dict | None = None):
+        """deps: the already-translated modules of the project (name -> ModuleTranslator) that
+        this one may import from; see project.py."""
         self.source = source
         self.module_name = module_name
         self.filename = filename
@@ -130,6 +145,17 @@ class ModuleTranslator:
         self.returns_alias: dict = {}      # function -> indices of array params it may return
         self.errstate_funcs: set[str] = set()
         self.classes: dict = {}            # name -> classes.ClassInfo (stage 5)
+        # multi-module projects (0.8)
+        self.deps: dict = dict(deps or {})
+        ns = cpp_ident(re.sub(r"\W", "_", module_name) or "module")
+        self.ns = "m_" + ns if ns[0].isdigit() else ns
+        self.imported: dict = {}           # local name -> (owner module, name there, kind)
+        self.module_aliases: dict = {}     # `import bl_core as C` -> {"C": "bl_core"}
+        self.project_deps: list = []       # project modules imported (their headers are included)
+        self.ext_modified: dict = {}       # imported function / method -> parameters it modifies
+        self.ext_math_domain: set = set()  # imported functions that may raise a math domain error
+        self.class_owner: dict = {}        # class name -> namespace of the module defining it
+        self.translated: set = set()       # after translate(): the names that got a body
 
     # --- annotations -----------------------------------------------------------------
     def parse_annotation(self, node, allow_void=False):
@@ -178,6 +204,7 @@ class ModuleTranslator:
 
     # --- classes (stage 5) -------------------------------------------------------------
     def _register_class(self, node):
+        self.class_owner[node.name] = self.module_name
         if any(isinstance(b, ast.Name) and (b.id.endswith("Error") or b.id.endswith("Exception")) for b in node.bases):
             self.report.module_notes.append(f"line {node.lineno}: exception class `{node.name}` skipped "
                                             "(raise ValueError / RuntimeError instead)")
@@ -195,19 +222,20 @@ class ModuleTranslator:
 
     def _collect_classes(self):
         """Fields, defaults and method signatures of every class, once all names are known."""
-        for info in self.classes.values():
+        own = [i for i in self.classes.values() if not i.external]
+        for info in own:
             if info.rejected is None:
                 try:
                     cls_.collect_class_body(self, info)
                 except Unsupported as e:
                     info.rejected = e
-        for info in self.classes.values():
+        for info in own:
             if info.rejected is None:
                 try:
                     cls_.check_field_types(self, info)
                 except Unsupported as e:
                     info.rejected = e
-        for info in self.classes.values():  # method signatures (a plain class's __init__ types its fields)
+        for info in own:  # method signatures (a plain class's __init__ types its fields)
             if info.rejected is not None:
                 continue
             try:
@@ -219,7 +247,7 @@ class ModuleTranslator:
                     self.sigs[m.key] = self.method_signature(info, m)
             except Unsupported as e:
                 info.rejected = e
-        for info in self.classes.values():
+        for info in own:
             if info.rejected is None:
                 try:
                     if info.plain:
@@ -228,16 +256,16 @@ class ModuleTranslator:
                 except Unsupported as e:
                     info.rejected = e
         try:
-            self.class_order = cls_.struct_order({n: c for n, c in self.classes.items()
-                                                  if c.rejected is None and all(f.type is not None for f in c.fields)})
+            self.class_order = cls_.struct_order({n: c for n, c in self.classes.items() if not c.external and
+                                                  c.rejected is None and all(f.type is not None for f in c.fields)})
         except Unsupported as e:
-            for c in self.classes.values():
+            for c in own:
                 c.rejected = c.rejected or e
             self.class_order = []
         changed = True
         while changed:  # a class holding a rejected class is rejected too
             changed = False
-            for info in self.classes.values():
+            for info in own:
                 if info.rejected is not None:
                     continue
                 for f in info.fields:
@@ -247,7 +275,7 @@ class ModuleTranslator:
                                                                f"not be translated: {self.classes[t.name].rejected.message}")
                         changed = True
                         break
-        for info in self.classes.values():
+        for info in own:
             if info.rejected is not None:
                 for m in info.methods.values():
                     self.fdefs.pop(m.key, None)
@@ -357,6 +385,232 @@ class ModuleTranslator:
                     return b
         return None
 
+    # --- multi-module projects (0.8) -------------------------------------------------------
+    def _import_project(self) -> set:
+        """Names imported from other modules of the project: `from m import f, g as h`,
+        `from m import *`, `import m` / `import m as alias` (then `alias.f`), `from . import m`,
+        `from .m import f`. Each becomes a function, class or constant of that module, seen
+        from here: C++ calls go to m::f, types are m::Option. Returns the import statements
+        handled here (the others are library imports)."""
+        handled = set()
+        # names defined here: a namespace of the same name is then reached as ::name
+        self._own_top = {n.name for n in self.tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))} | {
+            t.id for n in self.tree.body if isinstance(n, (ast.Assign, ast.AnnAssign))
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) if isinstance(t, ast.Name)}
+        for node in self.tree.body:
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name in self.deps:
+                        self.module_aliases[a.asname or a.name] = a.name
+                        self._dep(a.name)
+            elif isinstance(node, ast.ImportFrom) and node.level <= 1:
+                if node.level == 1 and node.module is None:  # from . import m
+                    mods = [a for a in node.names if a.name in self.deps]
+                    if mods and len(mods) == len(node.names):
+                        handled.add(id(node))
+                        for a in mods:
+                            self.module_aliases[a.asname or a.name] = a.name
+                            self._dep(a.name)
+                    continue
+                if node.module not in self.deps:
+                    continue
+                handled.add(id(node))
+                self._dep(node.module)
+                for a in node.names:
+                    if a.name == "*":
+                        self._import_star(node.module, node)
+                    else:
+                        self._import_name(a.asname or a.name, node.module, a.name, node)
+        if self.module_aliases:
+            self._rewrite_module_attributes()
+        return handled
+
+    def _q(self, ns):
+        """How this module names another module's namespace."""
+        return f"::{ns}" if ns in getattr(self, "_own_top", ()) else ns
+
+    def _dep(self, module):
+        if module not in self.project_deps:
+            self.project_deps.append(module)
+
+    def _import_star(self, module, node):
+        dep = self.deps[module]
+        names = dep.public_names()
+        for name in names:
+            self._import_name(name, module, name, node)
+        for alias, q in dep.imports.items():  # what it imported from libraries comes along too
+            if not alias.startswith("_") and (dep.all_names is None or alias in dep.all_names):
+                self.imports.setdefault(alias, q)
+        for alias, m in dep.module_aliases.items():
+            if not alias.startswith("_"):
+                self.module_aliases.setdefault(alias, m)
+
+    def _import_name(self, local, module, name, node):
+        entry = self.deps[module].namespace.get(name)
+        if entry is None:
+            self.report.module_notes.append(f"line {node.lineno}: {module} has no translatable name '{name}'")
+            return
+        kind, owner, oname = entry
+        o = self.deps[owner]
+        self.class_owner.update(o.class_owner)
+        if kind == "class":
+            if local != oname:
+                self.skipped_globals[local] = f"class {oname} is imported under another name; import it as {oname}"
+                return
+            self._import_class(o, oname)
+        elif kind == "function":
+            if oname in o.translated:
+                sig = self._from_module(o.sigs[oname], o, qualify=True)
+                sig.module = owner
+                self.sigs[local] = sig
+                self.ext_modified[local] = set(o.modified.get(oname, ()))
+                if oname in o.returns_alias:
+                    self.returns_alias[local] = set(o.returns_alias[oname])
+                if oname in o.math_domain:
+                    self.ext_math_domain.add(local)
+            else:
+                e = o.rejected.get(oname)
+                why = e.message if e is not None else "it could not be translated"
+                self.rejected[local] = Unsupported(None, f"{oname} (in {owner}) could not be translated: {why}")
+        elif kind == "constant":
+            c = o.constants[oname]
+            self.constants[local] = Constant(f"{self._q(o.ns)}::{c.cpp}", self._view(c.type), c.code, external=True)
+        else:
+            self.skipped_globals[local] = f"{o.skipped_globals.get(oname, 'not translated')} (in {owner})"
+        self.imported[local] = (owner, oname, kind)
+
+    def _import_class(self, o, name):
+        """A class of module o, as seen here: m::Option, with the methods' signatures, and any
+        class it holds as a field."""
+        if name in self.classes:
+            return
+        info = o.classes[name]
+        c = copy.copy(info)
+        c.ns, c.external, c.notes = self._q(o.ns), True, []
+        c.fields = []
+        for f in info.fields:
+            g = copy.copy(f)
+            g.type = self._view(f.type) if f.type is not None else None
+            g.default_code = o.qualify_code(f.default_code, self._q(o.ns))
+            c.fields.append(g)
+        c.methods = dict(info.methods)
+        self.classes[name] = c
+        if info.rejected is not None:
+            return
+        for m in info.methods.values():
+            if m.key in o.translated:
+                self.sigs[m.key] = self._from_module(o.sigs[m.key], o, qualify=False)
+                self.ext_modified[m.key] = set(o.modified.get(m.key, ()))
+        for f in info.fields:  # a class held as a field: its fields and methods are reachable here
+            t = f.type.inner if isinstance(f.type, OptionalType) else f.type
+            if isinstance(t, StructType) and t.name not in self.classes:
+                self._import_class(self.deps[self.class_owner[t.name]], t.name)
+
+    def _view(self, t):
+        """A type of another module as seen from here: its classes qualified with their namespace."""
+        if isinstance(t, StructType):
+            owner = self.class_owner.get(t.name, self.module_name)
+            if owner == self.module_name:
+                return StructType(t.name, cpp_ident(t.name))
+            return StructType(t.name, f"{self._q(self.deps[owner].ns)}::{cpp_ident(t.name)}")
+        if isinstance(t, TupleType):
+            return TupleType(tuple(self._view(e) for e in t.elts))
+        if isinstance(t, OptionalType):
+            return OptionalType(self._view(t.inner))
+        return t
+
+    def _from_module(self, sig, o, qualify):
+        new = copy.deepcopy(sig)
+        for p in new.params:
+            p.type = self._view(p.type)
+            p.default_code = o.qualify_code(p.default_code, self._q(o.ns))
+        new.ret = self._view(new.ret)
+        if qualify:
+            new.cpp = f"{self._q(o.ns)}::{sig.cpp}"
+        return new
+
+    def qualify_code(self, code, prefix=None):
+        """C++ written for inside this module's namespace, made valid outside it: its own
+        constants, classes and functions get the namespace (string literals untouched)."""
+        if code is None:
+            return None
+        names = {c.cpp for c in self.constants.values() if not c.external}
+        names |= {cpp_ident(n) for n, i in self.classes.items() if not i.external}
+        names |= {self.sigs[n].cpp for n in self.fdefs if n in self.sigs and "." not in n}
+        if not names:
+            return code
+        pat = re.compile(r"(?<![\w:.])(" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+                         + r")\b")
+        parts = re.split(r'("(?:[^"\\]|\\.)*")', code)
+        prefix = prefix or self.ns
+        return "".join(part if i % 2 else pat.sub(lambda m: f"{prefix}::{m.group(1)}", part)
+                       for i, part in enumerate(parts))
+
+    def _rewrite_module_attributes(self):
+        """`alias.f(...)` for an imported project module: rewritten to a name imported from it,
+        `alias.f` (a name no Python code can clash with), or the class name itself."""
+        mod = self
+
+        class Rewrite(ast.NodeTransformer):
+            def visit_Attribute(self, node):
+                self.generic_visit(node)
+                v = node.value
+                if isinstance(v, ast.Name) and v.id in mod.module_aliases:
+                    target = mod.module_aliases[v.id]
+                    entry = mod.deps[target].namespace.get(node.attr)
+                    if entry is None:
+                        return node
+                    local = node.attr if entry[0] == "class" else f"{v.id}.{node.attr}"
+                    if local not in mod.imported:
+                        mod._dep(target)
+                        mod._import_name(local, target, node.attr, node)
+                    return ast.copy_location(ast.Name(id=local, ctx=node.ctx), node)
+                return node
+
+        Rewrite().visit(self.tree)
+
+    def _build_namespace(self):
+        """What other modules can import from this one: (kind, defining module, its name)."""
+        ns = {local: (kind, owner, oname) for local, (owner, oname, kind) in self.imported.items()}
+        for name in self.fdefs:
+            if "." not in name:
+                ns[name] = ("function", self.module_name, name)
+        for name, info in self.classes.items():
+            if not info.external:
+                ns[name] = ("class", self.module_name, name)
+        for name, c in self.constants.items():
+            if not c.external:
+                ns[name] = ("constant", self.module_name, name)
+        for name in self.skipped_globals:
+            if name not in ns:
+                ns[name] = ("skipped", self.module_name, name)
+        self.namespace = ns
+        self.all_names = None
+        for node in self.tree.body:  # __all__ = [...] decides what `import *` takes
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets) \
+                    and isinstance(node.value, (ast.List, ast.Tuple)):
+                self.all_names = {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
+        # functions that may raise a math domain error (for `try: ... except ValueError` callers)
+        tr = _ConstTranslator(self)
+        self.math_domain = set(self.ext_math_domain)
+        changed = True
+        while changed:
+            changed = False
+            for name, f in self.fdefs.items():
+                if name in self.math_domain:
+                    continue
+                for n in ast.walk(f):
+                    if isinstance(n, ast.Call) and (tr.qualify(n.func) in lib.MATH_DOMAIN or (
+                            isinstance(n.func, ast.Name) and n.func.id in self.math_domain)):
+                        self.math_domain.add(name)
+                        changed = True
+                        break
+
+    def public_names(self):
+        if self.all_names is not None:
+            return [n for n in self.namespace if n in self.all_names]
+        return [n for n in self.namespace if not n.startswith("_")]
+
     # --- names visible inside functions -----------------------------------------------
     def global_name(self, node, tr):
         n = node.id
@@ -373,10 +627,11 @@ class ModuleTranslator:
         if n in self.skipped_globals:
             raise Unsupported(node, f"module variable '{n}' was not translated: {self.skipped_globals[n]}")
         raise Unsupported(node, f"unknown name '{n}'",
-                          "stage 1 translates one module at a time; define it in this file")
+                          "define it in this file, or import it from another module of the project (from m import f)")
 
     # --- collection ----------------------------------------------------------------------
     def collect(self):
+        handled = self._import_project()
         body = self.tree.body
         assigned_count = {}
         for node in body:
@@ -390,8 +645,12 @@ class ModuleTranslator:
         for i, node in enumerate(body):
             if i == 0 and is_docstring(node):
                 self.doc = inspect.cleandoc(node.value.value)
+            elif id(node) in handled:
+                continue  # an import from another module of the project (see _import_project)
             elif isinstance(node, ast.Import):
                 for a in node.names:
+                    if a.name in self.deps:
+                        continue
                     if a.asname:
                         self.imports[a.asname] = a.name
                     else:
@@ -425,6 +684,14 @@ class ModuleTranslator:
                 self.report.module_notes.append(f"line {node.lineno}: module-level "
                                                 f"{type(node).__name__} statement skipped")
 
+        for name in [n for n in self.imported if n in self.fdefs or
+                     (n in self.classes and not self.classes[n].external) or
+                     (n in self.constants and not self.constants[n].external)]:
+            # defined here after being imported: the module's own definition wins, as in Python
+            self.imported.pop(name)
+            self.sigs.pop(name, None)
+            self.rejected.pop(name, None)
+            self.skipped_globals.pop(name, None)
         self._collect_classes()
         for f in self.fdefs.values():
             self._strip_errstate(f)
@@ -613,7 +880,8 @@ class ModuleTranslator:
                 for callee, i, arg in lst:
                     cs = self.sigs[callee]
                     target = "self" if i == "self" else (cs.params[i].name if i < len(cs.params) else None)
-                    if target is not None and target in inplace.get(callee, ()) and arg not in inplace[name]:
+                    changes = inplace[callee] if callee in inplace else self.ext_modified.get(callee, ())
+                    if target is not None and target in changes and arg not in inplace[name]:
                         inplace[name].add(arg)
                         changed = True
         self.modified = inplace
@@ -669,7 +937,7 @@ class ModuleTranslator:
         array in Python (the field *is* the argument); the C++ object holds a copy."""
         for info in self.classes.values():
             m = info.methods.get("__init__" if info.plain else "__post_init__")
-            if info.rejected is not None or m is None or m.key not in self.sigs:
+            if info.external or info.rejected is not None or m is None or m.key not in self.sigs:
                 continue
             shared = {f.name for f in info.init_fields if is_array(f.type) or isinstance(f.type, StructType)}
             if info.plain:  # self.w = w (or a view of w): the field *is* the caller's array
@@ -732,7 +1000,7 @@ class ModuleTranslator:
             self.skipped_globals[name] = err.message
             self.report.module_notes.append(f"line {node.lineno}: `{name}` not translated: {err.message}")
             return
-        self.constants[name] = Constant(cpp_ident(name), t, code)
+        self.constants[name] = Constant(cpp_ident(name), t, code, lineno=node.lineno)
         self.report.constants.append(f"{name}: {t}")
 
     def signature(self, f):
@@ -812,7 +1080,7 @@ class ModuleTranslator:
                     self.rejected[name] = e
                     progress = True
             for info in self.classes.values():  # one untranslatable method sinks its class
-                if info.rejected is None:
+                if info.rejected is None and not info.external:
                     bad = next((m for m in info.methods.values() if m.key in self.rejected), None)
                     if bad is not None:
                         e = self.rejected[bad.key]
@@ -824,6 +1092,8 @@ class ModuleTranslator:
             bodies, notes, general = {}, {}, {}  # retranslate: a call may now point at a rejected function
 
         for info in self.classes.values():
+            if info.external:
+                continue
             if info.rejected is not None:
                 e = info.rejected
                 self.report.functions.append(FunctionReport(f"class {info.name}", info.node.lineno, False,
@@ -845,10 +1115,13 @@ class ModuleTranslator:
             self.report.general_notes.append(f"{text} (applies to: {', '.join(names)})")
         header = self.render(bodies)
         sigs = {n: self.sigs[n] for n in bodies}
+        self.translated = set(bodies)
+        self._build_namespace()
         uses_random = "qtrans_random.hpp" in header
         live = {n: self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None}
         return TranslationResult(self.module_name, header, self.report, sigs, "qt::" in header,
-                                 "qtrans_arrays.hpp" in header or uses_random, uses_random, live)
+                                 "qtrans_arrays.hpp" in header or uses_random, uses_random, live, self.ns,
+                                 list(self.project_deps))
 
     # --- rendering -----------------------------------------------------------------------------
     def attached_comments(self, first_line):
@@ -981,9 +1254,7 @@ class ModuleTranslator:
         return out
 
     def render(self, bodies) -> str:
-        ns = cpp_ident(re.sub(r"\W", "_", self.module_name) or "module")
-        if ns[0].isdigit():
-            ns = "m_" + ns
+        ns = self.ns
         out = [f"// {self.module_name}.hpp: generated by qtrans {VERSION} from {Path(self.filename).name}.",
                "// Edit the Python source and re-run qtrans rather than editing this file."]
         if self.doc:
@@ -991,9 +1262,13 @@ class ModuleTranslator:
             out += [("// " + line).rstrip() for line in self.doc.splitlines()]
         out += ["#pragma once", "", "@@INCLUDES@@", "", f"namespace {ns} {{", ""]
 
-        if self.constants:
-            for name, c in self.constants.items():
-                out.append(f"inline const {c.type.cpp()} {c.cpp} = {c.code};")
+        own_constants = [c for c in self.constants.values() if not c.external]
+        if own_constants:
+            for c in own_constants:
+                for line in self.attached_comments(c.lineno) if c.lineno else []:
+                    out.append("// " + line)
+                tail = f"  // {self.inline_comments[c.lineno]}" if c.lineno in self.inline_comments else ""
+                out.append(f"inline const {c.type.cpp()} {c.cpp} = {c.code};{tail}")
             out.append("")
 
         live = [self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None]
@@ -1041,6 +1316,8 @@ class ModuleTranslator:
             inc_lines.append('#include "qtrans_arrays.hpp"  // Eigen, plus NumPy semantics')
         elif "qt::" in text:
             inc_lines.append('#include "qtrans_runtime.hpp"')
+        for d in self.project_deps:  # the modules of the project it imports from
+            inc_lines.append(f'#include "{d}.hpp"  // from {d} import ...')
         return text.replace("@@INCLUDES@@", "\n".join(inc_lines))
 
 
@@ -1050,8 +1327,12 @@ def translate_source(source: str, module_name: str = "module", filename: str = "
 
 def translate_file(path, out_dir=None) -> TranslationResult:
     """Translate a .py file. If out_dir is given, write <module>.hpp, qtrans_runtime.hpp
-    (when needed) and <module>_report.md there."""
+    (when needed) and <module>_report.md there. Modules of the project it imports (files next
+    to it) are translated too, and their headers written alongside (see project.py)."""
     path = Path(path)
+    from .project import discover, translate_project
+    if len(discover([path])[0]) > 1:
+        return translate_project([path], out_dir).modules[path.stem]
     result = translate_source(path.read_text(encoding="utf-8"), path.stem, str(path))
     if out_dir is not None:
         out = Path(out_dir)

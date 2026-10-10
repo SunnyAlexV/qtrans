@@ -3,8 +3,8 @@
 [![tests](https://github.com/SunnyAlexV/qtrans/actions/workflows/tests.yml/badge.svg)](https://github.com/SunnyAlexV/qtrans/actions/workflows/tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/qtrans)](https://pypi.org/project/qtrans/)
 
-**Translate typed quant-finance Python into readable, standalone C++, and prove the
-translation computes the same numbers.**
+**Translate typed quant-finance Python into readable, standalone C++, and validate that it
+computes the same numbers through differential testing.**
 
 A quant prototypes a pricer or a portfolio model in Python; a developer rewrites it in C++
 for production, and bugs creep in during the rewrite. qtrans does the rewrite mechanically.
@@ -12,7 +12,9 @@ Its output is meant to be *handed over*: idiomatic C++ that keeps the original c
 docstrings and is clean under `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`. Scalar code
 needs only the standard library; array code uses Eigen, the header-only library found in many
 pricing libraries. Every translation comes with a verifier that compiles the C++, runs it and
-Python on the same inputs, and reports every difference.
+Python on the same inputs, and reports every difference. That is testing, not a formal proof:
+it shows agreement on every case run (hand-picked and thousands of random ones), which is
+strong evidence, but no finite set of cases can rule out a difference elsewhere.
 
 - **Stage 1, scalar code:** closed-form pricers, Greeks, root-finders, bond maths, lattice sums.
 - **Stage 2, NumPy arrays:** portfolio construction (Markowitz, Black-Litterman), binomial
@@ -35,6 +37,11 @@ Python on the same inputs, and reports every difference.
   arrays, your generator advances exactly as far, your dataclasses go in and come back
   updated, and the exceptions are Python's. Checked like the C++ itself: 19,545 cases over the
   examples, 0 mismatches. See [Calling the C++ from Python](#calling-the-c-from-python).
+- **0.8, projects:** files that import from each other (`from bl_core import nearest_psd`,
+  `from bl_config import *`, `import rates as R`) are translated together, one header and C++
+  namespace per module, with the analysis carried across the imports. The app's own four
+  files, type hints added in place, translate as a project: 22 functions, 4,436 cases,
+  0 mismatches, bindings included. See [Projects](#projects-several-modules).
 
 ```python
 def black_litterman(cov: Mat, w_mkt: Vec, P: Mat, Q: Vec, omega_diag: Vec,
@@ -124,9 +131,10 @@ report = verify_file("my_model.py", bench=True)      # compile, compare, time
 print(report.to_text())
 ```
 
-**From a terminal:** `python -m qtrans translate my_model.py -o cpp_out`,
+**From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
+folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (339 tests).
+`python -m pytest` (359 tests).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -392,6 +400,76 @@ What it turned up, beyond the missing features:
 6. **The benchmark could time an empty array** (the first random case) and report a
    meaningless speed-up. It now times a hand-picked case, or the largest random one.
 
+## Projects: several modules
+
+Real code is split across files. Give qtrans the files (or their folder) and it follows their
+imports to the modules next to them:
+
+```
+python -m qtrans translate examples/bl_app -o cpp_out      # bl_config, bl_core, bl_inference, bl_backtest
+python -m qtrans verify examples/bl_app --bench
+python -m qtrans bind examples/bl_app --check
+```
+
+**One header and one namespace per module**, laid out as the Python is, so the C++ reads like
+the code it came from. A module that imports from another includes its header and calls into
+its namespace; types, constants and defaults are qualified on the way:
+
+```cpp
+// from tests/data/project/core.hpp (the // notes are added here): import rates as R, from rates import *
+#include "rates.hpp"  // from rates import ...
+namespace core {
+double pv(double cf, double t, double rf = rates::DEFAULT_RF);   // a default from rates
+double weights(qt::Vec& w);                                     // by reference: see below
+inline double pv2(double cf, double t) {
+    return cf * rates::discount(rates::DEFAULT_RF, t);          // R.discount(R.DEFAULT_RF, t)
+}
+inline double weights(qt::Vec& w) {
+    rates::normalise(w);
+    return qt::sum(w);
+}
+```
+
+**The analysis is project-wide.** Modules are translated in import order, each after the ones it
+imports, so a function knows exactly how every imported function treats its arguments:
+`rates.normalise` divides its array in place, so `core.weights`, which passes its own array on,
+takes it by reference, and so does a function two modules up that calls `core.weights`. The same
+holds for methods of an imported class, a generator passed on to an imported function that
+draws from it, an argument an imported function may hand back, and `try: ... except
+ValueError` around an imported function that may raise a math domain error. Calling an imported
+function that could not be translated is refused with its own reason ("calls bad(): bad (in
+rates) could not be translated: module variable 'TABLE' was not translated: dicts are not
+supported").
+
+**Imports understood:** `from m import f`, `from m import f as g`, `from m import *` (public
+names, or `__all__`, including what `m` itself imported, as Python does), `import m` and
+`import m as alias` (then `alias.f`, `alias.Option`), and `from . import m` / `from .m import f`
+in a package. A name defined in the module after it was imported wins, as in Python.
+**Refused, with a message:** an import cycle (C++ headers can't include each other: "import
+cycle: a -> b -> a"), two classes of one name in a project, and a class imported under another
+name. Dotted imports of packages (`import pkg.sub`) aren't followed yet.
+
+**Verify** builds one C++ driver for all the modules and checks the files given (`--all`: also
+the modules they import). Hand-picked inputs can stay out of the code itself, in a
+`qtrans_cases.py` next to the modules: `QTRANS_CASES = {"bl_core": {"nearest_psd": [...]}}`.
+**Bind** builds one extension with a submodule per module (`bl_app_cpp.bl_core`, importable as
+`import bl_app_cpp.bl_core`), so a class used by several modules is one Python type; names a
+module imports are the same objects in its submodule; and when one file was given, its names are
+also at the top level, so `import bl_core_cpp as bl_core` is a drop-in.
+
+**Tested on the app's own files.** [`examples/bl_app`](https://github.com/SunnyAlexV/qtrans/tree/main/examples/bl_app) holds
+`bl_config.py`, `bl_core.py`, `bl_inference.py` and `bl_backtest.py` from the Black-Litterman app,
+with type hints added to the functions qtrans translates and one import line for them; a syntax-tree
+comparison against the app's repository finds every one of the 53 function bodies unchanged.
+`bl_core` and `bl_backtest` star-import `bl_config`, and `bl_backtest` star-imports `bl_core`.
+**22 functions translate, 4,436 cases, 0 mismatches**, and the same through the bindings
+([`examples/bl_app/RESULTS.md`](https://github.com/SunnyAlexV/qtrans/blob/main/examples/bl_app/RESULTS.md), regenerated by
+`tools/project_example.py`). Its configuration constants come across with their comments
+(`inline const double DEFAULT_VIEW_CONFIDENCE = 75.0;  // Idzorek confidence: ...`); its dict
+constants (`FREQ_PER_YEAR`, `MARKETS`) are refused, and so is anything that uses them. The other
+31 functions have no type hints: they work on pandas objects, call `scipy.optimize`, or format
+text.
+
 ## Calling the C++ from Python
 
 `python -m qtrans bind my_model.py --check --bench` compiles the translation into a Python
@@ -477,16 +555,18 @@ an array field to an array *equal* to the old one, the compiled side keeps the o
    `printf("%a")`, so nothing is rounded in transit.
 4. **Compares everything a call produces.** That means the return value, the final state of
    every array the function modifies in place, and, for a generator argument, its next raw
-   output after the call. Equal raw outputs prove both sides consumed exactly the same number
-   of draws.
+   output after the call. Equal raw outputs show both sides consumed the same number of draws
+   (two different states giving the same 64-bit output has probability about 2^-64).
 5. **Classifies every case:**
    - **match**: within `rtol=1e-10` / `atol=1e-13`, or the same exception category. Arrays are
      compared normwise, relative to the array's largest value.
    - **ill-cond**: further apart than that, but within 100× of how far *Python's own* answer
      moves when the inputs are nudged by 4 ULPs (for functions using `np.linalg`, also by 4 ULPs
-     of a matrix's largest element, the size of error LAPACK itself is allowed). The problem
-     itself can't be computed more precisely there, by any implementation. These cases are
-     listed separately, never hidden.
+     of a matrix's largest element, the size of error LAPACK itself is allowed). There the
+     inputs, known only to rounding, don't pin the answer down further: two backward-stable
+     implementations (as LAPACK and Eigen are) can differ by that much. It does not mean no
+     implementation could do better, e.g. one in higher precision. These cases are listed
+     separately, never hidden.
    - **known**: Python raised a float error that IEEE-754 arithmetic doesn't raise
      (`ZeroDivisionError`, `OverflowError`, math domain error), or a Python float went complex
      (`(-8.0) ** (1/3)`), where C, like `np.float64`, gives NaN.
@@ -592,14 +672,16 @@ qtrans/
   core.py, types.py, library.py, report.py, typing.py (Vec, Mat)
   verify.py          compile, run, compare (incl. conditioning), benchmark
   bind.py            pybind11 bindings: generate, build, check against Python
+  project.py         several modules: imports followed, import order, one header each
   runtime/qtrans_runtime.hpp   scalar helpers (standard library only)
   runtime/qtrans_arrays.hpp    array helpers on Eigen, NumPy algorithms ported
   runtime/qtrans_random.hpp    NumPy's Generator (SeedSequence + PCG64 + ziggurat)
   runtime/qtrans_pybind.hpp    the bindings' conversions, write-backs and exceptions
 examples/            11 quant modules (one from a real app, one of classes), their C++
-                     output, RESULTS.md, BINDINGS.md, three C++ consumers
-tests/               339 tests: generated text, refusals, compiled semantics, every example,
-                     the Python bindings
+                     output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
+                     app's own four modules, as a project
+tests/               359 tests: generated text, refusals, compiled semantics, every example,
+                     projects, the Python bindings
 tools/               scripts that back the numbers in this README
 run_examples.py      press-Run entry point
 ```
@@ -612,8 +694,17 @@ run_examples.py      press-Run entry point
 4. ~~Real code~~ (0.4: a real app's numerical core, unchanged but for type hints)
 5. ~~Classes~~ (0.5: `@dataclass`, `NamedTuple`, strings; 0.6: plain classes, a generator held
    by an object)
-6. **Tooling**: ~~a pybind11 wrapper so the C++ can be called back from Python~~ (0.7),
-   multi-module projects, PyPI.
+6. ~~Tooling~~: a pybind11 wrapper so the C++ can be called back from Python (0.7), PyPI
+   (0.7), multi-module projects (0.8).
+7. **Next (0.9, trust)**: rectangular, empty and extreme-value inputs in the verifier; Clang,
+   sanitizers, optimisation levels and macOS ARM64 in CI; generated-program fuzzing with
+   automatic minimisation; operation-specific numerical checks (backward error of solves,
+   residuals of eigendecompositions and Cholesky, Moore-Penrose conditions judged against the
+   condition number); `qtrans doctor` / `inspect` / `explain`; traceable headers (source hash,
+   Python line references, CMake); a reproducible benchmark protocol.
+8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
+   in-house libraries), integer arrays (the bootstrap), a written specification of the
+   supported subset. Not planned: pandas, all of Python, GPU backends.
 
 ## Licence
 

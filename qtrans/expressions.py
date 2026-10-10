@@ -558,7 +558,7 @@ class ExprTranslator(ArrayOps, StructOps):
             name = f.id
             if self.is_variable(name):
                 raise Unsupported(node, f"'{name}' is a variable, not a function")
-            if name in self.mod.sigs:
+            if name in self.mod.sigs or (name in self.mod.rejected and name in self.mod.imported):
                 return self.call_user(node, name)
             if name in self.mod.imports:
                 return self.call_library(node, self.mod.imports[name])
@@ -576,8 +576,10 @@ class ExprTranslator(ArrayOps, StructOps):
                                       "adds left to right, np.sum pairwise, so their results differ")
             if name in _REJECTED_BUILTINS:
                 raise Unsupported(node, f"{name}() is not supported", _REJECTED_BUILTINS[name])
+            if name in self.mod.skipped_globals:
+                raise Unsupported(node, f"'{name}' was not translated: {self.mod.skipped_globals[name]}")
             raise Unsupported(node, f"unknown function '{name}'",
-                              "stage 1 translates one module at a time; define it in this file")
+                              "define it in this file, or import it from another module of the project (from m import f)")
         q = self.qualify(f)
         if q is None and isinstance(f, ast.Attribute) and not self._is_module_path(f.value):
             base = self.expr(f.value)
@@ -592,6 +594,8 @@ class ExprTranslator(ArrayOps, StructOps):
 
     def call_user(self, node, name):
         if name in self.mod.rejected:
+            if name in self.mod.imported:  # from another module of the project: say why
+                raise Unsupported(node, f"calls {name}(): {self.mod.rejected[name].message}")
             raise Unsupported(node, f"calls {name}(), which could not be translated")
         sig = self.mod.sigs[name]
         return Expr(f"{sig.cpp}({', '.join(self.bind_args(node, sig, name))})", P_ATOM, sig.ret)

@@ -1,5 +1,5 @@
 """qtrans: translate typed, scalar quant-finance Python into readable, standalone C++,
-and prove the translation matches.
+and validate it against the Python by differential testing.
 
     from qtrans import translate_file, verify_file
     result = translate_file("black_scholes.py", "cpp_out")   # writes black_scholes.hpp
@@ -8,7 +8,9 @@ and prove the translation matches.
 """
 from .errors import Unsupported
 from .translator import VERSION as __version__
+from .project import ProjectError, translate_project
 from .translator import translate_file, translate_source
-from .verify import verify_file
+from .verify import verify_file, verify_project
 
-__all__ = ["translate_file", "translate_source", "verify_file", "Unsupported", "__version__"]
+__all__ = ["translate_file", "translate_source", "translate_project", "verify_file", "verify_project",
+           "Unsupported", "ProjectError", "__version__"]

@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python packages
-        run: python -m pip install numpy scipy pytest mpmath pybind11 setuptools
+        run: python -m pip install numpy scipy pandas pytest mpmath pybind11 setuptools
 
       - name: Install Eigen (Linux)
         if: runner.os == 'Linux'

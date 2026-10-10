@@ -30,8 +30,8 @@ def main(argv=None):
         build = Path(tempfile.mkdtemp(prefix=f"qtrans_bind_{name}_"))
         r = check_bindings(ROOT / "examples" / f"{name}.py", n_random=args.cases, bench=True, build_dir=build)
         print(r.to_text(), "\n", flush=True)
-        totals["functions"] += len(r.extension.binder.bound)
-        totals["classes"] += len(r.extension.binder.bound_classes)
+        totals["functions"] += len(r.extension.bound)
+        totals["classes"] += len(r.extension.bound_classes)
         for c in r.checks:
             totals["cases"] += c.cases
             totals["mismatch"] += c.outcomes.get("mismatch", 0)

@@ -71,10 +71,12 @@ class ClassInfo:
     doc: str | None = None
     rejected: Unsupported | None = None
     notes: list = field(default_factory=list)
+    ns: str | None = None           # the C++ namespace of the module that defines it, when imported
+    external: bool = False          # imported from another module of the project: not rendered here
 
     @property
     def cpp(self) -> str:
-        return cpp_ident(self.name)
+        return f"{self.ns}::{cpp_ident(self.name)}" if self.ns else cpp_ident(self.name)
 
     @property
     def type(self) -> StructType:

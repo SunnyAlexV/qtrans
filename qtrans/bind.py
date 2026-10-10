@@ -44,6 +44,7 @@ import importlib.util
 import inspect
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -125,11 +126,29 @@ class _Wrap:
 
 
 class Binder:
-    def __init__(self, result: TranslationResult, source: str):
+    def __init__(self, result: TranslationResult, source: str, project=None):
+        """project: the ProjectResult when the module is part of one; then the classes it uses
+        from other modules are known here too (converted, but bound by their own module), and
+        the analysis of what a call can run follows calls into the other modules."""
         self.result = result
-        self.ns = result.header.split("namespace ", 1)[1].split(" ", 1)[0]
+        self.ns = result.namespace or result.header.split("namespace ", 1)[1].split(" ", 1)[0]
         self.classes = dict(result.classes or {})
+        self.own = set(self.classes)
+        self.project = project
         self.tree = ast.parse(source)
+        self.extra_trees = []
+        if project is not None and len(project.modules) > 1:
+            t = project.translators[result.module]
+            for name, info in t.classes.items():  # imported classes, as this module sees them
+                if info.external and info.rejected is None and name in project.classes():
+                    self.classes[name] = info
+            order = [n for n in project.classes() if n in self.classes]  # dependency order, project-wide
+            self.classes = {n: self.classes[n] for n in order}
+            self.extra_trees = [project.translators[m].tree for m in project.order if m != result.module]
+            self.imported_fdefs = {local: project.translators[owner].fdefs.get(oname)
+                                   for local, (owner, oname, kind) in t.imported.items() if kind == "function"}
+        else:
+            self.imported_fdefs = {}
         self.notes = {}       # name -> [why it is left out / how it differs]
         self.bound = []       # Python names of the functions bound
         self.bound_classes = []
@@ -140,10 +159,11 @@ class Binder:
     # --- which object fields Python only ever re-points (never changes in place) -----------------
     def _index_functions(self):
         self.top = {n.name: n for n in self.tree.body if isinstance(n, ast.FunctionDef)}
+        self.top.update({k: v for k, v in self.imported_fdefs.items() if v is not None and k not in self.top})
         self.methods = {}   # (class, name) -> FunctionDef
         self.by_name = {}   # method name -> [FunctionDef]
         self.cls_defs = {}
-        for n in self.tree.body:
+        for n in [n for t in [self.tree] + self.extra_trees for n in t.body]:
             if isinstance(n, ast.ClassDef):
                 self.cls_defs[n.name] = n
                 for m in n.body:
@@ -276,9 +296,9 @@ class Binder:
             w.pre.append(f"std::optional<{cpp}> {v}_tmp;")
             decl = f"const {cpp}&" if p.mode == "cref" else f"{cpp}&" if p.mode == "ref" else cpp
             w.pre.append(f"{decl} {v} = qtb::obtain<{cpp}>({o}, {v}_tmp, [](py::handle h) {{ return "
-                         f"qtrans_from_py_{cpp}(h, {_cstr(p.name)}); }});")
+                         f"qtrans_from_py_{info.name}(h, {_cstr(p.name)}); }});")
             if modified:
-                w.post.append(f"if ({v}_tmp) qtrans_to_py_{cpp}_{self.variant}({o}, *{v}_tmp);")
+                w.post.append(f"if ({v}_tmp) qtrans_to_py_{info.name}_{self.variant}({o}, *{v}_tmp);")
             w.args.append(f"std::move({v})" if p.mode == "value" else v)
         else:
             raise BindError(f"parameter '{p.name}' of type {t} can't be bound yet")
@@ -369,7 +389,7 @@ class Binder:
         """C++ object from your Python object, field by field (no constructor runs: the fields
         are the object's state)."""
         cpp = info.cpp
-        out = [f"static {cpp} qtrans_from_py_{cpp}(py::handle o, const char* arg) {{",
+        out = [f"static {cpp} qtrans_from_py_{info.name}(py::handle o, const char* arg) {{",
                f"    qtb::expect_class(o, {_cstr(info.name)}, {_cstr(_article(info.name))}, arg);",
                f"    {cpp} v;"]
         for f in info.fields:
@@ -386,7 +406,7 @@ class Binder:
                 sc = self.classes[t.name].cpp
                 out.append(f"    {{ std::optional<{sc}> tmp; v.{f.cpp} = qtb::obtain<{sc}>(qtb::field<py::object>(o, "
                            f"{_cstr(info.name)}, {nm}, \"an object\"), tmp, [](py::handle h) {{ return "
-                           f"qtrans_from_py_{sc}(h, {nm}); }}); }}")
+                           f"qtrans_from_py_{t.name}(h, {nm}); }}); }}")
             else:
                 raise BindError(f"field {f.name} of type {t} can't be bound yet")
         return out + ["    return v;", "}", ""]
@@ -398,7 +418,7 @@ class Binder:
         functions this call can run only ever assign anew: those are re-pointed, as in Python."""
         cpp = info.cpp
         mutable = self._mutable(info)
-        out = [f"static void qtrans_to_py_{cpp}_{k}(py::handle o, const {cpp}& v) {{"]
+        out = [f"static void qtrans_to_py_{info.name}_{k}(py::handle o, const {cpp}& v) {{"]
         for f in info.fields:
             t, nm = f.type, _cstr(f.name)
             inner = t.inner if isinstance(t, OptionalType) else t
@@ -418,7 +438,7 @@ class Binder:
                         out.append(f"    qtb::set_attr(o, {nm}, py::cast(v.{f.cpp}));")
                 else:
                     out.append(f"    {{ py::object c = o.attr({nm}); if (py::isinstance<{sc}>(c)) c.cast<{sc}&>() = "
-                               f"v.{f.cpp}; else qtrans_to_py_{sc}_{k}(c, v.{f.cpp}); }}")
+                               f"v.{f.cpp}; else qtrans_to_py_{t.name}_{k}(c, v.{f.cpp}); }}")
         if len(out) == 1:
             out.append("    (void)o; (void)v;")
         return out + ["}", ""]
@@ -457,7 +477,7 @@ class Binder:
                 get = (f"py::cpp_function([]({cpp}& s) -> {sc}& {{ return s.{f.cpp}; }}, "
                        "py::return_value_policy::reference_internal)")
                 setter = (f"[]({cpp}& s, py::object x) {{ std::optional<{sc}> tmp; s.{f.cpp} = qtb::obtain<{sc}>(x, tmp, "
-                          f"[](py::handle h) {{ return qtrans_from_py_{sc}(h, {nm}); }}); }}")
+                          f"[](py::handle h) {{ return qtrans_from_py_{t.name}(h, {nm}); }}); }}")
             else:
                 get = f"[](const {cpp}& s) {{ return s.{f.cpp}; }}"
                 setter = f"[]({cpp}& s, {t.cpp()} x) {{ s.{f.cpp} = std::move(x); }}"
@@ -521,7 +541,7 @@ class Binder:
                          f"{reprs} + \")\"; }});")
         lines.append(f"    {var}.def(\"__copy__\", [](const {cpp}& s) {{ return {cpp}(s); }});")
         lines.append(f"    {var}.def(\"__deepcopy__\", [](const {cpp}& s, py::dict) {{ return {cpp}(s); }}, py::arg(\"memo\"));")
-        lines.append(f"    {var}.def_static(\"_from_python\", [](py::object o) {{ return qtrans_from_py_{cpp}(o, \"o\"); }}, "
+        lines.append(f"    {var}.def_static(\"_from_python\", [](py::object o) {{ return qtrans_from_py_{info.name}(o, \"o\"); }}, "
                      f"\"The compiled copy of one of your Python {info.name} objects (no constructor runs).\");")
         if info.namedtuple:
             tup = f"py::make_tuple({', '.join(f'o.attr({_cstr(f.name)})' for f in info.fields)})"
@@ -536,6 +556,29 @@ class Binder:
 
     # --- the whole file --------------------------------------------------------------------------
     def source(self, header_name: str, module_name: str) -> str:
+        """The whole .cpp of a one-module extension."""
+        res = self.result
+        block = self.block()
+        out = [f"// {module_name}_bind.cpp: Python bindings generated by qtrans {VERSION} for {header_name}.",
+               "// Build with `python -m qtrans bind`; see qtrans/bind.py for what the bindings guarantee.",
+               f'#include "{header_name}"']
+        if res.uses_random:
+            out.append("#define QTRANS_BIND_RNG 1")
+        out += ['#include "qtrans_pybind.hpp"', "", "namespace py = pybind11;", ""] + block
+        doc = _doc(f"{res.module}, compiled by qtrans {VERSION}: the translated functions and classes of "
+                   f"{res.module}.py.")
+        out += [f"PYBIND11_MODULE({module_name}, m) {{",
+                f"    m.doc() = {doc};",
+                "    qtb::register_exceptions(m);",
+                f"    {self.ns}::qtrans_binding::bind(m);",
+                f"    m.attr(\"__qtrans_version__\") = {_cstr(VERSION)};",
+                "}", ""]
+        return "\n".join(out)
+
+    def block(self) -> list:
+        """`namespace <module> { namespace qtrans_binding { ... void bind(module) } }`: the
+        conversions for every class the module uses, and the bindings of its own classes and
+        functions."""
         res = self.result
         order = list(self.classes)  # already in dependency order (class_order)
         ok_classes = []
@@ -561,15 +604,11 @@ class Binder:
                         changed = True
         self.classes = {i.name: i for i in ok_classes}
 
-        out = [f"// {module_name}_bind.cpp: Python bindings generated by qtrans {VERSION} for {header_name}.",
-               "// Build with `python -m qtrans bind`; see qtrans/bind.py for what the bindings guarantee.",
-               f'#include "{header_name}"']
-        if res.uses_random:
-            out.append("#define QTRANS_BIND_RNG 1")
-        out += ['#include "qtrans_pybind.hpp"', "", "namespace py = pybind11;", "", f"namespace {self.ns} {{",
-                "namespace qtrans_binding {", ""]
+        out = [f"namespace {self.ns} {{", "namespace qtrans_binding {", ""]
         body = []
         for info in ok_classes:
+            if info.name not in self.own:
+                continue  # bound by the module that defines it
             try:
                 body += self.bind_class(info)
                 self.bound_classes.append(info.name)
@@ -586,9 +625,9 @@ class Binder:
                 self.notes.setdefault(name, []).append(f"left out: {e}")
 
         for info in ok_classes:
-            out.append(f"static {info.cpp} qtrans_from_py_{info.cpp}(py::handle o, const char* arg);")
+            out.append(f"[[maybe_unused]] static {info.cpp} qtrans_from_py_{info.name}(py::handle o, const char* arg);")
             for k in self.variants.values():
-                out.append(f"[[maybe_unused]] static void qtrans_to_py_{info.cpp}_{k}(py::handle o, const {info.cpp}& v);")
+                out.append(f"[[maybe_unused]] static void qtrans_to_py_{info.name}_{k}(py::handle o, const {info.cpp}& v);")
         out.append("")
         out.append("// Where a compiled object sits in memory, for the shared-memory check.")
         out.append("[[maybe_unused]] static bool qtrans_span(py::handle o, const void*& p, std::size_t& n) {")
@@ -601,18 +640,10 @@ class Binder:
             out += conv[info.name]
             for key, k in self.variants.items():
                 out += self.to_python(info, k, key)
-        out.append("static void bind(py::module_& m) {")
-        out += body
+        out.append("[[maybe_unused]] static void bind(py::module_& m) {")
+        out += body or ["    (void)m;"]
         out += ["}", "", "}  // namespace qtrans_binding", f"}}  // namespace {self.ns}", ""]
-        doc = _doc(f"{res.module}, compiled by qtrans {VERSION}: the translated functions and classes of "
-                   f"{res.module}.py.")
-        out += [f"PYBIND11_MODULE({module_name}, m) {{",
-                f"    m.doc() = {doc};",
-                "    qtb::register_exceptions(m);",
-                f"    {self.ns}::qtrans_binding::bind(m);",
-                f"    m.attr(\"__qtrans_version__\") = {_cstr(VERSION)};",
-                "}", ""]
-        return "\n".join(out)
+        return out
 
 
 def binding_source(result: TranslationResult, source: str, module_name: str | None = None):
@@ -620,6 +651,59 @@ def binding_source(result: TranslationResult, source: str, module_name: str | No
     b = Binder(result, source)
     name = module_name or f"{result.module}_cpp"
     return b.source(f"{result.module}.hpp", name), b
+
+
+def project_binding_source(project, module_name: str):
+    """One extension for a whole project: a submodule per module (`<name>.bl_core`), each with
+    its functions and classes, and the names it imports from the others, as in Python. When one
+    module was asked for, its names are also at the top level, so `import <name> as bl_core`
+    works as a drop-in. One extension, so a class used by several modules is one Python type.
+    -> (C++ source, {module: Binder})"""
+    binders = {m: Binder(project.modules[m], Path(project.paths[m]).read_text(encoding="utf-8"), project)
+               for m in project.order}
+    blocks = {m: b.block() for m, b in binders.items()}
+    out = [f"// {module_name}_bind.cpp: Python bindings generated by qtrans {VERSION} for a project of "
+           f"{len(project.modules)} modules.",
+           "// Build with `python -m qtrans bind`; see qtrans/bind.py for what the bindings guarantee."]
+    out += [f'#include "{m}.hpp"' for m in project.order]
+    if project.uses_random:
+        out.append("#define QTRANS_BIND_RNG 1")
+    out += ['#include "qtrans_pybind.hpp"', "", "namespace py = pybind11;", ""]
+    for m in project.order:
+        out += blocks[m]
+    doc = _doc(f"compiled by qtrans {VERSION}: the translated functions and classes of "
+               + ", ".join(f"{m}.py" for m in project.order) + ", one submodule each.")
+    out += [f"PYBIND11_MODULE({module_name}, m) {{",
+            f"    m.doc() = {doc};",
+            "    qtb::register_exceptions(m);",
+            "    py::dict sysmods = py::module_::import(\"sys\").attr(\"modules\");",
+            "    py::dict submodules;"]
+    for mod in project.order:  # in import order: a module's classes exist before others use them
+        ns = project.modules[mod].namespace
+        out += [f"    py::module_ sub_{ns} = m.def_submodule({_cstr(mod)});",
+                f"    {ns}::qtrans_binding::bind(sub_{ns});",
+                f"    sub_{ns}.attr(\"ShapeError\") = m.attr(\"ShapeError\");",
+                f"    sysmods[{_cstr(module_name + '.' + mod)}] = sub_{ns};  // import {module_name}.{mod} works",
+                f"    submodules[{_cstr(mod)}] = sub_{ns};"]
+    for mod in project.order:  # names imported from other modules: the same objects, as in Python
+        t, ns = project.translators[mod], project.modules[mod].namespace
+        bound_here = set(binders[mod].bound) | set(binders[mod].bound_classes)
+        for local, (owner, oname, kind) in t.imported.items():
+            if "." in local or local in bound_here or kind not in ("function", "class"):
+                continue
+            ob = binders[owner]
+            if oname in ob.bound or oname in ob.bound_classes:
+                ons = project.modules[owner].namespace
+                out.append(f"    sub_{ns}.attr({_cstr(local)}) = sub_{ons}.attr({_cstr(oname)});")
+    if len(project.requested) == 1:
+        main = project.modules[project.requested[0]].namespace
+        out += [f"    for (auto kv : sub_{main}.attr(\"__dict__\").cast<py::dict>()) {{  // the module asked for, at the top",
+                "        std::string k = py::str(kv.first);",
+                "        if (k.rfind(\"__\", 0) != 0) m.attr(kv.first) = kv.second;",
+                "    }"]
+    out += ["    m.attr(\"_qtrans_submodules\") = submodules;",
+            f"    m.attr(\"__qtrans_version__\") = {_cstr(VERSION)};", "}", ""]
+    return "\n".join(out), binders
 
 
 # --- building --------------------------------------------------------------------------------------
@@ -649,10 +733,40 @@ setup(name=@@NAME@@, ext_modules=[Pybind11Extension(@@NAME@@, [@@SRC@@], include
 class Extension:
     path: Path            # the compiled module file
     name: str             # its import name
-    result: TranslationResult
-    binder: Binder
+    project: object       # the ProjectResult (one module, or several)
+    binders: dict         # module -> Binder
     build_dir: Path
     seconds: float = 0.0  # build time
+
+    @property
+    def single(self) -> bool:
+        return len(self.project.modules) == 1
+
+    @property
+    def result(self) -> TranslationResult:
+        return self.project.modules[self.project.requested[0]]
+
+    @property
+    def binder(self) -> Binder:
+        return self.binders[self.project.requested[0]]
+
+    @property
+    def bound(self) -> list:
+        return [n if self.single else f"{m}.{n}" for m, b in self.binders.items() for n in b.bound]
+
+    @property
+    def bound_classes(self) -> list:
+        return [n for b in self.binders.values() for n in b.bound_classes]
+
+    @property
+    def notes(self) -> dict:
+        return {(k if self.single else f"{m}.{k}"): v for m, b in self.binders.items() for k, v in b.notes.items()}
+
+    def submodules(self, mod) -> dict:
+        """module name -> the compiled (sub)module holding its functions and classes."""
+        if self.single:
+            return {self.project.order[0]: mod}
+        return dict(mod._qtrans_submodules)
 
     def load(self):
         spec = importlib.util.spec_from_file_location(self.name, self.path)
@@ -662,21 +776,35 @@ class Extension:
 
 
 def build_extension(path, out_dir=None, build_dir=None, eigen=None, module_name=None) -> Extension:
-    """Translate path, generate the bindings and compile them with the compiler Python's own
-    build tools use (MSVC on Windows, the system compiler elsewhere). The module is written to
-    out_dir (default: next to path) as <stem>_cpp.<platform suffix>."""
+    """Translate path (a file, a list of files, or a folder), generate the bindings and compile
+    them with the compiler Python's own build tools use (MSVC on Windows, the system compiler
+    elsewhere). The module is written to out_dir (default: next to the first file) as
+    <stem>_cpp.<platform suffix> (for several files, <folder>_cpp). A file that imports other
+    modules of its project gets one extension with a submodule per module."""
     try:
         import pybind11
     except ImportError as e:  # pragma: no cover
         raise RuntimeError("Building bindings needs pybind11: pip install pybind11") from e
-    path = Path(path).resolve()
+    from .project import translate_project
+    paths = [path] if isinstance(path, (str, Path)) and not Path(path).is_dir() else path
     build = Path(build_dir) if build_dir else Path(tempfile.mkdtemp(prefix="qtrans_bind_"))
     build.mkdir(parents=True, exist_ok=True)
-    result = translate_file(path, build)
-    name = module_name or f"{path.stem}_cpp"
-    src, binder = binding_source(result, path.read_text(encoding="utf-8"), name)
-    if not binder.bound and not binder.bound_classes:
-        raise RuntimeError(f"nothing in {path.name} could be translated and bound")
+    project = translate_project(paths, build)
+    first = Path(project.paths[project.requested[0]]) if project.requested else Path(project.paths[project.order[0]])
+    if len(project.requested) == 1:
+        default = f"{project.requested[0]}_cpp"
+    else:
+        default = re.sub(r"\W", "_", (Path(path) if isinstance(path, (str, Path)) else first.parent).resolve().name) + "_cpp"
+    name = module_name or default
+    if len(project.modules) == 1:
+        (m, result), = project.modules.items()
+        src, binder = binding_source(result, Path(project.paths[m]).read_text(encoding="utf-8"), name)
+        binders = {m: binder}
+    else:
+        src, binders = project_binding_source(project, name)
+    if not any(b.bound or b.bound_classes for b in binders.values()):
+        raise RuntimeError(f"nothing in {first.name} could be translated and bound")
+    path = first
     for h in (RUNTIME_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PYBIND_HEADER):
         shutil.copy(h, build / h.name)
     cpp = build / f"{name}_bind.cpp"
@@ -701,7 +829,7 @@ def build_extension(path, out_dir=None, build_dir=None, eigen=None, module_name=
             shutil.copy(built[-1], target)
         except PermissionError:  # Windows: the old module is loaded by a running Python
             target = built[-1]
-    return Extension(target, name, result, binder, build, seconds)
+    return Extension(target, name, project, binders, build, seconds)
 
 
 # --- checking ------------------------------------------------------------------------------------------
@@ -741,14 +869,15 @@ class BindReport:
     def to_text(self) -> str:
         e = self.extension
         lines = [f"qtrans bind: {Path(self.path).name} -> {e.path.name} (built in {e.seconds:.1f} s)",
-                 f"bound {len(e.binder.bound)} function(s), {len(e.binder.bound_classes)} class(es)", ""]
+                 f"bound {len(e.bound)} function(s), {len(e.bound_classes)} class(es)"
+                 + ("" if e.single else f" from {len(e.project.modules)} modules"), ""]
         timed = any(c.py_ns for c in self.checks)
-        head = f"{'':32} {'cases':>6} {'match':>6} {'known':>6} {'illcond':>7} {'MISMATCH':>8}"
+        head = f"{'':36} {'cases':>6} {'match':>6} {'known':>6} {'illcond':>7} {'MISMATCH':>8}"
         if timed:
             head += f" {'Python':>10} {'compiled':>10} {'speedup':>8}"
         lines.append(head)
         for c in self.checks:
-            row = (f"{c.name[:32]:32} {c.cases:6d} {c.outcomes.get('match', 0):6d} {c.outcomes.get('known', 0):6d} "
+            row = (f"{c.name[:36]:36} {c.cases:6d} {c.outcomes.get('match', 0):6d} {c.outcomes.get('known', 0):6d} "
                    f"{c.outcomes.get('illcond', 0):7d} {c.outcomes.get('mismatch', 0):8d}")
             if timed and c.py_ns and c.cpp_ns:
                 best = min(x for x in (c.cpp_ns, c.cpp_obj_ns) if x)
@@ -808,12 +937,13 @@ def _fresh(args, types):
     return out
 
 
-def _to_compiled(v, t, mod):
-    """One of your Python objects as the compiled object (fields copied, no constructor run)."""
-    if isinstance(t, StructType) and V._is_object(v):
-        return getattr(mod, t.name)._from_python(v)
+def _to_compiled(v, t, classes):
+    """One of your Python objects as the compiled object (fields copied, no constructor run).
+    classes: class name -> the compiled class."""
+    if isinstance(t, StructType) and V._is_object(v) and t.name in classes:
+        return classes[t.name]._from_python(v)
     if isinstance(t, OptionalType) and v is not None:
-        return _to_compiled(v, t.inner, mod)
+        return _to_compiled(v, t.inner, classes)
     return v
 
 
@@ -917,26 +1047,39 @@ def _result(fn, args, sig_params, ret, ref_idx):
 
 
 def check_bindings(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
-                   build_dir=None, eigen=None, ext: Extension | None = None) -> BindReport:
-    path = Path(path).resolve()
+                   build_dir=None, eigen=None, ext: Extension | None = None, all_modules=False) -> BindReport:
+    """Build (or take) the extension for path and check every function, constructor and method
+    of the modules asked for (all_modules=True: of every module of the project)."""
     ext = ext or build_extension(path, out_dir=build_dir, build_dir=build_dir, eigen=eigen)
-    result = ext.result
-    mod = ext.load()
-    pymod = V.load_module(path)
-    # the verifier's input generation, set up for this module
-    src = path.read_text(encoding="utf-8")
-    V._STRINGS = sorted({n.value for n in ast.walk(ast.parse(src))
-                         if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 80}) + \
-        ["", "no such option"]
-    V._CLASSES = {n: (info, getattr(pymod, n)) for n, info in (result.classes or {}).items()}
-    V._INIT_PARAMS = {n: result.signatures[f"{n}.__init__"].params for n, info in (result.classes or {}).items()
-                      if info.plain}
-    given = getattr(pymod, "QTRANS_CASES", {}) or {}
-    tolerances = getattr(pymod, "QTRANS_TOLERANCE", {}) or {}
-    normwise = V.lapack_functions(path)
+    project = ext.project
+    subs = ext.submodules(ext.load())
+    pymods = V.load_project(project)
+    V.setup_inputs(project, pymods)
+    compiled_classes = {}
+    for m, b in ext.binders.items():
+        for cname in b.bound_classes:
+            compiled_classes[cname] = getattr(subs[m], cname)
+    normwise = V.lapack_functions(project.paths[project.order[0]]) if ext.single else V.project_lapack_functions(project)
     rng = np.random.default_rng(seed)
     nudge_rng = np.random.default_rng(seed + 1)
-    bound = set(ext.binder.bound)
+    checks = []
+    targets = project.order if all_modules else project.requested
+    for module in targets:
+        checks += _check_module(project.modules[module], pymods[module], subs[module], ext.binders[module],
+                                compiled_classes, "" if ext.single else f"{module}.", n_random, rtol, atol, bench,
+                                rng, nudge_rng, normwise, project)
+    shown = project.paths[project.requested[0]] if len(project.requested) == 1 else Path(project.paths[targets[0]]).parent
+    return BindReport(str(shown), ext, checks, ext.notes)
+
+
+def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random, rtol, atol, bench,
+                  rng, nudge_rng, normwise, project=None) -> list:
+    if project is not None:
+        given, tolerances = V.module_cases(project, result.module, pymod)
+    else:
+        given = getattr(pymod, "QTRANS_CASES", {}) or {}
+        tolerances = getattr(pymod, "QTRANS_TOLERANCE", {}) or {}
+    bound = set(binder.bound)
     checks = []
 
     def tol_of(name):
@@ -948,7 +1091,7 @@ def check_bindings(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fal
         if sig.owner or name not in bound:
             continue
         f_rtol, f_atol = tol_of(name)
-        fc = CallableCheck(name, "function")
+        fc = CallableCheck(prefix + name, "function")
         fn, bfn = getattr(pymod, name), getattr(mod, name)
         types = [p.type for p in sig.params]
         ref_idx = [i for i, p in enumerate(sig.params) if p.mode == "ref"]
@@ -984,7 +1127,7 @@ def check_bindings(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fal
                                             normwise_too=name in normwise)
             variants = [_fresh(args, types)]
             if has_obj:
-                variants.append([_to_compiled(a, t, mod) for a, t in zip(_fresh(args, types), types)])
+                variants.append([_to_compiled(a, t, compiled_classes) for a, t in zip(_fresh(args, types), types)])
             worst = "match"
             for k, bargs in enumerate(variants):
                 bsnap = _snapshot(bargs, obj_refs) if k == 0 else []
@@ -1002,40 +1145,42 @@ def check_bindings(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fal
             if worst is not None:
                 fc.add(worst)
         if bench:
-            _bench(fc, fn, bfn, cases, types, mod, n_given=len(given.get(name, [])))
+            _bench(fc, fn, bfn, cases, types, compiled_classes, n_given=len(given.get(name, [])))
         checks.append(fc)
 
     # classes: constructors, methods and properties, on objects built the same way on both sides
-    for cname in ext.binder.bound_classes:
+    for cname in binder.bound_classes:
         info = result.classes[cname]
         pycls, bcls = getattr(pymod, cname), getattr(mod, cname)
         if info.plain:
             ctor_types = [p.type for p in V._INIT_PARAMS[cname]]
         else:
             ctor_types = [f.type for f in info.init_fields]
-        cc = CallableCheck(f"{cname}()", "constructor")
+        cc = CallableCheck(f"{prefix}{cname}()", "constructor")
         pairs = []
         for _ in range(max(20, n_random // 4)):
             n = int(rng.integers(1, 7))
-            raw = [V.random_value(rng, RNG) if t == RNG else V.random_value(rng, t, n) for t in ctor_types]
-            pa, ba = _fresh(raw, ctor_types), _fresh(raw, ctor_types)
+            try:
+                raw = [V.random_value(rng, RNG) if t == RNG else V.random_value(rng, t, n) for t in ctor_types]
+            except V._CantBuild:
+                continue
+            pa = _fresh(raw, ctor_types)
+            ba = _fresh(raw, ctor_types)
             py, cpp = _call(pycls, pa), _call(bcls, ba)
+            o = _outcome(py, cpp, info.type, rtol, atol)
             if py[0] == "ok" and cpp[0] == "ok":
-                o = _outcome(py, cpp, info.type, rtol, atol)
                 pairs.append((py[1], cpp[1], n))
-            else:
-                o = _outcome(py, cpp, info.type, rtol, atol)
             cc.add(o, (tuple(raw), py[1], cpp[1]))
         checks.append(cc)
         for m in info.methods.values():
             if m.kind in ("post_init", "init") or m.key not in result.signatures:
                 continue
             msig = result.signatures[m.key]
-            mname = f"{cname}.{m.name}"
+            mname = f"{prefix}{cname}.{m.name}"
             if not hasattr(bcls, m.name):
                 continue
             mc = CallableCheck(mname, "method")
-            f_rtol, f_atol = tol_of(mname)
+            f_rtol, f_atol = tol_of(f"{cname}.{m.name}")
             types = [p.type for p in msig.params]
             ref_idx = [i for i, p in enumerate(msig.params) if p.mode == "ref"]
             for po, bo, n in (pairs * (1 + n_random // max(1, 4 * len(pairs))) if pairs else []):
@@ -1065,10 +1210,10 @@ def check_bindings(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fal
                         o = "mismatch"
                 mc.add(o, (tuple(args), py[1], cpp[1]))
             checks.append(mc)
-    return BindReport(str(path), ext, checks, ext.binder.notes)
+    return checks
 
 
-def _bench(fc, fn, bfn, cases, types, mod, n_given=0):
+def _bench(fc, fn, bfn, cases, types, classes, n_given=0):
     """Time one representative call end to end on each side, as verify does: the hand-picked
     case with the most data if there is one, else the random case with the most data."""
     def runs(args):
@@ -1082,4 +1227,4 @@ def _bench(fc, fn, bfn, cases, types, mod, n_given=0):
     fc.py_ns = V._bench_python(fn, _fresh(case, types))
     fc.cpp_ns = V._bench_python(bfn, _fresh(case, types))
     if any(isinstance(t, StructType) for t in types):
-        fc.cpp_obj_ns = V._bench_python(bfn, [_to_compiled(a, t, mod) for a, t in zip(_fresh(case, types), types)])
+        fc.cpp_obj_ns = V._bench_python(bfn, [_to_compiled(a, t, classes) for a, t in zip(_fresh(case, types), types)])

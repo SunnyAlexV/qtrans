@@ -10,7 +10,7 @@ COMPILER = r"C:\\winlibs\\mingw64\\bin\\g++.exe".
 """
 from pathlib import Path
 
-from qtrans import translate_file, verify_file
+from qtrans import translate_file, translate_project, verify_file
 
 COMPILER = None          # None = search PATH (g++, clang++, cl), or give a full path
 RANDOM_CASES = 200       # random inputs per function, on top of the hand-picked ones
@@ -26,6 +26,10 @@ def main():
     for name in EXAMPLES + ["not_yet_supported"]:
         r = translate_file(HERE / "examples" / f"{name}.py", out)
         print(r.report.to_text(), "\n")
+    # the app's own modules, as a project: one header per module (examples/bl_app)
+    proj = translate_project(HERE / "examples" / "bl_app", out / "bl_app")
+    for m in proj.order:
+        print(proj.modules[m].report.to_text(), "\n")
     print(f"C++ written to {out}\n")
 
     rows = []
