@@ -2,6 +2,7 @@
 
     python -m qtrans translate FILE.py [-o OUT_DIR]
     python -m qtrans verify FILE.py [--cases N] [--seed S] [--bench] [--rtol X] [--atol X]
+    python -m qtrans bind FILE.py [-o OUT_DIR] [--check] [--cases N] [--bench]
 """
 from __future__ import annotations
 
@@ -31,7 +32,32 @@ def main(argv=None) -> int:
     v.add_argument("--cxx", default=None, help="C++ compiler to use")
     v.add_argument("--build", default=None, help="folder for the generated driver and binary")
 
+    b = sub.add_parser("bind", help="compile the C++ into a Python module, <module>_cpp (needs pybind11)")
+    b.add_argument("file")
+    b.add_argument("-o", "--out", default=None, help="where to put the module (default: next to the file)")
+    b.add_argument("--check", action="store_true", help="check the compiled module against the Python")
+    b.add_argument("--cases", type=int, default=200, help="random cases per function for --check (default 200)")
+    b.add_argument("--seed", type=int, default=0)
+    b.add_argument("--rtol", type=float, default=1e-10)
+    b.add_argument("--atol", type=float, default=1e-13)
+    b.add_argument("--bench", action="store_true", help="with --check: also time Python vs compiled per call")
+    b.add_argument("--build", default=None, help="folder for the generated sources and build files")
+
     args = ap.parse_args(argv)
+    if args.cmd == "bind":
+        from .bind import build_extension, check_bindings
+        ext = build_extension(args.file, out_dir=args.out, build_dir=args.build)
+        print(f"wrote {ext.path} (built in {ext.seconds:.1f} s): import {ext.name}")
+        print(f"bound {len(ext.binder.bound)} function(s) and {len(ext.binder.bound_classes)} class(es)")
+        if not args.check:
+            for k, ns in ext.binder.notes.items():
+                for n in ns:
+                    print(f"  {k}: {n}")
+            return 0
+        report = check_bindings(args.file, n_random=args.cases, seed=args.seed, rtol=args.rtol, atol=args.atol,
+                                bench=args.bench, ext=ext)
+        print(report.to_text())
+        return 0 if report.ok else 1
     if args.cmd == "translate":
         out = Path(args.out) if args.out else Path(args.file).resolve().parent / "cpp_out"
         result = translate_file(args.file, out)

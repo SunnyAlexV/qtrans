@@ -1,4 +1,6 @@
-# Runs the full test suite (translation, compiled semantics, every example) on Linux and Windows.
+# Runs the full test suite (translation, compiled semantics, every example, the Python bindings)
+# on Linux and Windows. On Windows, verify uses MinGW g++ and the bindings use MSVC, which is
+# what Python's own build tools use there.
 name: tests
 
 on:
@@ -20,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python packages
-        run: python -m pip install numpy scipy pytest mpmath
+        run: python -m pip install numpy scipy pytest mpmath pybind11 setuptools
 
       - name: Install Eigen (Linux)
         if: runner.os == 'Linux'
@@ -39,6 +41,7 @@ jobs:
         run: |
           g++ --version
           python -c "from qtrans.verify import find_compiler, find_eigen; print(find_compiler()); print(find_eigen())"
+          python -c "import pybind11; print('pybind11', pybind11.__version__)"
 
       - name: Run tests (a skipped test fails the run)
         env:

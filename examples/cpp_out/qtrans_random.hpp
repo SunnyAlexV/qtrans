@@ -361,6 +361,14 @@ public:
         return g;
     }
 
+    // The current state, as from_state takes it: {state_hi, state_lo, inc_hi, inc_lo}.
+    void state_words(std::uint64_t out[4]) const {
+        out[0] = state_.hi;
+        out[1] = state_.lo;
+        out[2] = inc_.hi;
+        out[3] = inc_.lo;
+    }
+
     // Generator.bit_generator.random_raw(): the next raw 64-bit output.
     std::uint64_t next_uint64() {
         step();

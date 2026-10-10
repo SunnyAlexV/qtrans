@@ -29,6 +29,11 @@ Python on the same inputs, and reports every difference.
   and `==`; an object can own its random generator (a Monte Carlo engine). Objects are passed,
   modified and copied with Python's sharing semantics checked, not assumed. Strings can be
   compared, passed, returned and joined. See [Stage 5](#stage-5-classes-and-strings).
+- **0.7, back to Python:** `python -m qtrans bind` compiles the translation into a Python
+  module (pybind11) that keeps Python's semantics at the boundary: in-place changes reach your
+  arrays, your generator advances exactly as far, your dataclasses go in and come back
+  updated, and the exceptions are Python's. Checked like the C++ itself: 19,545 cases over the
+  examples, 0 mismatches. See [Calling the C++ from Python](#calling-the-c-from-python).
 
 ```python
 def black_litterman(cov: Mat, w_mkt: Vec, P: Mat, Q: Vec, omega_diag: Vec,
@@ -115,7 +120,8 @@ print(report.to_text())
 ```
 
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out`,
-`python -m qtrans verify my_model.py --bench`, `python -m pytest` (314 tests).
+`python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
+`python -m pytest` (339 tests).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -125,11 +131,15 @@ print(report.to_text())
 - Eigen, for array and Monte Carlo code only. Install it with `conda install -c conda-forge eigen`. The
   verifier looks in the conda environment, then `/usr/include/eigen3`, or wherever
   `QTRANS_EIGEN` points.
+- For `qtrans bind` only: `pip install pybind11 setuptools`, and the compiler Python's own build
+  tools use. On Windows that is MSVC, also with Anaconda: install the free *Visual Studio Build
+  Tools* with the "Desktop development with C++" workload (MinGW g++ is fine for `verify`, but
+  can't build modules for an MSVC-built Python). On Linux and macOS, the system g++ or clang.
 - `qtrans` must be importable for array examples (`from qtrans.typing import Vec, Mat`), so
   run from the repo root or `pip install -e .`.
 
 Tested on every push by GitHub Actions on Linux (g++, Eigen 3.4 from apt) and Windows
-(MinGW g++, Eigen from conda-forge, as on an Anaconda machine). In CI a skipped compiled test
+(MinGW g++ for `verify` and MSVC for `bind`, Eigen from conda-forge, as on an Anaconda machine). In CI a skipped compiled test
 counts as a failure, so a green run means the C++ really was compiled and compared.
 
 ## How it works
@@ -377,6 +387,77 @@ What it turned up, beyond the missing features:
 6. **The benchmark could time an empty array** (the first random case) and report a
    meaningless speed-up. It now times a hand-picked case, or the largest random one.
 
+## Calling the C++ from Python
+
+`python -m qtrans bind my_model.py --check --bench` compiles the translation into a Python
+module, `my_model_cpp`, next to the file, then checks it against the Python and times both.
+From Python: `build_extension(path)` and `check_bindings(path, bench=True)` in `qtrans.bind`.
+
+```python
+import black_litterman_app_cpp as bl
+pi = bl.equilibrium_returns(2.5, Sigma, w_mkt)   # the same numbers, raising the same exceptions
+
+import instruments_cpp as inst
+p = Portfolio(weights, cash=1000.0)              # your own Python dataclass...
+inst.run_rebalances(p, target, prices, 3)        # ...is read, and written back as Python would
+```
+
+**What crosses the boundary, and how.** The aim is that swapping the import changes nothing
+but the speed, so where a conversion would silently change behaviour, the binding refuses.
+
+| You pass | The C++ gets | Afterwards |
+|---|---|---|
+| numbers, strings, `None` | converted; an `int` parameter refuses a float | |
+| an array the function only reads | a copy (any array-like; float64 C-ordered arrays are a plain `memcpy`) | |
+| an array it modifies in place | your own float64 C-contiguous array, or `TypeError` (a converted copy would hide the change) | the change copied into your array, so views of it see it too |
+| an `np.random.Generator` | its exact PCG64 state | the advanced state written back: your generator continues exactly where Python's would |
+| one of your dataclass / class objects | its fields (no constructor runs) | if the function modifies it, the fields written back. Arrays and generators go into the objects it already holds when Python changes them in place, and are re-pointed when Python assigns a new one (decided per function from what it can call) |
+| a compiled object (`inst.Portfolio(...)`) | the object itself | changed in place, as in Python |
+
+Write-backs happen also when the call raises, since Python would leave the partial change.
+Two arguments that share memory (the same array, a view of it, the same generator or object),
+where one of them is modified, raise `ValueError`: in Python the change would show through
+both, the compiled code works on separate copies. Exceptions come back as Python's:
+`numpy.linalg.LinAlgError`, `ValueError`, `ZeroDivisionError`, `TypeError` (for `None` where a
+number is needed), `IndexError`, `AssertionError`, `OverflowError`. Shape and bounds errors
+raise the module's `ShapeError`, which is both a `ValueError` and an `IndexError`, because
+NumPy raises one or the other and Eigen's checks can't tell which.
+
+**Compiled classes** have the constructor (running `__post_init__` or `__init__`), the fields
+as attributes (read-only on frozen classes and NamedTuples), methods, properties, static and
+class methods, `==`, hashing for frozen classes (unhashable otherwise, as in Python), the
+dataclass `repr`, `copy.copy`/`deepcopy`, tuple unpacking for a NamedTuple, and
+`Cls._from_python(obj)` to convert one of your objects once instead of on every call.
+
+**Checked like the C++ itself.** `--check` runs every function, method and constructor through
+the compiled module and through Python on the same random and hand-picked inputs, with your
+Python objects and again with compiled ones. It compares return values, in-place changes,
+which arrays were changed in place and which re-pointed, generator states, and exceptions.
+Over the eleven examples: **87 functions and 7 classes, 19,545 cases, 0 mismatches**
+([`examples/BINDINGS.md`](examples/BINDINGS.md), regenerated by `tools/bind_examples.py`).
+Breaking the generator and array write-backs on purpose turns 92 cases of `instruments` and
+30 of `monte_carlo` into mismatches, so the check sees what it is meant to see.
+
+**Speed from Python**, per call, end to end (one run; timings vary between runs). A call costs
+about 100 ns of overhead with number arguments and about 0.5 µs with two small arrays, so:
+
+| Kind of code | Speed-up from Python | Examples |
+|---|---|---|
+| Calls to `scipy.stats.norm` | 170x to 1,200x | `bs_price` 383x, `implied_vol` 1,227x |
+| Python loops over elements or objects | 15x to 75x | `max_drawdown` 74x, `leveraged_nav` 70x, `american_binomial` 30x |
+| Array code at the examples' sizes | 2x to 15x | `black_litterman` 12x, `posterior_mu` 10x, `nearest_psd` 3x |
+| Scalar arithmetic only | about 1x to 8x | `d1` 1.2x: the work is as small as the call overhead |
+| Tiny functions, exp-bound Monte Carlo | 0.6x to 2x | `weight_bounds` 0.6x (a string compare); `european_from_draws` 0.6x, as for the standalone C++ |
+
+**Not quite Python, by design:** a function returning its argument returns a copy, not the
+same array; reading an array field of a compiled object gives a read-only copy (writing to it
+would change nothing, so it can't be written); assigning an array to a field stores a copy;
+reading a generator field gives a copy; a generator given to a compiled constructor is copied,
+so the object and you no longer share it; `raise NotImplementedError` comes back as its parent
+`RuntimeError`; `copy.copy` of a compiled object is a deep copy; and when a function re-points
+an array field to an array *equal* to the old one, the compiled side keeps the old array (only
+`is` can tell).
+
 ## Verification
 
 `verify_file` / `python -m qtrans verify`:
@@ -505,12 +586,15 @@ qtrans/
   structs.py         object expressions: fields, properties, methods, constructors, ==
   core.py, types.py, library.py, report.py, typing.py (Vec, Mat)
   verify.py          compile, run, compare (incl. conditioning), benchmark
+  bind.py            pybind11 bindings: generate, build, check against Python
   runtime/qtrans_runtime.hpp   scalar helpers (standard library only)
   runtime/qtrans_arrays.hpp    array helpers on Eigen, NumPy algorithms ported
   runtime/qtrans_random.hpp    NumPy's Generator (SeedSequence + PCG64 + ziggurat)
+  runtime/qtrans_pybind.hpp    the bindings' conversions, write-backs and exceptions
 examples/            11 quant modules (one from a real app, one of classes), their C++
-                     output, RESULTS.md, three C++ consumers
-tests/               314 tests: generated text, refusals, compiled semantics, every example
+                     output, RESULTS.md, BINDINGS.md, three C++ consumers
+tests/               339 tests: generated text, refusals, compiled semantics, every example,
+                     the Python bindings
 tools/               scripts that back the numbers in this README
 run_examples.py      press-Run entry point
 ```
@@ -523,8 +607,8 @@ run_examples.py      press-Run entry point
 4. ~~Real code~~ (0.4: a real app's numerical core, unchanged but for type hints)
 5. ~~Classes~~ (0.5: `@dataclass`, `NamedTuple`, strings; 0.6: plain classes, a generator held
    by an object)
-6. **Tooling**: multi-module projects, a pybind11 wrapper so the C++ can be called back from
-   Python, PyPI.
+6. **Tooling**: ~~a pybind11 wrapper so the C++ can be called back from Python~~ (0.7),
+   multi-module projects, PyPI.
 
 ## Licence
 

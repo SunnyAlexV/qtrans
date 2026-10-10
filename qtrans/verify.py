@@ -750,6 +750,8 @@ def _compare_values(pv, cv, t, rtol, atol):
     if t == RNG:  # a generator inside an object: equal if its next raw output is
         if isinstance(pv, np.random.Generator):
             pv = int(copy.deepcopy(pv).bit_generator.random_raw())
+        if isinstance(cv, np.random.Generator):  # (a compiled object's generator field, via the bindings)
+            cv = int(copy.deepcopy(cv).bit_generator.random_raw())
         return (pv == cv, 0.0 if pv == cv else math.inf, 0)
     if isinstance(t, OptionalType):
         if pv is None or cv is None:
