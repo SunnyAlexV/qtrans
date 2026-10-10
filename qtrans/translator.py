@@ -351,7 +351,9 @@ class ModuleTranslator:
         for arg, d in zip(nodes, defaults):
             if arg.annotation is None:
                 raise Unsupported(arg, f"parameter '{arg.arg}' has no type annotation",
-                                  f"write `{arg.arg}: float` (or int / bool)")
+                                  f"write `{arg.arg}: float` (or int / bool) for a number, or "
+                                  f"`{arg.arg}: Vec` / `{arg.arg}: Mat` for a 1-D / 2-D float array "
+                                  f"(from qtrans.typing import Vec, Mat)")
             t = self.parse_annotation(arg.annotation)
             if not isinstance(t, (Scalar, ArrayType, RngType)):
                 raise Unsupported(arg, f"parameter '{arg.arg}': {t} parameters are not supported; "

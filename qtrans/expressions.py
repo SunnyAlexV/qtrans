@@ -229,8 +229,7 @@ class ExprTranslator(ArrayOps):
 
         if isinstance(op, ast.Div):
             # Python semantics: `/` is always true division. In C++ `7 / 2` is 3.
-            if both_int:
-                L = self.as_double(L)
+            L = self.as_double(L) if both_int else self.promote(L, FLOAT)
             R = self.promote(R, FLOAT)
             if R.value is None or R.value == 0:
                 self.note("div0", "division by zero gives ±inf or NaN in C++ where Python "
@@ -281,7 +280,8 @@ class ExprTranslator(ArrayOps):
         integral = R.type != FLOAT or (R.value is not None and float(R.value) == int(float(R.value)))
         if not integral:
             self.note("complexpow", "x ** y with a negative x and non-integer y gives a complex "
-                                    "number in Python but NaN in C++")
+                                    "number for a Python float but NaN in C++ (and for np.float64)")
+        L, R = self.promote(L, FLOAT), self.promote(R, FLOAT)
         return Expr(f"std::pow({L.code}, {R.code})", P_ATOM, FLOAT)
 
     def e_UnaryOp(self, node):

@@ -339,6 +339,8 @@ def run_python(fn, args, sig):
             return ("ok", _py_value(tuple(flat + refs), output_type(sig)))
         return ("ok", _py_value(v, sig.ret))
     except (TypeError, ValueError) as e:
+        if "complex" in str(e) or isinstance(v, complex):
+            return ("exc", "TypeError", "Python returned a complex number")
         return ("bad", f"{v!r} ({e})")
 
 
@@ -601,7 +603,10 @@ def classify(case: Case, ret, rtol, atol):
         case.outcome = "match"
     elif py[0] == "exc" and (
             py[1] in ("ZeroDivisionError", "OverflowError")
-            or (py[1] == "ValueError" and any(m in py[2] for m in _KNOWN_MESSAGES))):
+            or (py[1] == "ValueError" and any(m in py[2] for m in _KNOWN_MESSAGES))
+            # x ** y with x < 0 and fractional y: a Python float goes complex (and the next
+            # real-only operation raises TypeError); C, like np.float64, gives NaN
+            or (py[1] == "TypeError" and "complex" in py[2])):
         # Python raised a float error where IEEE-754 C++ carries on with inf/NaN. What C++
         # does next (returns NaN, or a later check throws) follows from that, not from a
         # translation error.

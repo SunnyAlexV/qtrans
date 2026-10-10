@@ -134,6 +134,11 @@ SOURCE = textwrap.dedent('''
     def norm_family(x: float, m: float, s: float) -> tuple[float, float, float, float]:
         return norm.cdf(x, m, s), norm.pdf(x, loc=m, scale=s), norm.sf(x), norm.ppf(0.25, m, s)
 
+    def int_float_mix(n: int, x: float) -> tuple[float, float]:
+        """An int on the left of / or ** with a float: must be cast explicitly (-Wconversion),
+        found by translating the Black-Litterman app's newey_west_lag."""
+        return n / 100.0 + x, n ** (2.0 / 9.0) + x ** 0.5
+
     QTRANS_CASES = {
         "int_floordiv": [(a, b) for a in INTS for b in INTS],
         "int_mod": [(a, b) for a in INTS for b in INTS],
@@ -157,6 +162,7 @@ SOURCE = textwrap.dedent('''
         "elif_spanning": [(x,) for x in (-2.0, 0.5, 3.0)],
         "ppf_roundtrip": [(p,) for p in (1e-300, 1e-100, 1e-20, 1e-10, 1e-5, 0.001, 0.02425, 0.1, 0.25,
                                          0.5, 0.75, 0.9, 0.97575, 0.999, 1 - 1e-10, 0.0, 1.0)],
+        "int_float_mix": [(n, x) for n in (0, 1, 7, 250, -8) for x in (0.0, 2.0, -4.0)],
         "norm_family": [(x, m, s) for x in (-3.0, 0.0, 1.5) for m in (0.0, 0.7)
                         for s in (0.5, 2.0, 0.0, -1.0, float("nan"))],
     }
@@ -193,7 +199,7 @@ def test_no_compiler_warnings(report):
                                   "rounding", "truncation", "floors", "int_powers", "mixed_minmax",
                                   "np_extremes", "truthiness", "chained", "collatz_steps", "stepped_sum",
                                   "ppf_roundtrip", "norm_family", "carried_partial", "carried_prev",
-                                  "fresh_each_iteration", "elif_spanning"])
+                                  "fresh_each_iteration", "elif_spanning", "int_float_mix"])
 def test_matches_python(report, name):
     f = next(f for f in report.functions if f.name == name)
     bad = [c for c in f.cases if c.outcome == "mismatch"]
@@ -215,3 +221,12 @@ def test_division_by_zero_raises_like_python(report):
 def test_norm_ppf_matches_scipy_closely(report):
     f = next(f for f in report.functions if f.name == "ppf_roundtrip")
     assert f.max_rel_err < 1e-13
+
+
+def test_negative_base_fractional_power_is_known_not_mismatch(report):
+    """(-8) ** (2/9): a Python float goes complex, C (like np.float64) gives NaN. The verifier
+    must call that a known float difference, and both paths must be exercised."""
+    f = next(f for f in report.functions if f.name == "int_float_mix")
+    given = [c for c in f.cases if c.source == "given"]
+    assert any(c.outcome == "known" and c.args[0] < 0 for c in given)
+    assert all(c.outcome == "match" for c in given if c.args[0] >= 0 and c.args[1] >= 0)
