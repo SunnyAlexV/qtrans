@@ -918,7 +918,7 @@ def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
         shutil.copy(RANDOM_HEADER, build / "qtrans_random.hpp")
     exe = build / ("qtrans_driver.exe" if os.name == "nt" else "qtrans_driver")
     cmd = cxx.command(driver, exe, build, system)
-    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=build)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=build)
     if proc.returncode != 0:
         raise RuntimeError(f"C++ compilation failed:\n{' '.join(cmd)}\n{proc.stderr}{proc.stdout}")
     diagnostics = (proc.stderr + proc.stdout).splitlines()
@@ -932,7 +932,7 @@ def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
             enc = " ".join(_encode(v, p.type) for v, p in zip(c.args, sig.params))
             lines.append(f"CALL {fc.name} {enc}")
             index.append((fc, c))
-    run = subprocess.run([str(exe)], input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=600)
+    run = subprocess.run([str(exe)], input="\n".join(lines) + "\n", capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
     outputs = run.stdout.splitlines()
     if len(outputs) != len(lines):
         raise RuntimeError(f"C++ driver produced {len(outputs)} results for {len(lines)} cases "
@@ -963,7 +963,7 @@ def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
             fc.py_ns = _bench_python(fn, _call_args(case.args, result.signatures[fc.name]))
             sig = result.signatures[fc.name]
             enc = " ".join(_encode(v, p.type) for v, p in zip(case.args, sig.params))
-            r = subprocess.run([str(exe)], input=f"BENCH {fc.name} {enc}\n", capture_output=True, text=True)
+            r = subprocess.run([str(exe)], input=f"BENCH {fc.name} {enc}\n", capture_output=True, text=True, encoding="utf-8", errors="replace")
             fc.cpp_ns = float(r.stdout.split()[1])
 
     return VerifyReport(str(path), result, f"{Path(cxx.path).name}", " ".join(cmd), warns, checks, rtol, atol)

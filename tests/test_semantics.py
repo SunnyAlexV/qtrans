@@ -173,7 +173,7 @@ SOURCE = textwrap.dedent('''
 def report(tmp_path_factory):
     d = tmp_path_factory.mktemp("sem")
     f = d / "semantics.py"
-    f.write_text(SOURCE)
+    f.write_text(SOURCE, encoding="utf-8")
     return verify_file(f, n_random=50, build_dir=d / "build")
 
 

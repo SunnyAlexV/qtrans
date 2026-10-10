@@ -265,7 +265,7 @@ QTRANS_CASES = {"label": [(1.0,), (-0.0,)], "is_known": [("Long only",), ("long 
 def _verify(tmp_path_factory, src, name):
     d = tmp_path_factory.mktemp(name)
     f = d / f"{name}.py"
-    f.write_text(src)
+    f.write_text(src, encoding="utf-8")
     return verify_file(f, n_random=60, build_dir=d / "build")
 
 

@@ -148,7 +148,7 @@ compiled = pytest.mark.skipif(not HAVE, reason="no C++ compiler or Eigen")
 def report(tmp_path_factory):
     d = tmp_path_factory.mktemp("lin")
     f = d / "linalg_try.py"
-    f.write_text(SOURCE)
+    f.write_text(SOURCE, encoding="utf-8")
     return verify_file(f, n_random=60, build_dir=d / "build")
 
 
@@ -277,7 +277,7 @@ def test_pinv_is_accurate_on_badly_scaled_matrices(tmp_path):
     src = HEAD + "def p(A: Mat) -> Mat:\n    return np.linalg.pinv(A)\n\nQTRANS_CASES = {'p': [" + \
         ", ".join(f"({m!r},)" for m in mats) + "]}\n"
     f = tmp_path / "hard_pinv.py"
-    f.write_text(src)
+    f.write_text(src, encoding="utf-8")
     rep = verify_file(f, n_random=0, build_dir=tmp_path / "build")
     mpmath.mp.dps = 60
     for c in rep.functions[0].cases:

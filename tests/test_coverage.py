@@ -170,7 +170,7 @@ compiled = pytest.mark.skipif(not HAVE, reason="no C++ compiler or Eigen")
 def report(tmp_path_factory):
     d = tmp_path_factory.mktemp("cov")
     f = d / "coverage.py"
-    f.write_text(SOURCE)
+    f.write_text(SOURCE, encoding="utf-8")
     return verify_file(f, n_random=40, build_dir=d / "build")
 
 

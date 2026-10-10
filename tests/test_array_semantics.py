@@ -125,7 +125,7 @@ BIT_EXACT = ["total", "matrix_sums", "moments", "quantiles", "grid", "steps", "r
 def report(tmp_path_factory):
     d = tmp_path_factory.mktemp("arr")
     f = d / "arrays_sem.py"
-    f.write_text(SOURCE)
+    f.write_text(SOURCE, encoding="utf-8")
     return verify_file(f, n_random=40, build_dir=d / "build")
 
 

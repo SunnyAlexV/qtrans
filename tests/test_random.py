@@ -110,7 +110,7 @@ pytestmark_compiled = pytest.mark.skipif(not HAVE, reason="no C++ compiler or Ei
 def report(tmp_path_factory):
     d = tmp_path_factory.mktemp("rng")
     f = d / "random_sem.py"
-    f.write_text(SOURCE)
+    f.write_text(SOURCE, encoding="utf-8")
     return verify_file(f, n_random=30, build_dir=d / "build")
 
 
