@@ -20,12 +20,13 @@ from pathlib import Path
 from . import library as lib
 from .errors import Unsupported
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
+from . import classes as cls_
 from .functions import FunctionTranslator, is_docstring, subscript_root, target_leaves, view_root
 from .report import FunctionReport, ModuleReport
-from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
-                    TupleType, assignable, is_array)
+from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
+                    StructType, TupleType, assignable, is_array)
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
 # code. Reported once per module instead of under every function.
@@ -58,6 +59,9 @@ class Signature:
     ret: object
     lineno: int
     doc: str | None
+    owner: str | None = None        # the class, for a method
+    kind: str = "function"          # or "instance", "property", "static", "class", "post_init"
+    const: bool = False             # a method that doesn't modify self
 
 
 @dataclass
@@ -76,6 +80,7 @@ class TranslationResult:
     uses_runtime: bool
     uses_arrays: bool = False
     uses_random: bool = False
+    classes: dict = None   # name -> classes.ClassInfo, translated classes only (stage 5)
 
 
 def _collect_comments(source):
@@ -123,6 +128,7 @@ class ModuleTranslator:
         self.type_aliases: set = set()     # module-level `Vec = ...` / `Mat = ...`
         self.returns_alias: dict = {}      # function -> indices of array params it may return
         self.errstate_funcs: set[str] = set()
+        self.classes: dict = {}            # name -> classes.ClassInfo (stage 5)
 
     # --- annotations -----------------------------------------------------------------
     def parse_annotation(self, node, allow_void=False):
@@ -136,10 +142,15 @@ class ModuleTranslator:
             if not isinstance(inner, (Scalar, ArrayType)):
                 raise Unsupported(node, f"'{ast.unparse(node)}': only a number or an array can be optional")
             return OptionalType(inner)
-        elif isinstance(node, ast.Name) and node.id in ("float", "int", "bool"):
-            return {"float": FLOAT, "int": INT, "bool": BOOL}[node.id]
+        elif isinstance(node, ast.Name) and node.id in ("float", "int", "bool", "str"):
+            return {"float": FLOAT, "int": INT, "bool": BOOL, "str": STR}[node.id]
         elif isinstance(node, ast.Name) and self.imports.get(node.id) == "numpy.random.Generator":
             return RNG
+        elif isinstance(node, ast.Name) and node.id in self.classes:
+            c = self.classes[node.id]
+            if c.rejected is not None:
+                raise Unsupported(node, f"class {c.name} could not be translated: {c.rejected.message}")
+            return c.type
         elif isinstance(node, ast.Name) and node.id in ("Vec", "Mat") and (
                 self.imports.get(node.id) == f"qtrans.typing.{node.id}" or node.id in self.type_aliases):
             return VEC if node.id == "Vec" else MAT
@@ -155,7 +166,7 @@ class ModuleTranslator:
             if bname in ("tuple", "Tuple"):
                 elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
                 ts = tuple(self.parse_annotation(e) for e in elts)
-                if all(isinstance(t, (Scalar, ArrayType)) for t in ts) and len(ts) >= 1:
+                if all(isinstance(t, (Scalar, ArrayType)) or t == STR for t in ts) and len(ts) >= 1:
                     return TupleType(ts)
         text = ast.unparse(node)
         if "ndarray" in text or "NDArray" in text:
@@ -163,6 +174,121 @@ class ModuleTranslator:
                               "annotate with Vec (1-D) or Mat (2-D): `from qtrans.typing import Vec, Mat`")
         raise Unsupported(node, f"type annotation '{text}' is not supported",
                           "use float, int, bool, Vec, Mat, or tuple[...] of those")
+
+    # --- classes (stage 5) -------------------------------------------------------------
+    def _register_class(self, node):
+        try:
+            is_dc, frozen, eq, nt = cls_.dataclass_options(self, node)
+        except Unsupported as e:
+            info = cls_.ClassInfo(node.name, node, rejected=e)
+            self.classes[node.name] = info
+            return
+        if not (is_dc or nt):
+            if any(isinstance(b, ast.Name) and b.id in ("Exception", "ValueError", "RuntimeError") for b in node.bases):
+                self.report.module_notes.append(f"line {node.lineno}: exception class `{node.name}` skipped "
+                                                "(raise ValueError / RuntimeError instead)")
+                return
+            info = cls_.ClassInfo(node.name, node, rejected=Unsupported(
+                node, f"class {node.name} is a plain class; only @dataclass and NamedTuple are supported so far",
+                "add @dataclass if its attributes are all set in __init__ from its arguments"))
+            self.classes[node.name] = info
+            return
+        self.classes[node.name] = cls_.ClassInfo(node.name, node, frozen=frozen, eq=eq, namedtuple=nt)
+
+    def _collect_classes(self):
+        """Fields, defaults and method signatures of every class, once all names are known."""
+        for info in self.classes.values():
+            if info.rejected is None:
+                try:
+                    cls_.collect_class_body(self, info)
+                except Unsupported as e:
+                    info.rejected = e
+        for info in self.classes.values():
+            if info.rejected is None:
+                try:
+                    cls_.check_field_types(self, info)
+                    self._field_defaults(info)
+                except Unsupported as e:
+                    info.rejected = e
+        try:
+            self.class_order = cls_.struct_order({n: c for n, c in self.classes.items() if c.rejected is None})
+        except Unsupported as e:
+            for c in self.classes.values():
+                c.rejected = c.rejected or e
+            self.class_order = []
+        changed = True
+        while changed:  # a class holding a rejected class is rejected too
+            changed = False
+            for info in self.classes.values():
+                if info.rejected is not None:
+                    continue
+                for f in info.fields:
+                    t = f.type.inner if isinstance(f.type, OptionalType) else f.type
+                    if isinstance(t, StructType) and self.classes[t.name].rejected is not None:
+                        info.rejected = Unsupported(info.node, f"field '{f.name}' holds a {t.name}, which could "
+                                                               f"not be translated: {self.classes[t.name].rejected.message}")
+                        changed = True
+                        break
+        for info in self.classes.values():
+            if info.rejected is not None:
+                continue
+            try:
+                for m in info.methods.values():
+                    if m.name in cls_.DUNDERS_SKIPPED:
+                        info.notes.append(f"{m.name} skipped: it only formats text")
+                        continue
+                    self.fdefs[m.key] = m.fdef
+                    self.sigs[m.key] = self.method_signature(info, m)
+            except Unsupported as e:
+                info.rejected = e
+        for info in self.classes.values():
+            if info.rejected is not None:
+                for m in info.methods.values():
+                    self.fdefs.pop(m.key, None)
+                    self.sigs.pop(m.key, None)
+
+    def _field_defaults(self, info):
+        tr = _ConstTranslator(self)
+        for f in info.fields:
+            node = f.default if f.default is not None else f.factory
+            if node is None:
+                continue
+            e = tr.expr_raw(node) if isinstance(f.type, OptionalType) else tr.expr(node)
+            if not assignable(f.type, e.type):
+                raise Unsupported(node, f"the default for field '{f.name}' is a {e.type} but the field is {f.type}")
+            if isinstance(f.type, OptionalType):
+                e = tr.to_optional(e, f.type)
+            f.default_code = tr.as_double(e).code if f.type == FLOAT else e.code
+
+    def method_signature(self, info, m):
+        f = m.fdef
+        args = f.args.args[1:] if m.kind != "static" else f.args.args
+        stub = ast.FunctionDef(name=f.name, args=ast.arguments(posonlyargs=[], args=args, vararg=None,
+                               kwonlyargs=[], kw_defaults=[], kwarg=None,
+                               defaults=list(f.args.defaults)[-len(args):] if args and f.args.defaults else []),
+                               body=f.body, decorator_list=[], returns=f.returns, lineno=f.lineno)
+        if m.kind == "post_init" and f.returns is None:
+            stub.returns = ast.Constant(None)
+        sig = self.signature(stub)
+        sig.owner, sig.kind = info.name, m.kind
+        py_names = {n.id for n in ast.walk(f) if isinstance(n, ast.Name)} | {a.arg for a in f.args.args}
+        for prm in sig.params:  # a parameter named like a field would shadow it
+            prm.cpp = cls_.member_safe_name(prm.name, info, py_names)
+        if m.kind == "post_init" and sig.ret != VOID:
+            raise Unsupported(f, "__post_init__ must return None")
+        return sig
+
+    def _rejected_class_in(self, sig):
+        for t in [p.type for p in sig.params] + [sig.ret]:
+            for x in (t.elts if isinstance(t, TupleType) else [t]):
+                x = x.inner if isinstance(x, OptionalType) else x
+                if isinstance(x, StructType) and self.classes[x.name].rejected is not None:
+                    return Unsupported(self.fdefs[sig.name] if sig.name in self.fdefs else None,
+                                       f"uses class {x.name}, which could not be translated: "
+                                       f"{self.classes[x.name].rejected.message}")
+        if sig.owner and self.classes[sig.owner].rejected is not None:
+            return self.classes[sig.owner].rejected
+        return None
 
     def _optional_inner(self, node):
         """X | None, None | X, Optional[X], Union[X, None] -> the X node; otherwise None."""
@@ -247,17 +373,19 @@ class ModuleTranslator:
             elif isinstance(node, ast.If) and "__name__" in ast.unparse(node.test):
                 self.report.module_notes.append(f"line {node.lineno}: `if __name__ == ...` block skipped")
             elif isinstance(node, ast.ClassDef):
-                self.report.module_notes.append(f"line {node.lineno}: class `{node.name}` skipped "
-                                                "(classes arrive in stage 4)")
+                self._register_class(node)
             elif isinstance(node, ast.AsyncFunctionDef):
                 self.report.module_notes.append(f"line {node.lineno}: async function `{node.name}` skipped")
             else:
                 self.report.module_notes.append(f"line {node.lineno}: module-level "
                                                 f"{type(node).__name__} statement skipped")
 
+        self._collect_classes()
         for f in self.fdefs.values():
             self._strip_errstate(f)
         for name, f in self.fdefs.items():
+            if name in self.rejected or name in self.sigs:  # methods already have theirs
+                continue
             try:
                 self.sigs[name] = self.signature(f)
             except Unsupported as e:
@@ -331,22 +459,57 @@ class ModuleTranslator:
             return True
         return False
 
+    def _shareable(self, t) -> bool:
+        """Types Python shares rather than copies on assignment and calls."""
+        return is_array(t) or t in (RNG, STR) or _optional_array(t) or isinstance(t, StructType)
+
+    def immutable(self, t) -> bool:
+        """A frozen object with no array anywhere inside: nothing about it can change. (Frozen
+        only stops fields being reassigned; an array field can still be changed in place.)"""
+        if not isinstance(t, StructType):
+            return False
+        info = self.classes[t.name]
+        return info.frozen and not info.has_array_field(self.classes) and all(
+            self.immutable(f.type) for f in info.fields if isinstance(f.type, StructType))
+
+    def chain_type(self, node, ptypes):
+        """The static type of `p`, `p.field`, `self.inner.w` for a parameter p; else None."""
+        if isinstance(node, ast.Name):
+            return ptypes.get(node.id)
+        if isinstance(node, ast.Attribute):
+            t = self.chain_type(node.value, ptypes)
+            if isinstance(t, StructType) and t.name in self.classes:
+                f = self.classes[t.name].field(node.attr)
+                return f.type if f is not None else None
+        return None
+
+    def _param_types(self, name):
+        sig = self.sigs[name]
+        pt = {p.name: p.type for p in sig.params}
+        if sig.owner and sig.kind in ("instance", "property", "post_init"):
+            pt["self"] = self.classes[sig.owner].type
+        return pt
+
     def analyze_array_params(self):
-        """Decide how each array parameter is passed so the C++ behaves like Python, where
-        arrays are shared, not copied, when passed to a function."""
+        """Decide how each array or object parameter is passed (and which methods are const) so
+        the C++ behaves like Python, where arrays and objects are shared, not copied, when
+        passed to a function. A parameter (or self) is modified if something stores into it
+        (an element, a field), calls a method that modifies it, or passes it, or one of its
+        fields, to a function that modifies that argument; this is iterated to a fixpoint."""
         inplace, rebound, calls = {}, {}, {}
         for name, f in self.fdefs.items():
             if name not in self.sigs:
                 continue
             sig = self.sigs[name]
-            arr = {p.name for p in sig.params if is_array(p.type) or p.type == RNG or _optional_array(p.type)}
+            ptypes = self._param_types(name)
+            arr = {n for n, t in ptypes.items() if self._shareable(t)}
             ip, rb, cl = set(), set(), []
             for n in ast.walk(f):
                 if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                     targets = n.targets if isinstance(n, ast.Assign) else [n.target]
                     for t in targets:
                         for leaf in target_leaves(t):
-                            if isinstance(leaf, ast.Subscript):
+                            if isinstance(leaf, (ast.Subscript, ast.Attribute)):
                                 root = subscript_root(leaf)
                                 if root in arr:
                                     ip.add(root)
@@ -356,13 +519,32 @@ class ModuleTranslator:
                                 (ip if isinstance(n, ast.AugAssign) else rb).add(leaf.id)
                 elif isinstance(n, ast.For) and isinstance(n.target, ast.Name) and n.target.id in arr:
                     rb.add(n.target.id)
-                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in self.sigs:
-                    callee = self.sigs[n.func.id]
-                    pos = {p.name: i for i, p in enumerate(callee.params)}
-                    pairs = list(enumerate(n.args)) + [(pos.get(k.arg, -1), k.value) for k in n.keywords]
-                    for i, a in pairs:
-                        if isinstance(a, ast.Name) and a.id in arr and i >= 0:
-                            cl.append((n.func.id, i, a.id))
+                elif isinstance(n, ast.Call):
+                    if ast.unparse(n.func) == "object.__setattr__" and n.args and \
+                            isinstance(n.args[0], ast.Name) and n.args[0].id in arr:
+                        ip.add(n.args[0].id)
+                    callee = None
+                    if isinstance(n.func, ast.Name) and n.func.id in self.sigs:
+                        callee = n.func.id
+                    elif isinstance(n.func, ast.Attribute):
+                        bt = self.chain_type(n.func.value, ptypes)
+                        if isinstance(bt, StructType) and bt.name in self.classes:
+                            m = self.classes[bt.name].methods.get(n.func.attr)
+                            if m is not None and m.key in self.sigs:
+                                callee = m.key
+                                root = subscript_root(n.func.value) if not isinstance(n.func.value, ast.Name) \
+                                    else n.func.value.id
+                                if root in arr and m.kind in ("instance",):
+                                    cl.append((callee, "self", root))
+                    if callee is not None:
+                        cs = self.sigs[callee]
+                        pos = {p.name: i for i, p in enumerate(cs.params)}
+                        pairs = list(enumerate(n.args)) + [(pos.get(k.arg, -1), k.value) for k in n.keywords]
+                        for i, a in pairs:
+                            root = a.id if isinstance(a, ast.Name) else (
+                                subscript_root(a) if isinstance(a, (ast.Attribute, ast.Subscript)) else None)
+                            if root in arr and i >= 0:
+                                cl.append((callee, i, root))
             # `S = S.copy()` first, then `S += ...`: the changes never reach the caller
             fresh = {p for p in ip & rb if self._starts_fresh(f, p, self.sigs)}
             ip -= fresh
@@ -372,21 +554,31 @@ class ModuleTranslator:
             for n in ast.walk(f):
                 if isinstance(n, ast.Return) and n.value is not None:
                     root = view_root(n.value, {p.name: p.type for p in sig.params})
-                    if root in arr:
+                    if root in arr and root != "self":
                         idx = next(i for i, p in enumerate(sig.params) if p.name == root)
                         self.returns_alias.setdefault(name, set()).add(idx)
         changed = True
-        while changed:  # passing an array to a function that modifies it modifies it too
+        while changed:  # passing an array or object to a function that modifies it modifies it too
             changed = False
             for name, lst in calls.items():
                 for callee, i, arg in lst:
                     cs = self.sigs[callee]
-                    if i < len(cs.params) and cs.params[i].name in inplace.get(callee, ()) \
-                            and arg not in inplace[name]:
+                    target = "self" if i == "self" else (cs.params[i].name if i < len(cs.params) else None)
+                    if target is not None and target in inplace.get(callee, ()) and arg not in inplace[name]:
                         inplace[name].add(arg)
                         changed = True
+        self.modified = inplace
         for name, ip in inplace.items():
             sig = self.sigs[name]
+            if sig.owner:
+                info = self.classes[sig.owner]
+                if sig.kind in ("instance", "property"):
+                    # (assigning a field of a frozen object is refused where it happens; changing an
+                    # array inside one is allowed, in Python as here)
+                    sig.const = "self" not in ip
+                    if not sig.const and sig.kind == "property":
+                        self.rejected[name] = Unsupported(self.fdefs[name], f"property {sig.name} modifies self",
+                                                          "make it a method")
             for p in sig.params:
                 if p.type == RNG:
                     # drawing advances the caller's generator, as in Python: pass by reference
@@ -395,6 +587,9 @@ class ModuleTranslator:
                             self.fdefs[name], f"generator parameter '{p.name}' is reassigned",
                             "use a new name for the new generator")
                     p.mode = "ref"
+                    continue
+                if p.type == STR:  # strings are immutable: read by reference unless rebound
+                    p.mode = "value" if p.name in rebound[name] else "cref"
                     continue
                 if _optional_array(p.type):
                     # an array that may be None: read it, or rebind the name, but don't modify it
@@ -405,14 +600,49 @@ class ModuleTranslator:
                             "not supported", f"check for None, then work on a copy: {p.name}_ = {p.name}.copy()")
                     p.mode = "value" if p.name in rebound[name] else "cref"
                     continue
-                if not is_array(p.type):
+                if isinstance(p.type, StructType) and self.immutable(p.type):
+                    p.mode = "value" if p.name in rebound[name] else "cref"  # can't change: never copied
                     continue
+                if not (is_array(p.type) or isinstance(p.type, StructType)):
+                    continue
+                what = "array" if is_array(p.type) else "object"
                 if p.name in ip and p.name in rebound[name]:
                     self.rejected[name] = Unsupported(
-                        self.fdefs[name], f"array parameter '{p.name}' is both modified in place and "
+                        self.fdefs[name], f"{what} parameter '{p.name}' is both modified in place and "
                         "reassigned: in Python the caller sees changes made before the reassignment "
-                        "but not after it", f"work on a copy: {p.name}_ = {p.name}.copy()")
+                        "but not after it", f"work on a copy: {p.name}_ = {p.name}.copy()" if what == "array"
+                        else f"work on a copy: {p.name}_ = copy.deepcopy({p.name})")
                 p.mode = "ref" if p.name in ip else "value" if p.name in rebound[name] else "cref"
+        self._check_post_init_sharing()
+
+    def _check_post_init_sharing(self):
+        """__post_init__ changing an array or object field in place changes the caller's own
+        array in Python (the field *is* the argument); the C++ object holds a copy."""
+        for info in self.classes.values():
+            m = info.methods.get("__post_init__")
+            if info.rejected is not None or m is None or m.key not in self.sigs:
+                continue
+            shared = {f.name for f in info.init_fields if is_array(f.type) or isinstance(f.type, StructType)}
+            for n in ast.walk(m.fdef):
+                hit = None
+                if isinstance(n, (ast.Assign, ast.AugAssign)):
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                        for leaf in target_leaves(t):
+                            node = leaf
+                            # self.w[i] = ..., self.w += ..., self.inner.x = ...: dig to self.<field>
+                            while isinstance(node, (ast.Subscript, ast.Attribute)) and not (
+                                    isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                                    and node.value.id == "self"):
+                                node = node.value
+                            if isinstance(node, ast.Attribute) and node.attr in shared and (
+                                    node is not leaf or isinstance(n, ast.AugAssign)):
+                                hit = node.attr
+                if hit:
+                    info.rejected = Unsupported(
+                        n, f"__post_init__ changes field '{hit}' in place: in Python that changes the array or "
+                           "object the caller passed in, which the C++ object holds a copy of",
+                        f"assign a new value instead, e.g. self.{hit} = self.{hit} / self.{hit}.sum()")
+                    break
 
     def collect_constant(self, node, assigned_count):
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -434,7 +664,7 @@ class ModuleTranslator:
         tr = _ConstTranslator(self)
         try:
             e = tr.expr(node.value)
-            if not isinstance(e.type, Scalar):
+            if not isinstance(e.type, Scalar) and e.type != STR:
                 raise Unsupported(node, f"{e.type} constants are not supported")
             t = e.type
             if isinstance(node, ast.AnnAssign):
@@ -472,14 +702,15 @@ class ModuleTranslator:
                                   f"`{arg.arg}: Vec` / `{arg.arg}: Mat` for a 1-D / 2-D float array "
                                   f"(from qtrans.typing import Vec, Mat)")
             t = self.parse_annotation(arg.annotation)
-            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType)):
+            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType)) and t != STR:
                 raise Unsupported(arg, f"parameter '{arg.arg}': {t} parameters are not supported; "
                                        "use float, int, bool, Vec, Mat or np.random.Generator")
             if d is not None and isinstance(t, RngType):
                 raise Unsupported(d, f"generator parameter '{arg.arg}' can't have a default value")
             code = None
-            if d is not None and isinstance(t, ArrayType):
-                raise Unsupported(d, f"array parameter '{arg.arg}' can't have a default value")
+            if d is not None and isinstance(t, (ArrayType, StructType)):
+                raise Unsupported(d, f"parameter '{arg.arg}' can't have a default {t}: Python creates it once "
+                                     "and shares it between calls")
             if d is not None:
                 e = tr.expr_raw(d) if isinstance(t, OptionalType) else tr.expr(d)
                 if not assignable(t, e.type):
@@ -507,6 +738,11 @@ class ModuleTranslator:
             for name, f in self.fdefs.items():
                 if name in self.rejected or name in bodies:
                     continue
+                bad = self._rejected_class_in(self.sigs[name])
+                if bad is not None:
+                    self.rejected[name] = bad
+                    progress = True
+                    continue
                 tr = FunctionTranslator(self, f, self.sigs[name])
                 try:
                     bodies[name] = tr.translate()
@@ -519,11 +755,30 @@ class ModuleTranslator:
                 except Unsupported as e:
                     self.rejected[name] = e
                     progress = True
+            for info in self.classes.values():  # one untranslatable method sinks its class
+                if info.rejected is None:
+                    bad = next((m for m in info.methods.values() if m.key in self.rejected), None)
+                    if bad is not None:
+                        e = self.rejected[bad.key]
+                        info.rejected = Unsupported(bad.fdef, f"method {bad.name} could not be translated: "
+                                                              f"{e.message}", e.hint)
+                        progress = True
             if not progress:
                 break
             bodies, notes, general = {}, {}, {}  # retranslate: a call may now point at a rejected function
 
+        for info in self.classes.values():
+            if info.rejected is not None:
+                e = info.rejected
+                self.report.functions.append(FunctionReport(f"class {info.name}", info.node.lineno, False,
+                                                            e.message, e.lineno, e.hint))
+            else:
+                self.report.functions.append(FunctionReport(f"class {info.name}", info.node.lineno, True,
+                                                            notes=list(info.notes)))
         for name, f in self.fdefs.items():
+            owner = self.sigs[name].owner if name in self.sigs else None
+            if owner and self.classes[owner].rejected is not None:
+                continue  # reported with its class
             if name in bodies:
                 self.report.functions.append(FunctionReport(name, f.lineno, True, notes=notes[name]))
             else:
@@ -535,8 +790,9 @@ class ModuleTranslator:
         header = self.render(bodies)
         sigs = {n: self.sigs[n] for n in bodies}
         uses_random = "qtrans_random.hpp" in header
+        live = {n: self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None}
         return TranslationResult(self.module_name, header, self.report, sigs, "qt::" in header,
-                                 "qtrans_arrays.hpp" in header or uses_random, uses_random)
+                                 "qtrans_arrays.hpp" in header or uses_random, uses_random, live)
 
     # --- rendering -----------------------------------------------------------------------------
     def attached_comments(self, first_line):
@@ -547,11 +803,11 @@ class ModuleTranslator:
             ln -= 1
         return list(reversed(out))
 
-    def cpp_signature(self, sig, defaults, used_params=None):
+    def cpp_signature(self, sig, defaults, used_params=None, name=None):
         parts = []
         for p in sig.params:
             attr = "[[maybe_unused]] " if used_params is not None and p.name not in used_params else ""
-            if is_array(p.type) or p.type == RNG or _optional_array(p.type):
+            if is_array(p.type) or p.type in (RNG, STR) or _optional_array(p.type) or isinstance(p.type, StructType):
                 ty = {"cref": f"const {p.type.cpp()}&", "ref": f"{p.type.cpp()}&"}.get(p.mode, p.type.cpp())
             else:
                 ty = p.type.cpp()
@@ -559,7 +815,98 @@ class ModuleTranslator:
             if defaults and p.default_code is not None:
                 s += f" = {p.default_code}"
             parts.append(s)
-        return f"{sig.ret.cpp()} {sig.cpp}({', '.join(parts)})"
+        return f"{sig.ret.cpp()} {name or sig.cpp}({', '.join(parts)})"
+
+    # --- structs ------------------------------------------------------------------------------
+    def _ctor_params(self, info, defaults):
+        names = {f.cpp for f in info.fields}
+        out = []
+        for f in info.init_fields:
+            pname = f.cpp + "_"
+            while pname in names:
+                pname += "_"
+            ty = f.type.cpp()
+            if is_array(f.type) or isinstance(f.type, StructType) or f.type == STR or _optional_array(f.type):
+                ty = f"{ty} "  # by value: the object keeps its own copy (see the sharing analysis)
+            d = f" = {f.default_code}" if defaults and f.default_code is not None else ""
+            out.append((f, pname, f"{ty.strip()} {pname}{d}"))
+        return out
+
+    def render_struct(self, info, bodies) -> list:
+        """The struct: fields, constructors and member declarations. Member functions are
+        defined after the module's function declarations, so they can call anything."""
+        out = []
+        if info.doc:
+            out += [("/// " + line).rstrip() for line in inspect.cleandoc(info.doc).splitlines()]
+        kind = "NamedTuple" if info.namedtuple else ("frozen dataclass" if info.frozen else "dataclass")
+        out.append(f"struct {info.cpp} {{  // {kind}")
+        for f in info.fields:
+            note = "" if f.init else "  // init=False: set by __post_init__ or its default"
+            out.append(f"    {f.type.cpp()} {f.cpp}{{}};{note}")
+        out.append("")
+        out.append(f"    {info.cpp}() = default;  // only so a variable can be declared before it is assigned")
+        params = self._ctor_params(info, defaults=True)
+        required = sum(1 for f, _, _ in params if f.default_code is None)
+        explicit = "explicit " if params and required <= 1 else ""  # no silent conversions
+        out.append(f"    {explicit}{info.cpp}({', '.join(p for _, _, p in params)});")
+        for m in info.methods.values():
+            if m.key not in bodies or m.kind == "post_init":
+                continue
+            sig = self.sigs[m.key]
+            decl = self.cpp_signature(sig, defaults=True)
+            if m.kind in ("static", "class"):
+                decl = "static " + decl
+            elif sig.const:
+                decl += " const"
+            out.append(f"    {decl};" + ("  // @property" if m.kind == "property" else ""))
+        if info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields):
+            out.append(f"    bool operator==(const {info.cpp}& other) const;")
+            out.append(f"    bool operator!=(const {info.cpp}& other) const {{ return !(*this == other); }}")
+        out.append("};")
+        out.append("")
+        return out
+
+    def render_members(self, info, bodies) -> list:
+        out = []
+        params = self._ctor_params(info, defaults=False)
+        inits = [f"{f.cpp}(std::move({pname}))" if not isinstance(f.type, Scalar) else f"{f.cpp}({pname})"
+                 for f, pname, _ in params]
+        for f in info.fields:
+            if not f.init and f.default_code is not None:
+                inits.append(f"{f.cpp}({f.default_code})")
+        head = f"inline {info.cpp}::{info.cpp}({', '.join(p for _, _, p in params)})"
+        post = info.methods.get("__post_init__")
+        body = bodies.get(post.key) if post is not None else None
+        if inits:
+            head += "\n    : " + ", ".join(inits)
+        out.append(head + (" {" if body else " {}"))
+        if body:
+            out.append("    // __post_init__")
+            out += body
+            out.append("}")
+        out.append("")
+        for m in info.methods.values():
+            if m.key not in bodies or m.kind == "post_init":
+                continue
+            sig = self.sigs[m.key]
+            if sig.doc:
+                out += [("/// " + line).rstrip() for line in sig.doc.splitlines()]
+            used = {x.id for x in ast.walk(m.fdef) if isinstance(x, ast.Name)}
+            line = "inline " + self.cpp_signature(sig, defaults=False, used_params=used,
+                                                   name=f"{info.cpp}::{sig.cpp}")
+            if m.kind not in ("static", "class") and sig.const:
+                line += " const"
+            out.append(line + " {")
+            out += bodies[m.key]
+            out.append("}")
+            out.append("")
+        if info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields):
+            terms = [f"{f.cpp} == other.{f.cpp}" for f in info.fields if f.compare]
+            out.append(f"inline bool {info.cpp}::operator==(const {info.cpp}& other) const {{")
+            out.append(f"    return {' && '.join(terms)};")
+            out.append("}")
+            out.append("")
+        return out
 
     def render(self, bodies) -> str:
         ns = cpp_ident(re.sub(r"\W", "_", self.module_name) or "module")
@@ -577,13 +924,19 @@ class ModuleTranslator:
                 out.append(f"inline const {c.type.cpp()} {c.cpp} = {c.code};")
             out.append("")
 
-        names = [n for n in self.fdefs if n in bodies]
-        forward = len(names) > 1
+        live = [self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None]
+        for info in live:
+            out += self.render_struct(info, bodies)
+        names = [n for n in self.fdefs if n in bodies and not self.sigs[n].owner]
+        forward = len(names) > 1 or (live and names)
         if forward:
             out.append("// Declarations (so functions can call each other in any order).")
             for n in names:
                 out.append(self.cpp_signature(self.sigs[n], defaults=True) + ";")
             out.append("")
+
+        for info in live:
+            out += self.render_members(info, bodies)
 
         for n in names:
             f, sig = self.fdefs[n], self.sigs[n]
@@ -604,7 +957,8 @@ class ModuleTranslator:
         includes = ["<cmath>"]
         checks = [("<algorithm>", r"std::(max|min)\("), ("<cstdlib>", r"std::abs\("),
                   ("<stdexcept>", r"throw std::"), ("<tuple>", r"std::(tuple|tie|ignore|make_tuple)"),
-                  ("<initializer_list>", r"std::(max|min)\(\{")]
+                  ("<initializer_list>", r"std::(max|min)\(\{"), ("<string>", r"std::string"),
+                  ("<optional>", r"std::optional"), ("<utility>", r"std::move\(")]
         for inc, pat in checks:
             if re.search(pat, text):
                 includes.append(inc)

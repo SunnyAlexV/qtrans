@@ -122,7 +122,7 @@ def test_elementwise_update_needs_no_eval():
     ("def f(a: Vec, b: Vec) -> bool:\n    return (a > 0).all() and (b > 0)\n", "`and`/`or` on arrays"),
     ("def f(a: Vec) -> None:\n    for x in a:\n        a[0] = x\n", "while iterating"),
     ("def g(x: Vec, y: Vec) -> None:\n    x[0] = y[0]\n\ndef f(a: Vec) -> None:\n    g(a, a)\n",
-     "the same array is passed twice"),
+     "is passed twice to g()"),
     ("def g(x: Vec) -> None:\n    x[0] = 1.0\n\ndef f(a: Vec) -> None:\n    g(a * 2)\n", "modifies its argument"),
     ("def f(a: Vec) -> float:\n    return a.reshape(2, 2).sum()\n", "not supported"),
     ("def f(A: Mat, i: int) -> Vec:\n    return A[i, 1:3]\n", "mixing an index and a partial slice"),

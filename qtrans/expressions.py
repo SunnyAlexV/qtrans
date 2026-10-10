@@ -18,9 +18,11 @@ from dataclasses import dataclass
 from . import library as lib
 from .errors import Unsupported
 from .arrays import STACKERS, ArrayOps
-from .types import (BOOL, FLOAT, INT, NONE, RNG, VOID, ArrayType, MaskType, OptionalType, Scalar, TupleType,
-                    assignable, is_array, join)
+from .structs import StructOps
+from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
+                    TupleType, assignable, is_array, join)
 
+from .core import cpp_string
 from .core import (CPP_RESERVED, P_ADD, P_AND, P_ATOM, P_COND, P_EQ, P_MUL, P_OR, P_REL,  # noqa: F401
                    P_UNARY, Expr, cpp_ident, float_literal, wrap)
 
@@ -33,7 +35,7 @@ _UNSUPPORTED_EXPR = {
     "DictComp": ("dict comprehensions", None),
     "GeneratorExp": ("generator expressions", "use an explicit for-loop over range()"),
     "Lambda": ("lambdas", "define a named function at module level"),
-    "JoinedStr": ("f-strings", "strings are only allowed as error messages"),
+    "JoinedStr": ("f-strings", "strings can be compared, passed, returned and joined with +; not formatted"),
     "Subscript": ("indexing / subscripts", "arrays arrive in stage 2"),
     "Starred": ("starred expressions", None),
     "NamedExpr": ("walrus (:=) expressions", "assign on a separate line"),
@@ -67,11 +69,21 @@ _FOLD = {ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b, ast.Gt: lambd
          ast.GtE: lambda a, b: a >= b, ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b}
 
 
+_FLIP_CMP = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+
+
+def _is_lvalue(node) -> bool:
+    """A variable, or a field / element of one: something C++ can bind a reference to."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return isinstance(node, ast.Name)
+
+
 def _is_num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-class ExprTranslator(ArrayOps):
+class ExprTranslator(ArrayOps, StructOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
@@ -119,6 +131,12 @@ class ExprTranslator(ArrayOps):
                 return Expr(f"static_cast<long long>({e.code})", P_ATOM, INT)
         return e
 
+    def as_string(self, e: Expr) -> Expr:
+        """A literal as std::string, so that member functions and + work on it."""
+        if e.type == STR and isinstance(e.value, str):
+            return Expr(f"std::string({e.code})", P_ATOM, STR, value=e.value)
+        return e
+
     def promote(self, e: Expr, t) -> Expr:
         """Make an int -> double conversion explicit when the int isn't a literal. The value is
         the same either way (Python converts too); writing it out keeps the C++ clean under
@@ -141,6 +159,8 @@ class ExprTranslator(ArrayOps):
                 raise Unsupported(node or self.current, "the truth value of an array that may be None",
                                   "test `x is None` explicitly")
             return Expr(f"qt::truthy({e.code})", P_ATOM, BOOL)
+        if e.type == STR:
+            return Expr(f"!{wrap(self.as_string(e), P_ATOM)}.empty()", P_UNARY, BOOL)  # "" is falsy
         if e.type == BOOL:
             return e
         if e.type == INT:
@@ -201,8 +221,7 @@ class ExprTranslator(ArrayOps):
             code, prec = float_literal(v)
             return Expr(code, prec, FLOAT, value=v, simple=True)
         if isinstance(v, str):
-            raise Unsupported(node, "string values are not supported",
-                              "strings are only allowed as exception messages")
+            return Expr(cpp_string(v), P_ATOM, STR, value=v, simple=True)
         if v is None:
             return Expr("std::nullopt", P_ATOM, NONE, simple=True)
         raise Unsupported(node, f"{type(v).__name__} literals are not supported")
@@ -235,13 +254,17 @@ class ExprTranslator(ArrayOps):
     def e_Attribute(self, node):
         q = self.qualify(node)
         src = ast.unparse(node)
+        if isinstance(node.value, ast.Name) and node.value.id in self.mod.classes \
+                and not self.is_variable(node.value.id):
+            raise Unsupported(node, f"'{src}': class attributes are not supported", "use a module-level constant")
         if q is None and not self._is_module_path(node.value):
             base = self.expr(node.value)
             if is_array(base.type):
                 return self.array_attribute(node, base)
+            if isinstance(base.type, StructType):
+                return self.struct_attribute(node, base)
         if q is None:
-            raise Unsupported(node, f"attribute access '{src}' is not supported in stage 1",
-                              "objects and classes arrive in stage 4")
+            raise Unsupported(node, f"attribute access '{src}' is not supported here")
         if q in lib.CONSTANTS:
             return Expr(lib.CONSTANTS[q], P_ATOM, FLOAT, simple=True)
         raise Unsupported(node, f"'{src}' ({q}) can't be used as a value")
@@ -252,6 +275,13 @@ class ExprTranslator(ArrayOps):
 
     def binop(self, node, op, L: Expr, R: Expr) -> Expr:
         node = node or self.current
+        if STR in (L.type, R.type):
+            if isinstance(op, ast.Add) and L.type == R.type == STR:
+                if isinstance(L.value, str) and isinstance(R.value, str):
+                    return self.expr(ast.Constant(L.value + R.value))
+                return Expr(f"{wrap(self.as_string(L), P_ADD)} + {wrap(R, P_ADD - 1)}", P_ADD, STR)
+            raise Unsupported(node, "on strings only + (joining two strings) is supported",
+                              "Python raises TypeError for str + number; formatting isn't supported")
         if any(is_array(e.type) or isinstance(e.type, MaskType) for e in (L, R)):
             return self.array_binop(node, op, L, R)
         if isinstance(op, ast.MatMult):
@@ -332,7 +362,10 @@ class ExprTranslator(ArrayOps):
 
     def e_UnaryOp(self, node):
         if isinstance(node.op, ast.Not):
-            return Expr(f"!{wrap(self.cond(node.operand), P_ATOM)}", P_UNARY, BOOL)
+            raw = self.expr_raw(node.operand)
+            if raw.type == STR:
+                return Expr(f"{wrap(self.as_string(raw), P_ATOM)}.empty()", P_ATOM, BOOL)
+            return Expr(f"!{wrap(self.truth(raw, node.operand), P_ATOM)}", P_UNARY, BOOL)
         e = self.expr(node.operand)
         if isinstance(e.type, MaskType) and isinstance(node.op, ast.Invert):
             return Expr(f"!{wrap(e, P_ATOM)}", P_UNARY, e.type)
@@ -374,8 +407,16 @@ class ExprTranslator(ArrayOps):
     def e_Compare(self, node):
         if any(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
             return self._is_none(node)
+        if any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+            return self._in_literals(node)
         vals = [node.left] + list(node.comparators)
         exprs = [self.expr(v) for v in vals]
+        if any(e.type == STR for e in exprs):
+            return self._compare_strings(node, vals, exprs)
+        if any(isinstance(e.type, StructType) for e in exprs):
+            if len(node.ops) > 1:
+                raise Unsupported(node, "chained comparisons of objects are not supported")
+            return self.struct_compare(node, exprs[0], node.ops[0], exprs[1])
         if any(is_array(e.type) for e in exprs):
             if len(node.ops) > 1:
                 raise Unsupported(node, "chained comparisons of arrays raise ValueError in NumPy")
@@ -404,6 +445,55 @@ class ExprTranslator(ArrayOps):
                 return Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True)
             return parts[0]
         return Expr(" && ".join(wrap(x, P_AND) for x in parts), P_AND, BOOL)
+
+    def _compare_strings(self, node, vals, exprs):
+        if not all(e.type == STR for e in exprs):
+            if all(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops) and len(node.ops) == 1:
+                raise Unsupported(node, "comparing a string with a number: Python says they are never equal",
+                                  "compare like with like")
+            raise Unsupported(node, "ordering a string against a number raises TypeError in Python")
+        if len(node.ops) > 1:
+            for v, e in zip(vals[1:-1], exprs[1:-1]):
+                if not e.simple:
+                    raise Unsupported(v, "chained comparison with a computed middle term",
+                                      "store the middle value in a variable first")
+        parts = []
+        for op, a, b in zip(node.ops, exprs, exprs[1:]):
+            sym, p = _CMP[type(op)]
+            if isinstance(a.value, str) and isinstance(b.value, str):  # two literals: decide now
+                v = _FOLD[type(op)](a.value, b.value)
+                parts.append(Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True))
+                continue
+            if isinstance(a.value, str):  # "x" == s would compare char pointers: put the std::string first
+                a, b, sym = b, a, _FLIP_CMP[sym]
+            parts.append(Expr(f"{wrap(a, p)} {sym} {wrap(b, p - 1)}", p, BOOL))
+        if len(parts) == 1:
+            return parts[0]
+        return Expr(" && ".join(wrap(x, P_AND) for x in parts), P_AND, BOOL)
+
+    def _in_literals(self, node):
+        """`x in ("a", "b")` / `n not in (1, 2)`: a chain of == against a literal tuple or list."""
+        if len(node.ops) != 1 or not isinstance(node.comparators[0], (ast.Tuple, ast.List, ast.Set)):
+            raise Unsupported(node, "`in` is supported against a literal tuple or list: x in (a, b, c)")
+        x = self.expr(node.left)
+        if not x.simple:
+            raise Unsupported(node.left, "the value tested with `in` must be a variable or constant",
+                              "store it in a variable first")
+        negate = isinstance(node.ops[0], ast.NotIn)
+        if not node.comparators[0].elts:
+            v = negate
+            return Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True)
+        tests = []
+        for e in node.comparators[0].elts:
+            cmp = ast.copy_location(ast.Compare(left=node.left, ops=[ast.Eq()], comparators=[e]), node)
+            tests.append(self.expr(cmp))
+        if all(isinstance(t.value, bool) for t in tests):
+            v = any(t.value for t in tests) != negate
+            return Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True)
+        body = " || ".join(wrap(t, P_AND - 1) for t in tests)
+        if negate:
+            return Expr(f"!({body})", P_UNARY, BOOL)
+        return Expr(body, P_OR, BOOL)
 
     def _is_none(self, node):
         """`x is None` / `x is not None`. Only comparisons with None are supported: `is` between
@@ -450,7 +540,7 @@ class ExprTranslator(ArrayOps):
     def e_Tuple(self, node):
         parts = [self.expr(e) for e in node.elts]
         for e, p in zip(node.elts, parts):
-            if not is_array(p.type):
+            if not is_array(p.type) and p.type != STR:
                 self.need_scalar(p, e, "a tuple element")
         parts = [self.as_type(p, p.type) for p in parts]
         return Expr(f"std::make_tuple({', '.join(p.code for p in parts)})", P_ATOM,
@@ -461,6 +551,9 @@ class ExprTranslator(ArrayOps):
         if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
             raise Unsupported(node, "*args / **kwargs in calls are not supported")
         f = node.func
+        made = self.struct_call(node)
+        if made is not None:
+            return made
         if isinstance(f, ast.Name):
             name = f.id
             if self.is_variable(name):
@@ -501,67 +594,71 @@ class ExprTranslator(ArrayOps):
         if name in self.mod.rejected:
             raise Unsupported(node, f"calls {name}(), which could not be translated")
         sig = self.mod.sigs[name]
+        return Expr(f"{sig.cpp}({', '.join(self.bind_args(node, sig, name))})", P_ATOM, sig.ret)
+
+    def bind_args(self, node, sig, display):
+        """C++ arguments for a call to a translated function or method, in parameter order,
+        converted to the parameter types, with defaults spelled out where a later argument
+        is passed by keyword."""
         params = sig.params
         if len(node.args) > len(params):
-            raise Unsupported(node, f"{name}() takes {len(params)} arguments but {len(node.args)} were given")
+            raise Unsupported(node, f"{display}() takes {len(params)} arguments but {len(node.args)} were given")
         bound = {}
         for p, a in zip(params, node.args):
             bound[p.name] = a
         for k in node.keywords:
             if k.arg not in {p.name for p in params}:
-                raise Unsupported(node, f"{name}() has no parameter '{k.arg}'")
+                raise Unsupported(node, f"{display}() has no parameter '{k.arg}'")
             if k.arg in bound:
-                raise Unsupported(node, f"{name}() got two values for '{k.arg}'")
+                raise Unsupported(node, f"{display}() got two values for '{k.arg}'")
             bound[k.arg] = k.value
         last = max((i for i, p in enumerate(params) if p.name in bound), default=-1)
         codes = []
-        passed_arrays = []
+        passed = []
         for i, p in enumerate(params):
-            if p.name in bound and p.type == RNG:
-                a = bound[p.name]
-                e = self.expr(a)
-                if e.type != RNG or not isinstance(a, ast.Name):
-                    raise Unsupported(a, f"argument '{p.name}' of {name}() must be a generator variable")
-                codes.append(e.code)
-                continue
-            if p.name in bound and is_array(p.type):
-                a = bound[p.name]
-                e = self.expr(a)
-                if e.type != p.type:
-                    raise Unsupported(a, f"argument '{p.name}' of {name}() must be a {p.type}, got {e.type}")
-                if p.mode == "ref":
-                    if not isinstance(a, ast.Name):
-                        raise Unsupported(a, f"{name}() modifies its argument '{p.name}' in place, so it "
-                                             "must be given an array variable", "store the value in a variable first")
-                if isinstance(a, ast.Name):
-                    passed_arrays.append(a.id)
-                codes.append(e.code)
-                continue
-            if p.name in bound and isinstance(p.type, OptionalType):
-                e = self.expr_raw(bound[p.name])
-                if not assignable(p.type, e.type):
-                    raise Unsupported(bound[p.name], f"argument '{p.name}' of {name}() is declared "
-                                                     f"{p.type} but a {e.type} is passed")
-                codes.append(self.to_optional(e, p.type).code)
-                continue
-            if p.name in bound:
-                e = self.expr(bound[p.name])
-                self.need_scalar(e, bound[p.name], f"argument '{p.name}' of {name}()")
-                if not assignable(p.type, e.type):
-                    raise Unsupported(bound[p.name], f"argument '{p.name}' of {name}() is declared "
-                                                     f"{p.type} but a {e.type} is passed",
-                                      f"annotate '{p.name}' as float, or convert with int(...)")
-                codes.append(self.promote(e, p.type).code)
-            elif p.default_code is not None:
+            if p.name not in bound:
+                if p.default_code is None:
+                    raise Unsupported(node, f"{display}() is missing argument '{p.name}'")
                 if i < last:  # a later argument was passed by keyword: spell the default out
                     codes.append(p.default_code)
-            else:
-                raise Unsupported(node, f"{name}() is missing argument '{p.name}'")
-        if any(p.mode == "ref" for p in params) and len(set(passed_arrays)) < len(passed_arrays):
-            raise Unsupported(node, f"the same array is passed twice to {name}(), which modifies an "
-                                    "argument in place: the two parameters would share memory in Python",
+                continue
+            a = bound[p.name]
+            codes.append(self.argument(a, p, display, passed))
+        if any(getattr(p, "mode", "") == "ref" for p in params) and len(set(passed)) < len(passed):
+            raise Unsupported(node, f"the same array or object is passed twice to {display}(), which modifies "
+                                    "an argument in place: the two parameters would share memory in Python",
                               "pass a copy for one of them")
-        return Expr(f"{sig.cpp}({', '.join(codes)})", P_ATOM, sig.ret)
+        return codes
+
+    def argument(self, a, p, display, passed) -> str:
+        """One argument `a` for parameter p, as C++."""
+        if p.type == RNG:
+            e = self.expr(a)
+            if e.type != RNG or not isinstance(a, ast.Name):
+                raise Unsupported(a, f"argument '{p.name}' of {display}() must be a generator variable")
+            return e.code
+        if isinstance(p.type, OptionalType):
+            e = self.expr_raw(a)
+            if not assignable(p.type, e.type):
+                raise Unsupported(a, f"argument '{p.name}' of {display}() is declared {p.type} but a {e.type} is passed")
+            return self.to_optional(e, p.type).code
+        if is_array(p.type) or isinstance(p.type, StructType) or p.type == STR:
+            e = self.expr(a)
+            if e.type != p.type:
+                raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
+            if getattr(p, "mode", "") == "ref":
+                if not _is_lvalue(a):
+                    raise Unsupported(a, f"{display}() modifies its argument '{p.name}' in place, so it must be "
+                                         "given a variable", "store the value in a variable first")
+            if isinstance(a, ast.Name) and p.type != STR:
+                passed.append(a.id)
+            return e.code
+        e = self.expr(a)
+        self.need_scalar(e, a, f"argument '{p.name}' of {display}()")
+        if not assignable(p.type, e.type):
+            raise Unsupported(a, f"argument '{p.name}' of {display}() is declared {p.type} but a {e.type} is passed",
+                              f"annotate '{p.name}' as float, or convert with int(...)")
+        return self.promote(e, p.type).code
 
     def _arity(self, node, args, lo, hi=None):
         hi = lo if hi is None else hi
@@ -667,6 +764,16 @@ class ExprTranslator(ArrayOps):
                               {k.arg: k.value for k in node.keywords})
         if qual in STACKERS:
             return self.stack_call(node, qual)
+        if qual in ("copy.deepcopy", "copy.copy"):
+            if len(node.args) != 1 or node.keywords:
+                raise Unsupported(node, f"{src}(x) takes one argument here")
+            e = self.expr(node.args[0])
+            if qual == "copy.copy" and (isinstance(e.type, StructType) or is_array(e.type)):
+                raise Unsupported(node, "copy.copy is a shallow copy: arrays inside stay shared",
+                                  "use copy.deepcopy (an independent copy, which is what C++ makes)")
+            if not (isinstance(e.type, StructType) or is_array(e.type)):
+                raise Unsupported(node, f"{src}() of a {e.type} is not needed")
+            return Expr(f"{e.type.cpp()}({e.code})", P_ATOM, e.type)  # a C++ copy is a deep copy
         if qual == "numpy.einsum":
             return self.einsum_call(node)
         args = [self.expr(a) for a in node.args]

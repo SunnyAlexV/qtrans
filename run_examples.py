@@ -18,7 +18,7 @@ BENCHMARK = True
 
 HERE = Path(__file__).resolve().parent
 EXAMPLES = ["black_scholes", "implied_vol", "futures_options", "bonds", "exotics",
-            "portfolio", "lattice_pde", "risk", "monte_carlo", "black_litterman_app"]
+            "portfolio", "lattice_pde", "risk", "monte_carlo", "black_litterman_app", "instruments"]
 
 
 def main():

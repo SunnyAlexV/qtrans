@@ -49,4 +49,18 @@ def float_literal(v: float) -> tuple[str, int]:
         r += ".0"
     return r, (P_UNARY if r.startswith("-") else P_ATOM)
 
-
+def cpp_string(s: str) -> str:
+    out = []
+    for b in s.encode("utf-8"):
+        c = chr(b)
+        if c == "\\":
+            out.append("\\\\")
+        elif c == '"':
+            out.append('\\"')
+        elif c == "\n":
+            out.append("\\n")
+        elif 32 <= b < 127:
+            out.append(c)
+        else:
+            out.append(f"\\{b:03o}")  # octal escapes: always exactly 3 digits, no ambiguity
+    return '"' + "".join(out) + '"'

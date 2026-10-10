@@ -18,7 +18,7 @@ import ast
 
 from .core import P_ADD, P_ATOM, P_EQ, P_MUL, P_REL, P_UNARY, Expr, wrap
 from .errors import Unsupported
-from .types import BOOL, FLOAT, INT, MAT, RNG, VEC, ArrayType, MaskType, Scalar, TupleType, is_array
+from .types import BOOL, FLOAT, INT, MAT, RNG, VEC, ArrayType, MaskType, Scalar, StructType, TupleType, is_array
 
 _ARITH = {ast.Add: ("+", P_ADD), ast.Sub: ("-", P_ADD), ast.Mult: ("*", P_MUL), ast.Div: ("/", P_MUL)}
 _CMP = {ast.Lt: ("<", P_REL), ast.LtE: ("<=", P_REL), ast.Gt: (">", P_REL), ast.GtE: (">=", P_REL),
@@ -57,6 +57,12 @@ _CREATORS = {"numpy.zeros", "numpy.ones", "numpy.full", "numpy.eye", "numpy.iden
 # Generator methods: name -> scalar parameters (with NumPy's defaults), then `size`
 _RNG_METHODS = {"random": [], "standard_normal": [], "normal": [("loc", "0.0"), ("scale", "1.0")],
                 "uniform": [("low", "0.0"), ("high", "1.0")]}
+
+
+def _is_named(node) -> bool:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, ast.Name)
 
 
 class ArrayOps:
@@ -213,6 +219,15 @@ class ArrayOps:
         if isinstance(base_node, ast.Attribute) and base_node.attr == "shape" and not target:
             return self._shape_item(node)
         B = self.expr(base_node)
+        if isinstance(B.type, StructType) and not target:
+            info = self.class_info(B.type.name, node)
+            k = node.slice.value if isinstance(node.slice, ast.Constant) else None
+            if not info.namedtuple:
+                raise Unsupported(node, f"{info.name} objects can't be indexed (Python raises TypeError)")
+            if not isinstance(k, int) or isinstance(k, bool) or not -len(info.fields) <= k < len(info.fields):
+                raise Unsupported(node, "a NamedTuple can only be indexed with a constant in range")
+            f = info.fields[k % len(info.fields)]
+            return Expr(self._member(B, f.cpp), P_ATOM, f.type)
         if isinstance(B.type, TupleType) and not target:
             k = node.slice.value if isinstance(node.slice, ast.Constant) else None
             if not isinstance(k, int) or not -len(B.type.elts) <= k < len(B.type.elts):
@@ -222,7 +237,7 @@ class ArrayOps:
         if not is_array(B.type):
             raise Unsupported(node, "indexing / subscripts are only supported on arrays",
                               "lists and dicts are not supported")
-        named = isinstance(base_node, ast.Name)
+        named = _is_named(base_node)  # a variable or a field of one: safe to name twice
         if target and not named:
             raise Unsupported(node, "assignment into an expression; assign into a variable")
         parts = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]

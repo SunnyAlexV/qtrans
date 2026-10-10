@@ -12,6 +12,7 @@ admits the types quant pricing code actually uses for scalars:
     Mat      qt::Mat     (row-major Eigen::ArrayXXd; 2-D float64 array) stage 2
     None     void        (return type only)
     X | None std::optional<X>  (X a number or array: optional arguments, "no result" returns)
+    @dataclass / NamedTuple   a C++ struct with a constructor, methods and properties (stage 5)
 
 Numeric types form a ladder bool < int < float. A variable that is assigned an int
 in one place and a float in another is widened to float, exactly the way Python's
@@ -102,6 +103,38 @@ class RngType:
 
 
 @dataclass(frozen=True)
+class StrType:
+    """A Python str that is compared, passed and returned (as std::string). Python compares
+    strings by code point and std::string by byte; for UTF-8 the two orders agree."""
+
+    def cpp(self) -> str:
+        return "std::string"
+
+    def zero(self) -> str:
+        return "{}"
+
+    def __str__(self) -> str:
+        return "str"
+
+
+@dataclass(frozen=True)
+class StructType:
+    """An instance of a translated @dataclass or NamedTuple (stage 5): a C++ struct. Details
+    (fields, methods, frozen) live in the module's ClassInfo, looked up by name."""
+    name: str
+    cpp_name: str
+
+    def cpp(self) -> str:
+        return self.cpp_name
+
+    def zero(self) -> str:
+        return "{}"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
 class NoneValueType:
     """The value None, before it is stored anywhere (it then becomes part of an OptionalType)."""
 
@@ -139,6 +172,7 @@ VEC = ArrayType(1)
 MAT = ArrayType(2)
 RNG = RngType()
 NONE = NoneValueType()
+STR = StrType()
 
 _RANK = {"bool": 0, "int": 1, "float": 2}
 

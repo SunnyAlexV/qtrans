@@ -8,7 +8,7 @@ from tests.test_semantics import HAVE_CXX
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 FILES = ["black_scholes", "implied_vol", "futures_options", "bonds", "exotics",
-         "portfolio", "lattice_pde", "risk", "monte_carlo", "black_litterman_app"]
+         "portfolio", "lattice_pde", "risk", "monte_carlo", "black_litterman_app", "instruments"]
 
 
 @pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")

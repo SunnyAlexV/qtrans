@@ -16,11 +16,14 @@ import inspect
 
 from . import library as lib
 from .errors import Unsupported
+from .core import cpp_string
 from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown, cpp_ident, wrap)
+from .structs import THIS
+from .classes import member_safe_name
 from .types import VEC as VEC_T
 from .types import RNG
-from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, TupleType,
-                    assignable, is_array, join)
+from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
+                    TupleType, assignable, is_array, join)
 
 _STATEMENT_MESSAGES = {
     "FunctionDef": ("nested functions", "move the function to module level"),
@@ -48,36 +51,57 @@ def target_leaves(t):
 
 
 def subscript_root(node):
-    """`a[i]`, `A[i, j]`, `a[1:3]` -> 'a' (the array variable being indexed)."""
-    while isinstance(node, ast.Subscript):
+    """`a[i]`, `A[i, j]`, `a[1:3]` -> 'a' (the array variable being indexed); through fields
+    too: `self.w[i]`, `port.weights[0]` -> 'self', 'port' (changing a field changes the object)."""
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
         node = node.value
     return node.id if isinstance(node, ast.Name) else None
 
 
-def view_root(node, types):
-    """If `node` evaluates to an existing array or a view of one (NumPy shares memory for
-    `b = a`, slices, rows, and `.T`), return that array's name; otherwise None (a new array)."""
+def view_root(node, types, mod=None):
+    """If `node` evaluates to an existing array or object, or a view of one (NumPy shares
+    memory for `b = a`, slices, rows and `.T`; Python shares objects and their fields), return
+    that variable's name; otherwise None (a new array or object)."""
     if isinstance(node, ast.Name):
-        return node.id if is_array(types.get(node.id)) else None
+        t = types.get(node.id)
+        if is_array(t) or (mod is not None and isinstance(t, StructType) and not mod.immutable(t)):
+            return node.id
+        return None
+    if isinstance(node, ast.Attribute) and node.attr != "T" and mod is not None:
+        t = _chain_type(node, types, mod)
+        if is_array(t) or (isinstance(t, StructType) and not mod.immutable(t)):
+            return subscript_root(node)  # obj.w is obj's own array
     if isinstance(node, ast.Attribute) and node.attr == "T":
-        return view_root(node.value, types)
+        return view_root(node.value, types, mod)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "transpose" \
             and not node.args:
-        return view_root(node.func.value, types)
+        return view_root(node.func.value, types, mod)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "ravel" \
             and not node.args:
-        return view_root(node.func.value, types)  # ravel of a contiguous array is a view
+        return view_root(node.func.value, types, mod)  # ravel of a contiguous array is a view
     if isinstance(node, ast.Call) and node.args and (
             (isinstance(node.func, ast.Attribute) and node.func.attr == "asarray")
             or (isinstance(node.func, ast.Name) and node.func.id == "asarray")):
-        return view_root(node.args[0], types)  # np.asarray returns its argument when it is float64 already
+        return view_root(node.args[0], types, mod)  # np.asarray returns its argument when it is float64 already
     if isinstance(node, ast.Subscript):
         parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
         base_t = types.get(node.value.id) if isinstance(node.value, ast.Name) else None
         row = base_t == MAT and len(parts) == 1 and not _is_mask_index(parts[0], types)
         is_view = any(isinstance(p, ast.Slice) for p in parts) or row
         if is_view:
-            return view_root(node.value, types)
+            return view_root(node.value, types, mod)
+    return None
+
+
+def _chain_type(node, types, mod):
+    """The type of `x`, `x.field`, `x.inner.w` from the variable types and the class fields."""
+    if isinstance(node, ast.Name):
+        return types.get(node.id)
+    if isinstance(node, ast.Attribute):
+        t = _chain_type(node.value, types, mod)
+        if isinstance(t, StructType) and t.name in mod.classes:
+            f = mod.classes[t.name].field(node.attr)
+            return f.type if f is not None else None
     return None
 
 
@@ -99,21 +123,6 @@ def is_docstring(stmt) -> bool:
     return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
 
 
-def cpp_string(s: str) -> str:
-    out = []
-    for b in s.encode("utf-8"):
-        c = chr(b)
-        if c == "\\":
-            out.append("\\\\")
-        elif c == '"':
-            out.append('\\"')
-        elif c == "\n":
-            out.append("\\n")
-        elif 32 <= b < 127:
-            out.append(c)
-        else:
-            out.append(f"\\{b:03o}")  # octal escapes: always exactly 3 digits, no ambiguity
-    return '"' + "".join(out) + '"'
 
 
 def _contains_break(stmts) -> bool:
@@ -192,6 +201,17 @@ class FunctionTranslator(ExprTranslator):
         self.inline_at: dict = {}
         self._locals_cache: set = set()
         self.all_names = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)} | set(self.params)
+        self.owner = mod.classes.get(sig.owner) if sig.owner else None
+        self.py_names = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)} | {a.arg for a in fdef.args.args}
+        self.has_self = sig.kind in ("instance", "property", "post_init")
+        self.all_names.discard("self")
+
+    def ident(self, name: str) -> str:
+        """The C++ name of a local or parameter. Inside a method, one that would hide a field
+        or method of the class (and trip -Wshadow) gets a trailing underscore."""
+        if self.owner is None:
+            return cpp_ident(name)
+        return member_safe_name(name, self.owner, self.py_names)
 
     # --- variables -------------------------------------------------------------------
     @property
@@ -200,10 +220,12 @@ class FunctionTranslator(ExprTranslator):
 
     def is_variable(self, name):
         return (name in self.params or name in self.loop_vars or name in self.ignored
-                or name in self._locals_cache)
+                or name in self._locals_cache or (name == "self" and self.has_self))
 
     def variable(self, node):
         n = node.id
+        if n == "self" and self.has_self:
+            return Expr(THIS, P_ATOM, self.owner.type, simple=True)
         if n in self.loop_vars:
             t = self.loop_types.get(n, INT)
         elif n in self.params:
@@ -214,7 +236,7 @@ class FunctionTranslator(ExprTranslator):
                 if self.inferring:
                     raise _Unknown(n)
                 raise Unsupported(node, f"could not infer a type for '{n}'")
-        return Expr(cpp_ident(n), P_ATOM, t, simple=True)
+        return Expr(self.ident(n), P_ATOM, t, simple=True)
 
     # --- driver ----------------------------------------------------------------------
     def translate(self):
@@ -256,7 +278,7 @@ class FunctionTranslator(ExprTranslator):
                     raise Unsupported(s, "for-loops must use a single loop variable")
                 if s.orelse:
                     raise Unsupported(s, "for ... else is not supported")
-                if s.target.id in self.params:
+                if s.target.id in self.params or s.target.id == "self":
                     raise Unsupported(s, f"loop variable '{s.target.id}' shadows a parameter")
                 v = s.target.id
                 if v in self.loop_types and self.loop_types[v] != self._loop_type(s):
@@ -296,12 +318,11 @@ class FunctionTranslator(ExprTranslator):
                     self.locals_order.append(name)
                 if s.value is not None:
                     self._add_event(name, "expr", s.value, s)
-            elif isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Subscript):
-                self._check_store_target(s.target, s)  # a[i] += x: updates an element, no new variable
+            elif isinstance(s, ast.AugAssign) and isinstance(s.target, (ast.Subscript, ast.Attribute)):
+                self._check_store_target(s.target, s)  # a[i] += x, obj.x += 1: no new variable
             elif isinstance(s, ast.AugAssign):
                 if not isinstance(s.target, ast.Name):
-                    raise Unsupported(s, "augmented assignment must target a name or an array element",
-                                      "attribute assignment arrives in stage 4")
+                    raise Unsupported(s, "augmented assignment must target a name, a field or an array element")
                 b = ast.copy_location(ast.BinOp(left=ast.Name(id=s.target.id, ctx=ast.Load()),
                                                 op=s.op, right=s.value), s)
                 self.aug_binops[id(s)] = b
@@ -361,6 +382,8 @@ class FunctionTranslator(ExprTranslator):
                                      "run in Python but not in C++", "test the argument before the call instead")
 
     def _scan_target(self, t, value, stmt):
+        if isinstance(t, ast.Name) and t.id == "self" and self.has_self:
+            raise Unsupported(stmt, "assigning to self is not supported")
         if isinstance(t, ast.Name):
             self._add_event(t.id, "expr", value, stmt)
         elif isinstance(t, (ast.Tuple, ast.List)):
@@ -375,16 +398,19 @@ class FunctionTranslator(ExprTranslator):
             else:
                 for i, e in enumerate(t.elts):
                     self._add_event(e.id, "elt", value, stmt, (i, len(t.elts)))
-        elif isinstance(t, ast.Subscript):
+        elif isinstance(t, (ast.Subscript, ast.Attribute)):
             self._check_store_target(t, stmt)
-        elif isinstance(t, ast.Attribute):
-            raise Unsupported(stmt, "attribute assignment is not supported in stage 1",
-                              "objects arrive in stage 4")
         else:
             raise Unsupported(stmt, f"cannot assign to {type(t).__name__}")
 
     def _check_store_target(self, t, stmt):
-        if not isinstance(t.value, ast.Name):
+        base = t.value
+        while isinstance(base, ast.Attribute):
+            base = base.value
+        if not isinstance(base, ast.Name):
+            raise Unsupported(stmt, "assignment into a nested subscript (a[1:][0] = ...) is not supported",
+                              "index the array directly")
+        if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Subscript):
             raise Unsupported(stmt, "assignment into a nested subscript (a[1:][0] = ...) is not supported",
                               "index the array directly")
 
@@ -476,9 +502,10 @@ class FunctionTranslator(ExprTranslator):
         t = e.type
         if ev.kind == "elt":
             i, n = ev.index
-            if not isinstance(t, TupleType) or len(t.elts) != n:
+            elts = self.unpack_types(t)
+            if elts is None or len(elts) != n:
                 raise Unsupported(ev.stmt, f"cannot unpack a {t} value into {n} names")
-            t = t.elts[i]
+            t = elts[i]
         if t == VOID:
             raise Unsupported(ev.stmt, "assigning the result of a function that returns None")
         return t
@@ -543,15 +570,22 @@ class FunctionTranslator(ExprTranslator):
         branch of a conditional, or a parameter a called function hands back."""
         if isinstance(value, ast.IfExp):
             return self._alias_sources(value.body, types) | self._alias_sources(value.orelse, types)
-        root = view_root(value, types)
+        root = view_root(value, types, self.mod)
         if root:
             return {root}
+        if isinstance(value, ast.Call) and (
+                (isinstance(value.func, ast.Name) and value.func.id in self.mod.classes)
+                or self.qualify(value.func) == "dataclasses.replace"):
+            # Option(w=w): the object's field *is* the array passed in; replace() copies the
+            # other fields by reference, so arrays inside stay shared
+            return {r for a in list(value.args) + [k.value for k in value.keywords]
+                    for r in [view_root(a, types, self.mod)] if r}
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
                 and value.func.id in self.mod.returns_alias:
             out = set()
             for i in self.mod.returns_alias[value.func.id]:
                 if i < len(value.args):
-                    r = view_root(value.args[i], types)
+                    r = view_root(value.args[i], types, self.mod)
                     if r:
                         out.add(r)
             return out
@@ -562,7 +596,10 @@ class FunctionTranslator(ExprTranslator):
         variable is a copy. The two agree unless one of the names is later modified in place,
         so any such pair is refused rather than translated into a silent difference."""
         types = {**self.local_types, **self.params}
-        arrays = {n for n, t in types.items() if is_array(t)}
+        if self.has_self:
+            types["self"] = self.owner.type
+        arrays = {n for n, t in types.items()
+                  if is_array(t) or (isinstance(t, StructType) and not self.mod.immutable(t))}
         if not arrays:
             return
         mutated = set()
@@ -571,18 +608,29 @@ class FunctionTranslator(ExprTranslator):
                 targets = n.targets if isinstance(n, ast.Assign) else [n.target]
                 for t in targets:
                     for leaf in target_leaves(t):
-                        if isinstance(leaf, ast.Subscript):
+                        if isinstance(leaf, (ast.Subscript, ast.Attribute)):
                             mutated.add(subscript_root(leaf))
                         elif isinstance(n, ast.AugAssign) and isinstance(leaf, ast.Name) and leaf.id in arrays:
                             mutated.add(leaf.id)
-            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in self.mod.sigs:
-                callee = self.mod.sigs[n.func.id]
-                pos = {p.name: i for i, p in enumerate(callee.params)}
-                pairs = list(enumerate(n.args)) + [(pos.get(k.arg, -1), k.value) for k in n.keywords]
-                for i, a in pairs:
-                    if isinstance(a, ast.Name) and a.id in arrays and 0 <= i < len(callee.params) \
-                            and callee.params[i].mode == "ref":
-                        mutated.add(a.id)
+            elif isinstance(n, ast.Call):
+                callee = None
+                if isinstance(n.func, ast.Name) and n.func.id in self.mod.sigs:
+                    callee = self.mod.sigs[n.func.id]
+                elif isinstance(n.func, ast.Attribute) and not self._is_module_path(n.func.value):
+                    bt = _chain_type(n.func.value, types, self.mod)
+                    if isinstance(bt, StructType) and bt.name in self.mod.classes:
+                        m = self.mod.classes[bt.name].methods.get(n.func.attr)
+                        if m is not None and m.key in self.mod.sigs:
+                            callee = self.mod.sigs[m.key]
+                            if m.kind == "instance" and not callee.const:
+                                mutated.add(subscript_root(n.func.value))  # obj.step() changes obj
+                if callee is not None:
+                    pos = {p.name: i for i, p in enumerate(callee.params)}
+                    pairs = list(enumerate(n.args)) + [(pos.get(k.arg, -1), k.value) for k in n.keywords]
+                    for i, a in pairs:
+                        if 0 <= i < len(callee.params) and callee.params[i].mode == "ref" and \
+                                isinstance(a, (ast.Name, ast.Attribute, ast.Subscript)):
+                            mutated.add(subscript_root(a))
         for n in ast.walk(self.fdef):
             if not isinstance(n, (ast.Assign, ast.AnnAssign)) or n.value is None:
                 continue
@@ -599,10 +647,21 @@ class FunctionTranslator(ExprTranslator):
                 for y in self._alias_sources(value, types):
                     if y != x and (x in mutated or y in mutated):
                         which = x if x in mutated else y
-                        raise Unsupported(n, f"'{x}' and '{y}' share memory in NumPy (assignment, slices "
-                                             f"and .T are views, not copies) and '{which}' is modified in "
-                                             "place, so a C++ copy would give different results",
-                                          f"if you want an independent array, write {x} = ....copy()")
+                        if is_array(types.get(x)) and is_array(types.get(y)):
+                            raise Unsupported(n, f"'{x}' and '{y}' share memory in NumPy (assignment, slices "
+                                                 f"and .T are views, not copies) and '{which}' is modified in "
+                                                 "place, so a C++ copy would give different results",
+                                              f"if you want an independent array, write {x} = ....copy()")
+                        if isinstance(types.get(y), StructType) and not isinstance(types.get(x), StructType):
+                            rel = f"'{x}' is part of '{y}' in Python (an object's fields are shared, not copied)"
+                        elif isinstance(types.get(x), StructType) and not isinstance(types.get(y), StructType):
+                            rel = f"'{y}' is part of '{x}' in Python (the object holds that very array)"
+                        else:
+                            rel = f"'{x}' and '{y}' are the same object in Python (objects are shared, not copied)"
+                        raise Unsupported(n, f"{rel} and '{which}' is modified, so a C++ copy would give "
+                                             "different results",
+                                          "pass or store a copy: x.copy() for an array, copy.deepcopy(obj) for an "
+                                          "object (dataclasses.replace keeps sharing the arrays inside)")
         for n in ast.walk(self.fdef):
             if isinstance(n, ast.For) and not self._is_range(n.iter):
                 src = view_root(n.iter, types)
@@ -815,7 +874,7 @@ class FunctionTranslator(ExprTranslator):
                 return None
             if isinstance(s, ast.AugAssign):
                 reads(s.value, A)
-                if isinstance(s.target, ast.Subscript):
+                if isinstance(s.target, (ast.Subscript, ast.Attribute)):
                     reads(s.target, A)
                     return A
                 reads(ast.Name(id=s.target.id, ctx=ast.Load()), A)
@@ -874,10 +933,10 @@ class FunctionTranslator(ExprTranslator):
                         if not self._tuple_needs_tie(s):
                             inline = [n for n in names if n in mine and n not in declared]
                     else:
-                        vt = self.expr_type_quiet(s.value)
-                        if (isinstance(vt, TupleType) and len(set(names)) == len(names)
+                        elts = self.unpack_types(self.expr_type_quiet(s.value))
+                        if (elts is not None and len(set(names)) == len(names)
                                 and all(n in mine and n not in declared for n in names)
-                                and all(self.local_types[n] == et for n, et in zip(names, vt.elts))):
+                                and all(self.local_types[n] == et for n, et in zip(names, elts))):
                             inline = names
             elif isinstance(s, ast.AnnAssign) and s.value is not None \
                     and s.target.id in mine and s.target.id not in declared:
@@ -888,6 +947,14 @@ class FunctionTranslator(ExprTranslator):
                 declared.add(n)
             self.hoist_at[id(s)] = hoist
             self.inline_at[id(s)] = set(inline)
+
+    def unpack_types(self, t):
+        """The element types `a, b = value` unpacks: a tuple's, or a NamedTuple's fields."""
+        if isinstance(t, TupleType):
+            return list(t.elts)
+        if isinstance(t, StructType) and self.mod.classes[t.name].namedtuple:
+            return [f.type for f in self.mod.classes[t.name].fields]
+        return None
 
     def expr_type_quiet(self, node):
         try:
@@ -938,7 +1005,7 @@ class FunctionTranslator(ExprTranslator):
                 return None
             if isinstance(s, ast.AugAssign):
                 check(s.value, A)
-                if isinstance(s.target, ast.Subscript):
+                if isinstance(s.target, (ast.Subscript, ast.Attribute)):
                     check(s.target, A)
                     return A
                 check(ast.Name(id=s.target.id, ctx=ast.Load()), A)
@@ -981,8 +1048,8 @@ class FunctionTranslator(ExprTranslator):
         self.flush_comments(s.lineno)
         for n in self.hoist_at.get(id(s), ()):
             t = self.local_types[n]
-            self.emit(f"{t.cpp()} {cpp_ident(n)} = {t.zero()};" if isinstance(t, Scalar)
-                      else f"{t.cpp()} {cpp_ident(n)}{{}};")
+            self.emit(f"{t.cpp()} {self.ident(n)} = {t.zero()};" if isinstance(t, Scalar)
+                      else f"{t.cpp()} {self.ident(n)}{{}};")
         compound = isinstance(s, (ast.If, ast.While, ast.For))
         last = s.lineno if compound else s.end_lineno
         texts = [self.mod.inline_comments[ln] for ln in range(s.lineno, last + 1) if ln in self.mod.inline_comments]
@@ -1023,6 +1090,20 @@ class FunctionTranslator(ExprTranslator):
         if not isinstance(v, ast.Call):
             self.note(f"noeffect:{s.lineno}", f"line {s.lineno}: expression with no effect skipped")
             return
+        if ast.unparse(v.func) == "object.__setattr__":
+            # the frozen-dataclass idiom for a derived field: object.__setattr__(self, "x", value)
+            if not (self.sig.kind == "post_init" and len(v.args) == 3 and isinstance(v.args[0], ast.Name)
+                    and v.args[0].id == "self" and isinstance(v.args[1], ast.Constant)
+                    and isinstance(v.args[1].value, str)):
+                raise Unsupported(s, "object.__setattr__ is supported only as object.__setattr__(self, \"field\", "
+                                     "value) inside __post_init__")
+            target = ast.copy_location(ast.Attribute(value=v.args[0], attr=v.args[1].value, ctx=ast.Store()), v)
+            self._setattr_ok = True
+            try:
+                self.store_attribute(target, v.args[2], s)
+            finally:
+                self._setattr_ok = False
+            return
         e = self.expr(v)
         self.emit(f"{e.code};")
 
@@ -1044,15 +1125,15 @@ class FunctionTranslator(ExprTranslator):
             e = self.to_optional(e, vt)
         code = self.as_double(e).code if vt == FLOAT else e.code
         if vt == RNG and name in inline_set and code.startswith("qt::Rng(") and code.endswith(")"):
-            self.emit(f"qt::Rng {cpp_ident(name)}{code[len('qt::Rng'):]};")
+            self.emit(f"qt::Rng {self.ident(name)}{code[len('qt::Rng'):]};")
             return
         if (is_array(vt) or (isinstance(vt, OptionalType) and is_array(vt.inner))) and \
                 self._needs_eval(value_node, name, whole_array=True):
             code = f"({code}).eval()"  # Eigen is lazy: read all of the old value before overwriting it
         if name in inline_set:
-            self.emit(f"{vt.cpp()} {cpp_ident(name)} = {code};")
+            self.emit(f"{vt.cpp()} {self.ident(name)} = {code};")
         else:
-            self.emit(f"{cpp_ident(name)} = {code};")
+            self.emit(f"{self.ident(name)} = {code};")
 
     def s_Assign(self, s):
         inline = self.inline_at.get(id(s), set())
@@ -1071,6 +1152,9 @@ class FunctionTranslator(ExprTranslator):
         if isinstance(t, ast.Subscript):
             self.store_subscript(t, s.value, s, "=")
             return
+        if isinstance(t, ast.Attribute):
+            self.store_attribute(t, s.value, s)
+            return
         names = [e.id for e in t.elts]
         if isinstance(s.value, (ast.Tuple, ast.List)):
             if not self._tuple_needs_tie(s):
@@ -1087,19 +1171,30 @@ class FunctionTranslator(ExprTranslator):
                 if n not in self.ignored:
                     self.check_assignable(self.var_type(n), e, s, f"'{n}'")
                 parts.append(e.code)
-            lhs = ", ".join("std::ignore" if n in self.ignored else cpp_ident(n) for n in names)
+            lhs = ", ".join("std::ignore" if n in self.ignored else self.ident(n) for n in names)
             self.emit(f"std::tie({lhs}) = std::make_tuple({', '.join(parts)});")
             return
         e = self.expr(s.value)
-        if not isinstance(e.type, TupleType) or len(e.type.elts) != len(names):
+        elts = self.unpack_types(e.type)
+        if elts is None or len(elts) != len(names):
             raise Unsupported(s, f"cannot unpack a {e.type} value into {len(names)} names")
-        for n, et in zip(names, e.type.elts):
+        for n, et in zip(names, elts):
             if n not in self.ignored and not assignable(self.var_type(n), et):
                 raise Unsupported(s, f"'{n}' is declared {self.var_type(n)} but gets a {et} value")
         if inline and set(names) <= inline:
-            self.emit(f"auto [{', '.join(cpp_ident(n) for n in names)}] = {e.code};")
+            self.emit(f"auto [{', '.join(self.ident(n) for n in names)}] = {e.code};")  # works on structs too
+        elif isinstance(e.type, StructType):  # a NamedTuple into existing variables, field by field
+            info = self.mod.classes[e.type.name]
+            tmp = "qtrans_unpacked"
+            while tmp in self.all_names:
+                tmp += "_"
+            self.emit(f"{{ const {e.type.cpp()} {tmp} = {e.code};")
+            for n, f in zip(names, info.fields):
+                if n not in self.ignored:
+                    self.emit(f"  {self.ident(n)} = {tmp}.{f.cpp};")
+            self.emit("}")
         else:
-            lhs = ", ".join("std::ignore" if n in self.ignored else cpp_ident(n) for n in names)
+            lhs = ", ".join("std::ignore" if n in self.ignored else self.ident(n) for n in names)
             self.emit(f"std::tie({lhs}) = {e.code};")
 
     def store_subscript(self, t, value_node, s, sym):
@@ -1130,6 +1225,31 @@ class FunctionTranslator(ExprTranslator):
                 rhs = f"({rhs}).eval()"  # NumPy computes the whole right side before storing
         self.emit(f"{code} {sym} {rhs};")
 
+    def _field_target(self, t, s):
+        """`obj.x` as an assignment target: (C++ lvalue, field)."""
+        base = self.expr(t.value)
+        if not isinstance(base.type, StructType):
+            raise Unsupported(s, f"assigning an attribute of a {base.type} is not supported")
+        info = self.class_info(base.type.name, t)
+        f = info.field(t.attr)
+        if f is None:
+            what = "a property" if t.attr in info.methods else "not a field"
+            raise Unsupported(s, f"{info.name}.{t.attr} is {what}; only fields can be assigned")
+        if info.frozen and not getattr(self, "_setattr_ok", False):
+            kind = "a NamedTuple" if info.namedtuple else "a frozen dataclass"
+            raise Unsupported(s, f"{info.name} is {kind}: assigning {t.attr} raises an error in Python",
+                              "make a changed copy with dataclasses.replace(obj, field=value)")
+        return self._member(base, f.cpp), f
+
+    def store_attribute(self, t, value_node, s):
+        code, f = self._field_target(t, s)
+        e = self.expr_raw(value_node) if isinstance(f.type, OptionalType) else self.expr(value_node)
+        e = self.convert_to(e, f.type, s, f"field '{f.name}'")
+        rhs = e.code
+        if is_array(f.type) and self._needs_eval(value_node, subscript_root(t), whole_array=False):
+            rhs = f"({rhs}).eval()"  # NumPy computes the right side before storing it
+        self.emit(f"{code} = {rhs};")
+
     def s_AnnAssign(self, s):
         if s.value is None:
             return  # a bare `x: float` declares nothing in Python
@@ -1137,6 +1257,9 @@ class FunctionTranslator(ExprTranslator):
 
     def s_AugAssign(self, s):
         syms = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}
+        if isinstance(s.target, ast.Attribute):
+            self.aug_attribute(s, syms)
+            return
         if isinstance(s.target, ast.Subscript):
             if type(s.op) not in syms:
                 raise Unsupported(s, f"{type(s.op).__name__}= on an array element is not supported")
@@ -1150,7 +1273,7 @@ class FunctionTranslator(ExprTranslator):
             if type(s.op) not in syms:
                 raise Unsupported(s, f"{type(s.op).__name__}= on an array is not supported")
             rhs = self.expr(s.value)
-            target = cpp_ident(name)
+            target = self.ident(name)
             if is_array(rhs.type):
                 code = rhs.code
                 if self._needs_eval(s.value, name, whole_array=True):
@@ -1179,9 +1302,42 @@ class FunctionTranslator(ExprTranslator):
             sym = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}[type(s.op)]
             if isinstance(s.op, ast.Div) and vt != FLOAT:
                 raise Unsupported(s, "internal: /= on a non-float variable")  # inference widens it
-            self.emit(f"{cpp_ident(name)} {sym} {rhs.code};")
+            self.emit(f"{self.ident(name)} {sym} {rhs.code};")
         else:
-            self.emit(f"{cpp_ident(name)} = {result.code};")
+            self.emit(f"{self.ident(name)} = {result.code};")
+
+    def aug_attribute(self, s, syms):
+        """obj.x += v, self.w *= 2.0: the field updated in place (numbers and arrays)."""
+        code, f = self._field_target(s.target, s)
+        if type(s.op) not in syms:
+            raise Unsupported(s, f"{type(s.op).__name__}= on a field is not supported")
+        rhs = self.expr(s.value)
+        if is_array(f.type):
+            if is_array(rhs.type):
+                rc = rhs.code
+                if self._needs_eval(s.value, subscript_root(s.target), whole_array=False):
+                    rc = f"({rc}).eval()"
+                if f.type == MAT and rhs.type == MAT:
+                    op = {ast.Add: "add_op", ast.Sub: "sub_op", ast.Mult: "mul_op", ast.Div: "div_op"}[type(s.op)]
+                    self.emit(f"qt::broadcast_into({code}, {rc}, qt::{op}{{}});")
+                elif rhs.type == f.type:
+                    self.emit(f"{code} {syms[type(s.op)]} {rc};")
+                elif f.type == MAT:
+                    self.emit(f"{code}.rowwise() {syms[type(s.op)]} {wrap(rhs, P_ATOM)}.transpose();")
+                else:
+                    raise Unsupported(s, "a Mat can't be added into a Vec field")
+            else:
+                self.need_scalar(rhs, s.value, "array arithmetic")
+                self.emit(f"{code} {syms[type(s.op)]} {self.as_double(rhs).code};")
+            return
+        cur = Expr(code, P_ATOM, f.type, simple=True)
+        result = self.binop(s, s.op, cur, rhs)
+        self.check_assignable(f.type, result, s, f"field '{f.name}'")
+        if result.type == f.type and isinstance(s.op, (ast.Add, ast.Sub, ast.Mult)) or \
+                (isinstance(s.op, ast.Div) and f.type == FLOAT):
+            self.emit(f"{code} {syms[type(s.op)]} {self.promote(rhs, f.type).code};")
+        else:
+            self.emit(f"{code} = {self.as_type(result, f.type).code};")
 
     def s_If(self, s):
         cond = self.cond(s.test)
@@ -1239,7 +1395,7 @@ class FunctionTranslator(ExprTranslator):
                 raise Unsupported(s, "for-loops are supported over range(...) and over a Vec",
                                   "for a Mat, loop over range(A.shape[0]) and take rows")
             src = arr.code if arr.simple else f"qt::Vec({arr.code})"
-            self.emit(f"for (double {cpp_ident(s.target.id)} : {src}) {{")
+            self.emit(f"for (double {self.ident(s.target.id)} : {src}) {{")
             self._block(s.body)
             self.emit("}")
             return
@@ -1261,7 +1417,7 @@ class FunctionTranslator(ExprTranslator):
                 raise Unsupported(it, "range() step 0 raises ValueError in Python")
         start = args[0] if len(args) >= 2 else Expr("0", P_ATOM, INT, int_lit=True, value=0, simple=True)
         stop, stop_node = (args[1], it.args[1]) if len(args) >= 2 else (args[0], it.args[0])
-        var = cpp_ident(s.target.id)
+        var = self.ident(s.target.id)
         # Python evaluates range() once. If the bound could change during the loop (it calls
         # a function, or reads a variable the body assigns), evaluate it once up front.
         body_stores = {n.id for b in s.body for n in ast.walk(b) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
