@@ -19,13 +19,14 @@ from .errors import Unsupported
 from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown, cpp_ident, wrap)
 from .types import VEC as VEC_T
 from .types import RNG
-from .types import BOOL, FLOAT, INT, MAT, VOID, ArrayType, MaskType, Scalar, TupleType, assignable, is_array, join
+from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, TupleType,
+                    assignable, is_array, join)
 
 _STATEMENT_MESSAGES = {
     "FunctionDef": ("nested functions", "move the function to module level"),
     "AsyncFunctionDef": ("async functions", None),
     "ClassDef": ("classes inside functions", "classes and dataclasses arrive in stage 4"),
-    "Try": ("try/except blocks", "catching exceptions inside translated functions isn't supported yet; raising is"),
+    "Try": ("try/except blocks", None),
     "TryStar": ("try/except* blocks", None),
     "With": ("with-blocks", None),
     "AsyncWith": ("async with blocks", None),
@@ -63,13 +64,35 @@ def view_root(node, types):
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "transpose" \
             and not node.args:
         return view_root(node.func.value, types)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "ravel" \
+            and not node.args:
+        return view_root(node.func.value, types)  # ravel of a contiguous array is a view
+    if isinstance(node, ast.Call) and node.args and (
+            (isinstance(node.func, ast.Attribute) and node.func.attr == "asarray")
+            or (isinstance(node.func, ast.Name) and node.func.id == "asarray")):
+        return view_root(node.args[0], types)  # np.asarray returns its argument when it is float64 already
     if isinstance(node, ast.Subscript):
         parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
         base_t = types.get(node.value.id) if isinstance(node.value, ast.Name) else None
-        is_view = any(isinstance(p, ast.Slice) for p in parts) or (base_t == MAT and len(parts) == 1)
+        row = base_t == MAT and len(parts) == 1 and not _is_mask_index(parts[0], types)
+        is_view = any(isinstance(p, ast.Slice) for p in parts) or row
         if is_view:
             return view_root(node.value, types)
     return None
+
+
+def _is_mask_index(node, types) -> bool:
+    """A[mask] selects rows into a copy; A[i] is a view of row i."""
+    if isinstance(node, ast.Compare):
+        return True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitAnd, ast.BitOr)):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+        return True
+    if isinstance(node, ast.Name) and isinstance(types.get(node.id), MaskType):
+        return True
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+        node.func.attr in ("isfinite", "isnan", "isinf")
 
 
 def is_docstring(stmt) -> bool:
@@ -99,6 +122,8 @@ def _contains_break(stmts) -> bool:
             return True
         if isinstance(s, ast.If) and (_contains_break(s.body) or _contains_break(s.orelse)):
             return True
+        if isinstance(s, ast.Try) and (_contains_break(s.body) or any(_contains_break(h.body) for h in s.handlers)):
+            return True
     return False
 
 
@@ -109,10 +134,26 @@ def always_returns(stmts) -> bool:
             return True
         if isinstance(s, ast.If) and always_returns(s.body) and always_returns(s.orelse):
             return True
+        if isinstance(s, ast.Try) and always_returns(s.body) and all(always_returns(h.body) for h in s.handlers):
+            return True
         if isinstance(s, ast.While) and isinstance(s.test, ast.Constant) and s.test.value is True \
                 and not _contains_break(s.body):
             return True
     return False
+
+
+def _try_state(s, A, block):
+    """Variables certainly assigned after `try: body except ...: handler`. The handler may start
+    after any statement of the body, so it can rely only on what was assigned before the try."""
+    a = block(s.body, set(A))
+    outs = [a] + [block(h.body, set(A)) for h in s.handlers]
+    done = [o for o in outs if o is not None]
+    if not done:
+        return None
+    out = set(done[0])
+    for o in done[1:]:
+        out &= o
+    return out
 
 
 class _Event:
@@ -182,6 +223,9 @@ class FunctionTranslator(ExprTranslator):
         self.check_loop_vars()
         self.finish_scan()
         self.infer_types()
+        if self.fdef.name in self.mod.errstate_funcs:
+            self.note("errstate", "np.errstate(...) blocks are translated as their contents: they only "
+                                  "change which floating-point warnings NumPy prints, never the values")
         self.check_aliasing()
         self.check_random_draws()
         self.plan_declarations()
@@ -202,7 +246,7 @@ class FunctionTranslator(ExprTranslator):
 
     def scan(self, stmts):
         allowed = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.If, ast.While,
-                   ast.For, ast.Break, ast.Continue, ast.Pass, ast.Expr, ast.Raise, ast.Assert)
+                   ast.For, ast.Break, ast.Continue, ast.Pass, ast.Expr, ast.Raise, ast.Assert, ast.Try)
         for s in stmts:
             if not isinstance(s, allowed):
                 what, hint = _STATEMENT_MESSAGES.get(type(s).__name__, (type(s).__name__, None))
@@ -230,6 +274,11 @@ class FunctionTranslator(ExprTranslator):
             elif isinstance(s, ast.If):
                 self.scan(s.body)
                 self.scan(s.orelse)
+            elif isinstance(s, ast.Try):
+                self.check_try(s)
+                self.scan(s.body)
+                for h in s.handlers:
+                    self.scan(h.body)
             elif isinstance(s, ast.Assign):
                 for t in s.targets:
                     self._scan_target(t, s.value, s)
@@ -257,6 +306,59 @@ class FunctionTranslator(ExprTranslator):
                                                 op=s.op, right=s.value), s)
                 self.aug_binops[id(s)] = b
                 self._add_event(s.target.id, "expr", b, s)
+
+    # --- try / except -------------------------------------------------------------------------
+    def _handler_class(self, h):
+        """The C++ exception class an `except` clause catches, or Unsupported."""
+        if h.type is None:
+            raise Unsupported(h, "a bare `except:` catches everything, including errors Python raises "
+                                 "where C++ carries on with inf/NaN", "catch the specific error, e.g. "
+                                 "except np.linalg.LinAlgError:")
+        if h.name is not None and any(isinstance(n, ast.Name) and n.id == h.name for b in h.body for n in ast.walk(b)):
+            raise Unsupported(h, f"using the caught exception ('{h.name}') is not supported")
+        q = self.qualify(h.type) or (h.type.id if isinstance(h.type, ast.Name) else None)
+        if q in ("numpy.linalg.LinAlgError", "numpy.linalg.linalg.LinAlgError", "numpy.linalg.exceptions.LinAlgError"):
+            return "qt::linalg_error"
+        if q == "ValueError":
+            return "std::invalid_argument"
+        why = {"ZeroDivisionError": "x / 0.0 raises it in Python but gives inf in C++",
+               "ArithmeticError": "x / 0.0 and float overflow raise it in Python but give inf in C++",
+               "OverflowError": "float overflow raises it in Python but gives inf in C++",
+               "FloatingPointError": "NumPy raises it only under np.seterr; C++ never does",
+               "Exception": "it includes errors Python raises where C++ carries on with inf/NaN"}
+        src = ast.unparse(h.type)
+        raise Unsupported(h, f"catching {src} is not supported" + (f": {why[src]}" if src in why else ""),
+                          "supported: except np.linalg.LinAlgError, except ValueError")
+
+    def _uses_math_domain(self, stmts, seen=None) -> bool:
+        """Does running `stmts` (or a function it calls) use a math-module function that raises
+        ValueError in Python where C++ returns NaN, e.g. math.sqrt(-1)?"""
+        seen = set() if seen is None else seen
+        for n in (m for s in stmts for m in ast.walk(s)):
+            if not isinstance(n, ast.Call):
+                continue
+            if self.qualify(n.func) in lib.MATH_DOMAIN:
+                return True
+            if isinstance(n.func, ast.Name) and n.func.id in self.mod.fdefs and n.func.id not in seen:
+                seen.add(n.func.id)
+                if self._uses_math_domain(self.mod.fdefs[n.func.id].body, seen):
+                    return True
+        return False
+
+    def check_try(self, s):
+        if s.finalbody:
+            raise Unsupported(s, "try ... finally is not supported")
+        if s.orelse:
+            raise Unsupported(s, "try ... else is not supported", "move the else-block after the try statement")
+        for h in s.handlers:
+            if isinstance(h.type, ast.Tuple):
+                raise Unsupported(h, "catching several exception types in one clause is not supported",
+                                  "write one except clause per type")
+            cls = self._handler_class(h)
+            if cls == "std::invalid_argument" and self._uses_math_domain(s.body):
+                raise Unsupported(h, "except ValueError around math.sqrt / math.log / ...: Python raises "
+                                     "ValueError outside their domain, C++ returns NaN, so the handler would "
+                                     "run in Python but not in C++", "test the argument before the call instead")
 
     def _scan_target(self, t, value, stmt):
         if isinstance(t, ast.Name):
@@ -370,7 +472,7 @@ class FunctionTranslator(ExprTranslator):
     # --- pass 3: type inference ------------------------------------------------------------
     def event_type(self, ev):
         self.current = ev.stmt
-        e = self.expr(ev.payload)
+        e = self.expr_raw(ev.payload) if ev.kind == "expr" else self.expr(ev.payload)
         t = e.type
         if ev.kind == "elt":
             i, n = ev.index
@@ -398,6 +500,8 @@ class FunctionTranslator(ExprTranslator):
                         continue
                     old = self.local_types.get(ev.name)
                     new = join(old, t)
+                    if new == NONE:
+                        continue  # only None so far: its type comes from the other assignments
                     if new is None:
                         raise Unsupported(ev.stmt, f"'{ev.name}' is assigned both {old} and {t} values; "
                                                    "a C++ variable has one type", "use separate names")
@@ -564,7 +668,8 @@ class FunctionTranslator(ExprTranslator):
                         raise Unsupported(s, "a generator can only be created with np.random.default_rng(seed); "
                                              "`g2 = g` would share one stream in Python but copy it in C++",
                                           "pass the generator itself to the functions that need it")
-                for block in (getattr(s, "body", []), getattr(s, "orelse", [])):
+                for block in (getattr(s, "body", []), getattr(s, "orelse", []),
+                              *[h.body for h in getattr(s, "handlers", [])]):
                     visit(block)
         visit(self.body)
 
@@ -667,6 +772,10 @@ class FunctionTranslator(ExprTranslator):
                 visit(orelse, stack)
         elif isinstance(s, (ast.While, ast.For)):
             visit(s.body, stack)
+        elif isinstance(s, ast.Try):
+            visit(s.body, stack)
+            for h in s.handlers:
+                visit(h.body, stack)
 
     def _assigned_before_every_read(self, stmts, var) -> bool:
         """True if, running `stmts` from the top, `var` is always assigned before it is read.
@@ -693,6 +802,8 @@ class FunctionTranslator(ExprTranslator):
                 reads(s.test, A)
                 a, b = block(s.body, set(A)), block(s.orelse, set(A))
                 return b if a is None else a if b is None else a & b
+            if isinstance(s, ast.Try):
+                return _try_state(s, A, block)
             if isinstance(s, (ast.While, ast.For)):
                 reads(s.test if isinstance(s, ast.While) else s.iter, A)
                 block(s.body, set(A))
@@ -810,6 +921,8 @@ class FunctionTranslator(ExprTranslator):
                 if b is None:
                     return a
                 return a & b
+            if isinstance(s, ast.Try):
+                return _try_state(s, A, block)
             if isinstance(s, ast.While):
                 check(s.test, A)
                 block(s.body, set(A))
@@ -917,17 +1030,24 @@ class FunctionTranslator(ExprTranslator):
         return self.params.get(name) or self.local_types[name]
 
     def assign_name(self, name, value_node, s, inline_set):
-        e = self.expr(value_node)
+        vt = self.var_type(name)
+        if (is_array(vt) or (isinstance(vt, OptionalType) and is_array(vt.inner))) and \
+                self.mod.is_asarray_of(value_node, name) and name not in inline_set:
+            self.emit(f"// {ast.unparse(s)}: already a float64 array, so NumPy returns it unchanged")
+            return
+        e = self.expr_raw(value_node) if isinstance(vt, OptionalType) else self.expr(value_node)
         if e.type == VOID:
             raise Unsupported(s, "assigning the result of a function that returns None")
-        vt = self.var_type(name)
         what = f"parameter '{name}'" if name in self.params else f"'{name}'"
         self.check_assignable(vt, e, s, what)
+        if isinstance(vt, OptionalType):
+            e = self.to_optional(e, vt)
         code = self.as_double(e).code if vt == FLOAT else e.code
         if vt == RNG and name in inline_set and code.startswith("qt::Rng(") and code.endswith(")"):
             self.emit(f"qt::Rng {cpp_ident(name)}{code[len('qt::Rng'):]};")
             return
-        if is_array(vt) and self._needs_eval(value_node, name, whole_array=True):
+        if (is_array(vt) or (isinstance(vt, OptionalType) and is_array(vt.inner))) and \
+                self._needs_eval(value_node, name, whole_array=True):
             code = f"({code}).eval()"  # Eigen is lazy: read all of the old value before overwriting it
         if name in inline_set:
             self.emit(f"{vt.cpp()} {cpp_ident(name)} = {code};")
@@ -984,9 +1104,20 @@ class FunctionTranslator(ExprTranslator):
 
     def store_subscript(self, t, value_node, s, sym):
         """a[i] = x, a[i:j] = v, A[i] = row, A[:, j] = col, A[r0:r1, c0:c1] = M (and +=, -=, ...)."""
-        code, kind = self.array_subscript(t, target=True)
         root = subscript_root(t)
+        if isinstance(self.var_type(root) if root else None, OptionalType):
+            raise Unsupported(s, f"'{root}' may be None, and storing into it is not supported",
+                              f"after the None check, work on a new name: {root}_ = {root}.copy()")
+        code, kind = self.array_subscript(t, target=True)
         v = self.expr(value_node)
+        if kind == "mask":
+            base, mask = code
+            if is_array(v.type):
+                raise Unsupported(s, "a[mask] = array is not supported; assign a scalar, or use np.where")
+            self.need_scalar(v, value_node, "the value stored into an array")
+            op = {"=": "set_op", "+=": "add_op", "-=": "sub_op", "*=": "mul_op", "/=": "div_op"}[sym]
+            self.emit(f"qt::masked_update({base}, {mask}, {self.as_double(v).code}, qt::{op}{{}});")
+            return
         if kind == "scalar" or not is_array(v.type):
             self.need_scalar(v, value_node, "the value stored into an array")
             rhs = self.as_double(v).code  # a scalar into a slice fills it, as in NumPy
@@ -1011,6 +1142,9 @@ class FunctionTranslator(ExprTranslator):
                 raise Unsupported(s, f"{type(s.op).__name__}= on an array element is not supported")
             self.store_subscript(s.target, s.value, s, syms[type(s.op)])
             return
+        if isinstance(self.var_type(s.target.id), OptionalType) and is_array(self.var_type(s.target.id).inner):
+            raise Unsupported(s, f"'{s.target.id}' may be None; in-place arithmetic on it is not supported",
+                              f"work on a new name: {s.target.id}_ = {s.target.id} + ...")
         if is_array(self.var_type(s.target.id)):
             name, vt = s.target.id, self.var_type(s.target.id)
             if type(s.op) not in syms:
@@ -1021,7 +1155,11 @@ class FunctionTranslator(ExprTranslator):
                 code = rhs.code
                 if self._needs_eval(s.value, name, whole_array=True):
                     code = f"({code}).eval()"
-                if rhs.type == vt:
+                if rhs.type == vt == MAT:
+                    # NumPy broadcasts a (1, m) or (n, 1) right side into the target's shape
+                    op = {ast.Add: "add_op", ast.Sub: "sub_op", ast.Mult: "mul_op", ast.Div: "div_op"}[type(s.op)]
+                    self.emit(f"qt::broadcast_into({target}, {code}, qt::{op}{{}});")
+                elif rhs.type == vt:
                     self.emit(f"{target} {syms[type(s.op)]} {code};")
                 elif vt == MAT:
                     self.emit(f"{target}.rowwise() {syms[type(s.op)]} {wrap(rhs, P_ATOM)}.transpose();")
@@ -1046,7 +1184,16 @@ class FunctionTranslator(ExprTranslator):
             self.emit(f"{cpp_ident(name)} = {result.code};")
 
     def s_If(self, s):
-        cond = self.truth(self.expr(s.test), s)
+        cond = self.cond(s.test)
+        if isinstance(cond.value, bool) and not (len(s.orelse) == 1 and isinstance(s.orelse[0], ast.If)):
+            # the test is decided by the types (A.ndim == 1 for a Mat): only one branch can run
+            dead, live = (s.orelse, s.body) if cond.value else (s.body, s.orelse)
+            if dead:
+                self.note(f"dead:{s.lineno}", f"line {s.lineno}: `{ast.unparse(s.test)}` is always {cond.value} "
+                                              "for the declared types, so the other branch is left out")
+            for b in live:
+                self.emit_stmt(b)
+            return
         self.emit(f"if ({cond.code}) {{")
         self._block(s.body)
         orelse = s.orelse
@@ -1055,7 +1202,7 @@ class FunctionTranslator(ExprTranslator):
             self.current = elif_
             self.flush_comments(elif_.lineno)
             self.comment_floor = elif_.lineno
-            c = self.truth(self.expr(elif_.test), elif_)
+            c = self.cond(elif_.test)
             self.emit(f"}} else if ({c.code}) {{")
             self._block(elif_.body)
             orelse = elif_.orelse
@@ -1064,8 +1211,22 @@ class FunctionTranslator(ExprTranslator):
             self._block(orelse)
         self.emit("}")
 
+    def s_Try(self, s):
+        """try / except LinAlgError (or ValueError): a C++ try / catch. Variables assigned in the
+        try block are declared before it, so a handler and the code after see them as Python does;
+        statements that ran before the error keep their effect in both."""
+        self.emit("try {")
+        self._block(s.body)
+        for h in s.handlers:
+            self.current = h
+            self.flush_comments(h.lineno)
+            self.comment_floor = h.lineno
+            self.emit(f"}} catch (const {self._handler_class(h)}&) {{  // except {ast.unparse(h.type)}")
+            self._block(h.body)
+        self.emit("}")
+
     def s_While(self, s):
-        cond = self.truth(self.expr(s.test), s)
+        cond = self.cond(s.test)
         self.emit(f"while ({cond.code}) {{")
         self._block(s.body)
         self.emit("}")
@@ -1123,11 +1284,18 @@ class FunctionTranslator(ExprTranslator):
 
     def s_Return(self, s):
         ret = self.sig.ret
-        if s.value is None:
-            if ret != VOID:
-                raise Unsupported(s, f"bare `return` gives None, but the function returns {ret}")
+        none = s.value is None or (isinstance(s.value, ast.Constant) and s.value.value is None)
+        if none and ret == VOID:
             self.emit("return;")
             return
+        if isinstance(ret, OptionalType):
+            e = Expr("std::nullopt", P_ATOM, NONE) if s.value is None else self.expr_raw(s.value)
+            self.check_assignable(ret, e, s, "the return value")
+            self.emit(f"return {self.to_optional(e, ret).code};")
+            return
+        if s.value is None:
+            raise Unsupported(s, f"bare `return` gives None, but the function returns {ret}",
+                              f"annotate the return as `-> {ret} | None` if None is a real result")
         if ret == VOID:
             raise Unsupported(s, "returning a value from a function annotated -> None")
         if isinstance(s.value, ast.Tuple):

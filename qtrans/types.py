@@ -11,6 +11,7 @@ admits the types quant pricing code actually uses for scalars:
     Vec      qt::Vec     (Eigen::ArrayXd; 1-D float64 array)            stage 2
     Mat      qt::Mat     (row-major Eigen::ArrayXXd; 2-D float64 array) stage 2
     None     void        (return type only)
+    X | None std::optional<X>  (X a number or array: optional arguments, "no result" returns)
 
 Numeric types form a ladder bool < int < float. A variable that is assigned an int
 in one place and a float in another is widened to float, exactly the way Python's
@@ -100,6 +101,36 @@ class RngType:
         return "Generator"
 
 
+@dataclass(frozen=True)
+class NoneValueType:
+    """The value None, before it is stored anywhere (it then becomes part of an OptionalType)."""
+
+    def cpp(self) -> str:
+        return "std::nullopt_t"
+
+    def zero(self) -> str:
+        return "std::nullopt"
+
+    def __str__(self) -> str:
+        return "None"
+
+
+@dataclass(frozen=True)
+class OptionalType:
+    """`X | None`: a number or array that may be absent, as std::optional<X>. Using the value
+    where Python needs a number checks it first (Python raises TypeError on None + 1)."""
+    inner: object
+
+    def cpp(self) -> str:
+        return f"std::optional<{self.inner.cpp()}>"
+
+    def zero(self) -> str:
+        return "std::nullopt"
+
+    def __str__(self) -> str:
+        return f"{self.inner} | None"
+
+
 BOOL = Scalar("bool")
 INT = Scalar("int")
 FLOAT = Scalar("float")
@@ -107,6 +138,7 @@ VOID = VoidType()
 VEC = ArrayType(1)
 MAT = ArrayType(2)
 RNG = RngType()
+NONE = NoneValueType()
 
 _RANK = {"bool": 0, "int": 1, "float": 2}
 
@@ -127,6 +159,12 @@ def join(a, b):
         return a
     if a == b:
         return a
+    if a == NONE or b == NONE or isinstance(a, OptionalType) or isinstance(b, OptionalType):
+        # x = None in one place and x = 1.5 in another: an optional float
+        ia = a.inner if isinstance(a, OptionalType) else a
+        ib = b.inner if isinstance(b, OptionalType) else b
+        inner = ib if ia == NONE else ia if ib == NONE else join(ia, ib)
+        return OptionalType(inner) if isinstance(inner, (Scalar, ArrayType)) else None
     if isinstance(a, Scalar) and isinstance(b, Scalar):
         return a if _RANK[a.name] >= _RANK[b.name] else b
     if isinstance(a, TupleType) and isinstance(b, TupleType) and len(a.elts) == len(b.elts):
@@ -140,6 +178,11 @@ def assignable(target, value) -> bool:
     without changing the number Python would have computed?"""
     if target == value:
         return True
+    if isinstance(target, OptionalType):
+        if value == NONE:
+            return True
+        v = value.inner if isinstance(value, OptionalType) else value
+        return assignable(target.inner, v)
     if isinstance(target, Scalar) and isinstance(value, Scalar):
         return _RANK[value.name] <= _RANK[target.name]
     if isinstance(target, (ArrayType, RngType)) or isinstance(value, (ArrayType, RngType)):

@@ -8,8 +8,9 @@ Rules that keep the numbers identical to NumPy's:
   * sum, mean, var/std, cumsum, quantile, linspace, arange use ports of NumPy's own algorithms.
   * x ** 2, x ** 0.5, x ** -1 use the same fast paths NumPy takes (square, sqrt, reciprocal).
   * Python index and slice rules (negative indices, clipping) are applied exactly.
-  * Broadcasting is supported where the result is unambiguous: scalar with array, and a Mat
-    with a Vec whose length equals the number of columns (NumPy's trailing-axis rule).
+  * Broadcasting follows NumPy: scalar with array, a Mat with a Vec whose length equals the
+    number of columns (the trailing-axis rule), and two Mats whose dimensions are equal or 1
+    (a keepdims=True mean, or v[:, None], against a matrix).
 """
 from __future__ import annotations
 
@@ -43,7 +44,11 @@ ARRAY_FUNCS = set(_MEMBER) | set(_HELPER) | set(_MASK_FN) | set(_REDUCE) | {
     "numpy.full_like", "numpy.copy", "numpy.dot", "numpy.matmul", "numpy.outer", "numpy.transpose",
     "numpy.diag", "numpy.where", "numpy.all", "numpy.any", "numpy.count_nonzero", "numpy.maximum",
     "numpy.minimum", "numpy.power", "numpy.linalg.solve", "numpy.linalg.inv", "numpy.linalg.cholesky",
-    "numpy.linalg.det"}
+    "numpy.linalg.det", "numpy.clip", "numpy.trace", "numpy.ravel", "numpy.linalg.eigh",
+    "numpy.linalg.eigvalsh", "numpy.linalg.pinv"}
+# functions taking a list of arrays: np.column_stack([a, b]) ...
+STACKERS = {"numpy.column_stack", "numpy.vstack", "numpy.row_stack", "numpy.hstack", "numpy.concatenate"}
+_BC_OPS = {"+": "qt::add_op{}", "-": "qt::sub_op{}", "*": "qt::mul_op{}", "/": "qt::div_op{}"}
 # functions that make arrays from scalars: always take the array path
 _CREATORS = {"numpy.zeros", "numpy.ones", "numpy.full", "numpy.eye", "numpy.identity", "numpy.linspace",
              "numpy.arange", "numpy.array", "numpy.asarray"}
@@ -104,6 +109,9 @@ class ArrayOps:
             L = self._scalar_operand(L, node)
         if not RA:
             R = self._scalar_operand(R, node)
+        if L.type == MAT and R.type == MAT:
+            # either side may be (n, 1) or (1, m): NumPy broadcasts, Eigen would refuse
+            return Expr(f"qt::broadcast({L.code}, {R.code}, {_BC_OPS[sym]})", P_ATOM, MAT)
         if not (LA and RA) or L.type == R.type:
             t = L.type if LA else R.type
             return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, t)
@@ -134,6 +142,8 @@ class ArrayOps:
             return Expr(f"qt::pow({self.as_double(L).code}, {R.code})", P_ATOM, R.type)
         if L.type != R.type:
             raise Unsupported(node, "** between a Vec and a Mat is not supported")
+        if L.type == MAT:
+            return Expr(f"qt::broadcast({L.code}, {R.code}, qt::pow_op{{}})", P_ATOM, MAT)
         return Expr(f"qt::pow({L.code}, {R.code})", P_ATOM, L.type)
 
     def matmul(self, node, L: Expr, R: Expr) -> Expr:
@@ -217,6 +227,18 @@ class ArrayOps:
             raise Unsupported(node, "assignment into an expression; assign into a variable")
         parts = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
         b = wrap(B, P_ATOM)
+        if len(parts) == 1 and not isinstance(parts[0], ast.Slice):
+            M = self.expr(parts[0])
+            if isinstance(M, Expr) and isinstance(M.type, MaskType):
+                return self._mask_subscript(node, B, M, target)
+        if B.type == VEC and len(parts) == 2 and any(self._is_newaxis(q) for q in parts):
+            if target:
+                raise Unsupported(node, "assigning through a new axis (v[:, None] = ...) is not supported")
+            other = parts[1] if self._is_newaxis(parts[0]) else parts[0]
+            if not self._full(other):
+                raise Unsupported(node, "a new axis is supported as v[:, None] or v[None, :]")
+            fn = "as_row" if self._is_newaxis(parts[0]) else "as_col"
+            return Expr(f"qt::{fn}({B.code})", P_ATOM, MAT)
         slices = [isinstance(p, ast.Slice) for p in parts]
         if any(slices) and not named:
             raise Unsupported(node, "slicing an expression", "store the array in a variable, then slice it")
@@ -257,6 +279,21 @@ class ArrayOps:
         raise Unsupported(node, "mixing an index and a partial slice (A[i, 1:3]) is not supported",
                           "slice the row first: row = A[i]; row[1:3]")
 
+    def _is_newaxis(self, n) -> bool:
+        return (isinstance(n, ast.Constant) and n.value is None) or self.qualify(n) == "numpy.newaxis"
+
+    def _mask_subscript(self, node, B: Expr, M: Expr, target):
+        """a[mask] (a copy of the selected elements) and a[mask] = scalar."""
+        if target:
+            if M.type.rank != B.type.rank:
+                raise Unsupported(node, "assigning into rows picked by a mask (A[mask] = ...) is not supported")
+            return (B.code, M.code), "mask"
+        if M.type.rank == B.type.rank:
+            return Expr(f"qt::select({B.code}, {M.code})", P_ATOM, VEC)
+        if B.type == MAT and M.type.rank == 1:
+            return Expr(f"qt::select_rows({B.code}, {M.code})", P_ATOM, MAT)
+        raise Unsupported(node, "a 2-D mask can only index a 2-D array")
+
     def _shape_item(self, node):
         A = self.expr(node.value.value)
         self._need_array(A, node, ".shape")
@@ -284,8 +321,11 @@ class ArrayOps:
 
     # --- methods: a.sum(), a.copy(), (a > 0).any(), ... -------------------------------------------
     def array_method(self, node, B: Expr, name: str) -> Expr:
-        args = [self.expr(a) for a in node.args]
-        kws = {k.arg: self.expr(k.value) for k in node.keywords}
+        if name in ("astype", "clip"):  # arguments are a dtype / may be None: not plain values
+            args, kws = [], {}
+        else:
+            args = [self.expr(a) for a in node.args]
+            kws = {k.arg: self.expr(k.value) for k in node.keywords}
         if isinstance(B.type, MaskType):
             if name in ("any", "all") and not args and not kws:
                 return Expr(f"{wrap(B, P_ATOM)}.{name}()", P_ATOM, BOOL)
@@ -294,10 +334,24 @@ class ArrayOps:
             raise Unsupported(node, f"boolean-array method .{name}() is not supported")
         if name == "copy" and not args:
             return Expr(B.code, B.prec, B.type)
+        if name == "astype":
+            if len(node.args) != 1 or node.keywords or ast.unparse(node.args[0]) not in (
+                    "float", "np.float64", "numpy.float64", "'float64'", '"float64"'):
+                raise Unsupported(node, "only .astype(float) is supported (arrays are float64)")
+            return Expr(B.code, B.prec, B.type)  # a copy, as astype makes
+        if name in ("ravel", "flatten") and not node.args and not node.keywords:
+            return Expr(f"qt::ravel({B.code})", P_ATOM, VEC) if B.type == MAT else Expr(B.code, B.prec, VEC)
+        if name == "clip":
+            return self._clip(node, B, node.args, {k.arg: k.value for k in node.keywords})
+        if name == "trace" and not args and not kws:
+            if B.type != MAT:
+                raise Unsupported(node, ".trace() needs a 2-D array")
+            return Expr(f"qt::trace({B.code})", P_ATOM, FLOAT)
         if name == "transpose" and not args:
             return self.array_attribute(ast.Attribute(attr="T"), B)
         if name == "dot" and len(args) == 1:
             return self.matmul(node, B, args[0])
+
         if name in ("sum", "mean", "std", "var", "max", "min", "argmax", "argmin", "cumsum", "cumprod"):
             return self._reduce(node, name, B, args, kws)
         raise Unsupported(node, f"array method .{name}() is not supported in stage 2")
@@ -310,26 +364,64 @@ class ArrayOps:
             raise Unsupported(node, "axis must be an integer constant")
         return a.value
 
+    def _keepdims(self, node, kws) -> bool:
+        k = kws.get("keepdims")
+        if k is None:
+            return False
+        if not isinstance(k.value, bool):
+            raise Unsupported(node, "keepdims must be the constant True or False")
+        return k.value
+
+    def _kept(self, e: Expr, A: Expr, axis, keep: bool) -> Expr:
+        """A reduction result with keepdims=True: (1, m) for axis 0, (n, 1) for axis 1."""
+        if not keep:
+            return e
+        if A.type == VEC or axis is None:
+            raise Unsupported(self.current, "keepdims=True is supported for reductions of a Mat over an axis")
+        fn = "as_row" if axis in (0, -2) else "as_col"
+        return Expr(f"qt::{fn}({e.code})", P_ATOM, MAT)
+
     def _reduce(self, node, name, A: Expr, args, kws) -> Expr:
         self._need_array(A, node, f"{name}()")
-        extra = set(kws) - {"axis", "ddof"}
+        extra = set(kws) - {"axis", "ddof", "keepdims"}
         if extra:
             raise Unsupported(node, f"keyword(s) {', '.join(sorted(extra))} are not supported for {name}()")
-        if name in ("sum", "mean"):
+        keep = self._keepdims(node, kws)
+        if keep and name not in ("sum", "mean", "std", "var"):
+            raise Unsupported(node, f"keepdims is not supported for {name}()")
+        if name in ("sum", "mean", "std", "var"):
             axis = self._axis(node, args, kws, 0)
-            if axis is None or (A.type == VEC and axis in (0, -1)):
+            if axis is not None and not (A.type == VEC and axis in (0, -1)) and \
+                    not (A.type == MAT and axis in (0, 1, -1, -2)):
+                raise Unsupported(node, f"axis={axis} is out of range for a {A.type}")
+            if A.type == VEC:
+                axis = None
+        if name in ("sum", "mean"):
+            if axis is None:
                 return Expr(f"qt::{name}({A.code})", P_ATOM, FLOAT)
-            if A.type == MAT and axis in (0, 1, -1, -2):
-                return Expr(f"qt::{name}({A.code}, {axis})", P_ATOM, VEC)
-            raise Unsupported(node, f"axis={axis} is out of range for a {A.type}")
+            return self._kept(Expr(f"qt::{name}({A.code}, {axis})", P_ATOM, VEC), A, axis, keep)
         if name in ("std", "var"):
-            if "axis" in kws or args:
-                raise Unsupported(node, f"{name}() over an axis is not supported in stage 2")
+            if len(args) > 1:
+                raise Unsupported(node, f"pass ddof to {name}() by keyword")
             ddof = kws.get("ddof")
             if ddof is not None and ddof.type not in (INT, BOOL):
                 raise Unsupported(node, "ddof must be an integer")
             fn = "std_" if name == "std" else "var"
-            return Expr(f"qt::{fn}({A.code}{', ' + ddof.code if ddof is not None else ''})", P_ATOM, FLOAT)
+            if axis is None:
+                return Expr(f"qt::{fn}({A.code}{', ' + ddof.code if ddof is not None else ''})", P_ATOM, FLOAT)
+            d = ddof.code if ddof is not None else "0"
+            return self._kept(Expr(f"qt::{fn}({A.code}, {axis}, {d})", P_ATOM, VEC), A, axis, keep)
+        if name in ("cumsum", "cumprod") and not kws.keys() - {"axis"}:
+            axis = self._axis(node, args, kws, 0)
+            if axis is not None and len(args) > 1:
+                raise Unsupported(node, f"arguments to {name}() beyond axis are not supported")
+            if axis is not None and A.type == MAT:
+                if axis not in (0, 1, -1, -2):
+                    raise Unsupported(node, f"axis={axis} is out of range for a Mat")
+                return Expr(f"qt::{name}({A.code}, {axis})", P_ATOM, MAT)
+            if axis is not None and axis not in (0, -1):
+                raise Unsupported(node, f"axis={axis} is out of range for a Vec")
+            return Expr(f"qt::{name}({A.code})", P_ATOM, VEC)
         if args or kws:
             raise Unsupported(node, f"arguments to {name}() are not supported in stage 2")
         t = {"max": FLOAT, "min": FLOAT, "argmax": INT, "argmin": INT, "cumsum": VEC, "cumprod": VEC}[name]
@@ -501,15 +593,149 @@ class ArrayOps:
             return Expr(f"qt::{qual.split('.')[1]}({ca}, {cb})", P_ATOM, t)
         if qual == "numpy.power":
             return self.array_power(node, args[0], args[1])
+        if qual == "numpy.clip":
+            return self._clip(node, A, node.args[1:], {k.arg: k.value for k in node.keywords})
+        if qual == "numpy.trace":
+            if A.type != MAT or len(args) != 1 or kws:
+                raise Unsupported(node, "np.trace(A) of a 2-D array, without offset, is supported")
+            return Expr(f"qt::trace({A.code})", P_ATOM, FLOAT)
+        if qual == "numpy.ravel":
+            self._need_array(A, node, src)
+            return Expr(f"qt::ravel({A.code})", P_ATOM, VEC) if A.type == MAT else Expr(A.code, A.prec, VEC)
         if qual.startswith("numpy.linalg."):
             return self._linalg(node, qual, args)
         raise Unsupported(node, f"{src}() is not supported on arrays in stage 2")
+
+    def _clip(self, node, A: Expr, bound_nodes, kw_nodes) -> Expr:
+        """np.clip(a, lo, hi) / a.clip(lo, hi): scalar bounds, either of which may be None."""
+        names = ["a_min", "a_max"]
+        if len(bound_nodes) > 2 or set(kw_nodes) - {"a_min", "a_max", "min", "max"}:
+            raise Unsupported(node, "clip(a, lo, hi) with scalar bounds is supported")
+        b = dict(zip(names, bound_nodes))
+        for k, v in kw_nodes.items():
+            b["a_" + k if not k.startswith("a_") else k] = v
+        lo, hi = (None if (n := b.get(k)) is None or (isinstance(n, ast.Constant) and n.value is None)
+                  else n for k in names)
+        if lo is None and hi is None:
+            raise Unsupported(node, "clip() needs at least one bound (NumPy raises ValueError)")
+        ex = []
+        for n in (lo, hi):
+            if n is None:
+                ex.append(None)
+                continue
+            e = self.expr(n)
+            if is_array(e.type):
+                raise Unsupported(n, "array-valued clip bounds are not supported; use scalars")
+            ex.append(self._scalar_operand(e, n))
+        lo_e, hi_e = ex
+        if not is_array(A.type):
+            self.need_scalar(A, node, "np.clip()")
+            x = self.as_double(A).code
+            if hi_e is None:
+                return Expr(f"qt::np_maximum({x}, {lo_e.code})", P_ATOM, FLOAT)
+            if lo_e is None:
+                return Expr(f"qt::np_minimum({x}, {hi_e.code})", P_ATOM, FLOAT)
+            return Expr(f"qt::np_clip({x}, {lo_e.code}, {hi_e.code})", P_ATOM, FLOAT)
+        # NumPy: clip(a, lo, None) is np.maximum(a, lo) and clip(a, None, hi) is np.minimum(a, hi)
+        if hi_e is None:
+            return Expr(f"qt::maximum({A.code}, {lo_e.code})", P_ATOM, A.type)
+        if lo_e is None:
+            return Expr(f"qt::minimum({A.code}, {hi_e.code})", P_ATOM, A.type)
+        return Expr(f"qt::clip({A.code}, {lo_e.code}, {hi_e.code})", P_ATOM, A.type)
+
+    def stack_call(self, node, qual) -> Expr:
+        """np.column_stack / vstack / hstack / concatenate of a literal list of arrays."""
+        src = ast.unparse(node.func)
+        if len(node.args) != 1 or not isinstance(node.args[0], (ast.List, ast.Tuple)) or not node.args[0].elts:
+            raise Unsupported(node, f"{src}() of a literal list of arrays, [a, b, ...], is supported")
+        axis = 0
+        for k in node.keywords:
+            if qual == "numpy.concatenate" and k.arg == "axis" and isinstance(k.value, ast.Constant) \
+                    and k.value.value in (0, 1, -1):
+                axis = k.value.value
+            else:
+                raise Unsupported(node, f"keyword '{k.arg}' is not supported for {src}()")
+        parts = []
+        for e in node.args[0].elts:
+            if isinstance(e, (ast.List, ast.Tuple)):  # np.concatenate(([x0], v)): a literal list of numbers
+                parts.append(self.array_literal(ast.Call(func=node.func, args=[e], keywords=[]), "np.array"))
+            else:
+                parts.append(self.expr(e))
+        for e, n in zip(parts, node.args[0].elts):
+            if not is_array(e.type):
+                raise Unsupported(n, f"{src}() needs arrays (scalars are not supported here)")
+        vecs = all(e.type == VEC for e in parts)
+        mats = all(e.type == MAT for e in parts)
+        if qual == "numpy.column_stack":
+            cols = [f"qt::as_col({e.code})" if e.type == VEC else f"qt::Mat({e.code})" for e in parts]
+            return Expr(f"qt::hcat({{{', '.join(cols)}}})", P_ATOM, MAT)
+        if qual in ("numpy.vstack", "numpy.row_stack"):
+            rows = [f"qt::as_row({e.code})" if e.type == VEC else f"qt::Mat({e.code})" for e in parts]
+            return Expr(f"qt::vcat({{{', '.join(rows)}}})", P_ATOM, MAT)
+        if vecs and (qual == "numpy.hstack" or axis in (0, -1)):
+            return Expr(f"qt::concat({{{', '.join(f'qt::Vec({e.code})' for e in parts)}}})", P_ATOM, VEC)
+        if mats:
+            fn = "hcat" if qual == "numpy.hstack" or axis in (1, -1) else "vcat"
+            return Expr(f"qt::{fn}({{{', '.join(f'qt::Mat({e.code})' for e in parts)}}})", P_ATOM, MAT)
+        raise Unsupported(node, f"{src}() of a mix of 1-D and 2-D arrays raises ValueError in NumPy")
+
+    def einsum_call(self, node) -> Expr:
+        """np.einsum('ij,ij->i', A, B) with one or two Vec / Mat operands and a literal spec."""
+        if not node.args or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+            raise Unsupported(node, "np.einsum needs its subscripts as a string literal")
+        if node.keywords:
+            raise Unsupported(node, "keyword arguments to np.einsum (optimize=, out=, ...) are not supported")
+        spec = node.args[0].value.replace(" ", "")
+        ops = [self.expr(a) for a in node.args[1:]]
+        if not 1 <= len(ops) <= 2:
+            raise Unsupported(node, "np.einsum with one or two operands is supported")
+        if "." in spec or not all(c.isalpha() and c.islower() or c in ",->" for c in spec):
+            raise Unsupported(node, "np.einsum subscripts: lower-case letters only (no ellipsis)")
+        lhs, _, out = spec.partition("->")
+        ins = lhs.split(",")
+        if len(ins) != len(ops):
+            raise Unsupported(node, f"np.einsum spec '{spec}' names {len(ins)} operands but {len(ops)} are given")
+        if "->" not in spec:  # implicit mode: labels used once, alphabetically
+            out = "".join(sorted(c for c in set(lhs) - {","} if lhs.count(c) == 1))
+        for e, l, n in zip(ops, ins, node.args[1:]):
+            if not is_array(e.type):
+                raise Unsupported(n, "np.einsum operands must be arrays")
+            if len(l) != e.type.rank:
+                raise Unsupported(n, f"np.einsum subscripts '{l}' don't match a {e.type}")
+        if len(out) > 2 or len(set(out)) != len(out) or any(c not in lhs for c in out):
+            raise Unsupported(node, f"np.einsum output '{out}' is not supported (at most 2 distinct input labels)")
+        self.note("einsum", "np.einsum is computed by direct summation; NumPy's kernels add in a different "
+                            "order, so results agree to rounding rather than bit for bit")
+        mats = [e.code for e in ops]  # qt::EinsumArg takes a Mat or Vec by reference
+        ranks = ", ".join(str(e.type.rank) for e in ops)
+        t = {0: FLOAT, 1: VEC, 2: MAT}[len(out)]
+        return Expr(f'qt::einsum{len(out)}("{spec}", {{{", ".join(mats)}}}, {{{ranks}}})', P_ATOM, t)
 
     def _linalg(self, node, qual, args):
         fn = qual.rsplit(".", 1)[1]
         A = args[0]
         if A.type != MAT:
             raise Unsupported(node, f"np.linalg.{fn} needs a Mat")
+        if fn in ("eigh", "eigvalsh"):
+            if len(args) != 1 or node.keywords:
+                raise Unsupported(node, f"np.linalg.{fn}(A) without UPLO= is supported (the lower triangle is used)")
+            self.note("eigh", "np.linalg.eigh: eigenvalues agree to rounding; each eigenvector is defined only up "
+                              "to sign (and rotation within a repeated eigenvalue), which LAPACK and Eigen may "
+                              "choose differently. Results like V @ diag(f(w)) @ V.T agree.")
+            if fn == "eigvalsh":
+                return Expr(f"qt::eigvalsh({A.code})", P_ATOM, VEC)
+            return Expr(f"qt::eigh({A.code})", P_ATOM, TupleType((VEC, MAT)))
+        if fn == "pinv":
+            rc = [k for k in node.keywords if k.arg in ("rcond", "rtol")]
+            if len(args) > 2 or len(rc) != len(node.keywords) or (len(args) == 2 and rc):
+                raise Unsupported(node, "np.linalg.pinv(A) or pinv(A, rcond) with a scalar rcond is supported")
+            r = args[1] if len(args) == 2 else (self.expr(rc[0].value) if rc else None)
+            if r is not None and is_array(r.type):
+                raise Unsupported(node, "array-valued rcond is not supported")
+            self.note("pinv", "np.linalg.pinv agrees with NumPy to rounding; singular values within rounding "
+                              "of the rcond cutoff can be kept by one and dropped by the other")
+            extra = f", {self._scalar_operand(r, node).code}" if r is not None else ""
+            return Expr(f"qt::pinv({A.code}{extra})", P_ATOM, MAT)
         if fn == "solve":
             if len(args) != 2 or not is_array(args[1].type):
                 raise Unsupported(node, "np.linalg.solve(A, b) with b a Vec or Mat")

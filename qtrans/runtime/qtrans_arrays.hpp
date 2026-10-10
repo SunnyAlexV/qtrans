@@ -23,7 +23,10 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <type_traits>
+#include <vector>
 
 #include "qtrans_runtime.hpp"
 
@@ -250,7 +253,9 @@ auto maximum(const Eigen::ArrayBase<D>& a, double b) {
     return a.unaryExpr([b](double x) { return np_maximum(x, b); });
 }
 template <class D>
-auto maximum(double a, const Eigen::ArrayBase<D>& b) { return maximum(b, a); }
+auto maximum(double a, const Eigen::ArrayBase<D>& b) {  // not maximum(b, a): ties return the 2nd
+    return b.unaryExpr([a](double y) { return np_maximum(a, y); });
+}
 template <class D1, class D2>
 auto minimum(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {
     return a.binaryExpr(b, [](double x, double y) { return np_minimum(x, y); });
@@ -260,7 +265,15 @@ auto minimum(const Eigen::ArrayBase<D>& a, double b) {
     return a.unaryExpr([b](double x) { return np_minimum(x, b); });
 }
 template <class D>
-auto minimum(double a, const Eigen::ArrayBase<D>& b) { return minimum(b, a); }
+auto minimum(double a, const Eigen::ArrayBase<D>& b) {
+    return b.unaryExpr([a](double y) { return np_minimum(a, y); });
+}
+
+// np.clip(a, lo, hi) with scalar bounds (one-sided clips are np.maximum / np.minimum).
+template <class D>
+auto clip(const Eigen::ArrayBase<D>& a, double lo, double hi) {
+    return a.unaryExpr([lo, hi](double x) { return np_clip(x, lo, hi); });
+}
 
 // np.where(cond, x, y) with arrays or scalars on either branch.
 inline double at(double v, Index, Index) { return v; }
@@ -313,10 +326,17 @@ inline double pairwise(const double* a, Index n, Index stride) {
     return pairwise(a, n2, stride) + pairwise(a + n2 * stride, n - n2, stride);
 }
 
+// A stored Vec / Mat is read where it is; an expression is evaluated once, in row-major order.
+template <class D>
+decltype(auto) evaluated(const Eigen::ArrayBase<D>& a) {
+    if constexpr (std::is_same_v<D, Vec> || std::is_same_v<D, Mat>) return (a.derived());
+    else return plain_t<D>(a);
+}
+
 // np.sum(a): pairwise over all elements in row-major (C) order.
 template <class D>
 double sum(const Eigen::ArrayBase<D>& a) {
-    const plain_t<D> p = a;
+    const auto& p = evaluated(a);
     return pairwise(p.data(), p.size(), 1);
 }
 
@@ -325,7 +345,7 @@ double sum(const Eigen::ArrayBase<D>& a) {
 // np.sum(A, axis=1): pairwise along each row.
 template <class D>
 Vec sum(const Eigen::ArrayBase<D>& a, int axis) {
-    const Mat m = a;
+    const auto& m = evaluated(a);
     if (axis == 0 || axis == -2) {
         Vec out(m.cols());
         if (m.cols() == 1) {
@@ -370,6 +390,27 @@ double std_(const Eigen::ArrayBase<D>& a, long long ddof = 0) {
     return std::sqrt(var(a, ddof));
 }
 
+// np.var(A, axis, ddof): NumPy's _var with an axis. The mean is sum(A, axis) / count (the
+// same reduction order as np.sum over that axis), then the squared deviations are summed
+// over the same axis and divided by max(count - ddof, 0).
+template <class D>
+Vec var(const Eigen::ArrayBase<D>& a, int axis, long long ddof) {
+    const Mat m = a;
+    const bool down = axis == 0 || axis == -2;
+    if (!down && axis != 1 && axis != -1) throw shape_error("axis out of bounds for a 2-D array");
+    const Vec mu = mean(m, axis);
+    Mat dev = down ? Mat(m.rowwise() - mu.transpose()) : Mat(m.colwise() - mu);
+    dev = dev * dev;
+    const long long count = static_cast<long long>(down ? m.rows() : m.cols());
+    const long long dof = std::max<long long>(count - ddof, 0);
+    return sum(dev, axis) / static_cast<double>(dof);
+}
+
+template <class D>
+Vec std_(const Eigen::ArrayBase<D>& a, int axis, long long ddof) {
+    return var(a, axis, ddof).sqrt();
+}
+
 template <class D>
 Vec cumsum(const Eigen::ArrayBase<D>& a) {
     const plain_t<D> p = a;
@@ -387,6 +428,29 @@ Vec cumprod(const Eigen::ArrayBase<D>& a) {
     for (Index i = 0; i < p.size(); ++i) out(i) = s *= p.data()[i];
     return out;
 }
+
+// np.cumsum(A, axis) / np.cumprod(A, axis): running totals down each column (axis 0) or
+// along each row (axis 1), one addition per step, as NumPy's accumulate does.
+template <bool Prod, class D>
+Mat accumulate(const Eigen::ArrayBase<D>& a, int axis) {
+    Mat m = a;
+    if (axis == 0 || axis == -2) {
+        for (Index i = 1; i < m.rows(); ++i)
+            for (Index j = 0; j < m.cols(); ++j)
+                m(i, j) = Prod ? m(i - 1, j) * m(i, j) : m(i - 1, j) + m(i, j);
+    } else if (axis == 1 || axis == -1) {
+        for (Index i = 0; i < m.rows(); ++i)
+            for (Index j = 1; j < m.cols(); ++j)
+                m(i, j) = Prod ? m(i, j - 1) * m(i, j) : m(i, j - 1) + m(i, j);
+    } else {
+        throw shape_error("axis out of bounds for a 2-D array");
+    }
+    return m;
+}
+template <class D>
+Mat cumsum(const Eigen::ArrayBase<D>& a, int axis) { return accumulate<false>(a, axis); }
+template <class D>
+Mat cumprod(const Eigen::ArrayBase<D>& a, int axis) { return accumulate<true>(a, axis); }
 
 // np.max / np.min: NaN anywhere gives NaN; an empty array raises.
 template <class D>
@@ -547,6 +611,188 @@ Vec diagonal(const Eigen::ArrayBase<D>& m) {  // np.diag(matrix)
     return m.matrix().diagonal().array();
 }
 
+// np.trace(A): NumPy sums the diagonal (a strided view) with the same pairwise summation.
+template <class D>
+double trace(const Eigen::ArrayBase<D>& a) {
+    const Mat m = a;
+    return pairwise(m.data(), std::min(m.rows(), m.cols()), m.cols() + 1);
+}
+
+// =====================================================================================
+// Shapes: new axes, keepdims, ravel, stacking, broadcasting between two 2-D arrays
+// =====================================================================================
+template <class D>
+Mat as_row(const Eigen::ArrayBase<D>& v) {  // v[None, :], or a keepdims=True reduction over axis 0
+    const Vec p = v;
+    return Mat(p.transpose());
+}
+template <class D>
+Mat as_col(const Eigen::ArrayBase<D>& v) {  // v[:, None], or a keepdims=True reduction over axis 1
+    const Vec p = v;
+    Mat out(p.size(), 1);
+    for (Index i = 0; i < p.size(); ++i) out(i, 0) = p(i);
+    return out;
+}
+
+// a.ravel() / a.flatten(): row-major (C) order, as NumPy's default.
+template <class D>
+Vec ravel(const Eigen::ArrayBase<D>& a) {
+    const plain_t<D> p = a;
+    return Eigen::Map<const Vec>(p.data(), p.size());
+}
+
+// np.concatenate / np.hstack of 1-D arrays.
+inline Vec concat(std::initializer_list<Vec> parts) {
+    Index n = 0;
+    for (const Vec& v : parts) n += v.size();
+    Vec out(n);
+    Index k = 0;
+    for (const Vec& v : parts) { out.segment(k, v.size()) = v; k += v.size(); }
+    return out;
+}
+
+// Stack 2-D blocks on top of each other (np.vstack, np.concatenate(axis=0)) or side by side
+// (np.hstack / np.column_stack of 2-D blocks, np.concatenate(axis=1)).
+inline Mat vcat(std::initializer_list<Mat> parts) {
+    if (parts.size() == 0) throw shape_error("need at least one array to concatenate");
+    const Index c = parts.begin()->cols();
+    Index r = 0;
+    for (const Mat& m : parts) {
+        if (m.cols() != c) throw shape_error("all the input array dimensions except for the "
+                                             "concatenation axis must match exactly");
+        r += m.rows();
+    }
+    Mat out(r, c);
+    Index k = 0;
+    for (const Mat& m : parts) { out.middleRows(k, m.rows()) = m; k += m.rows(); }
+    return out;
+}
+inline Mat hcat(std::initializer_list<Mat> parts) {
+    if (parts.size() == 0) throw shape_error("need at least one array to concatenate");
+    const Index r = parts.begin()->rows();
+    Index c = 0;
+    for (const Mat& m : parts) {
+        if (m.rows() != r) throw shape_error("all the input array dimensions except for the "
+                                             "concatenation axis must match exactly");
+        c += m.cols();
+    }
+    Mat out(r, c);
+    Index k = 0;
+    for (const Mat& m : parts) { out.middleCols(k, m.cols()) = m; k += m.cols(); }
+    return out;
+}
+
+// NumPy broadcasting between two 2-D arrays: each dimension must be equal, or 1 in one of
+// them (a (n, 1) column against an (n, m) matrix, a (1, m) row against it, ...).
+inline Index broadcast_dim(Index a, Index b) {
+    if (a == b || b == 1) return a;
+    if (a == 1) return b;
+    throw shape_error("operands could not be broadcast together");
+}
+
+struct add_op { double operator()(double x, double y) const { return x + y; } };
+struct sub_op { double operator()(double x, double y) const { return x - y; } };
+struct mul_op { double operator()(double x, double y) const { return x * y; } };
+struct div_op { double operator()(double x, double y) const { return x / y; } };
+struct pow_op { double operator()(double x, double y) const { return std::pow(x, y); } };
+
+// Same shapes (the usual case): Eigen's own vectorised + - * /, which round exactly as the
+// scalar operations do, straight into the result. Otherwise NumPy's broadcasting rule.
+template <class F, class D1, class D2>
+Mat broadcast(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b, F f) {
+    if (a.rows() == b.rows() && a.cols() == b.cols()) {
+        if constexpr (std::is_same_v<F, add_op>) return a + b;
+        else if constexpr (std::is_same_v<F, sub_op>) return a - b;
+        else if constexpr (std::is_same_v<F, mul_op>) return a * b;
+        else if constexpr (std::is_same_v<F, div_op>) return a / b;
+        else return a.binaryExpr(b, f);
+    }
+    const Mat x = a, y = b;
+    const Index r = broadcast_dim(x.rows(), y.rows()), c = broadcast_dim(x.cols(), y.cols());
+    if constexpr (!std::is_same_v<F, pow_op>) {
+        // the common shapes: a (1, m) row or an (n, 1) column against an (n, m) matrix
+        if (x.rows() == r && x.cols() == c && y.rows() == 1 && y.cols() == c) {
+            Mat out = x;
+            const auto row = y.row(0);
+            for (Index i = 0; i < r; ++i) out.row(i) = out.row(i).binaryExpr(row, f);
+            return out;
+        }
+        if (x.rows() == r && x.cols() == c && y.cols() == 1 && y.rows() == r) {
+            Mat out(r, c);
+            for (Index i = 0; i < r; ++i) out.row(i) = x.row(i).unaryExpr([&](double v) { return f(v, y(i, 0)); });
+            return out;
+        }
+    }
+    Mat out(r, c);
+    for (Index i = 0; i < r; ++i)
+        for (Index j = 0; j < c; ++j)
+            out(i, j) = f(x(x.rows() == 1 ? 0 : i, x.cols() == 1 ? 0 : j),
+                          y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
+    return out;
+}
+
+// A += B for 2-D arrays: B is broadcast to A's shape; A's shape never changes (NumPy raises
+// "non-broadcastable output operand" otherwise).
+// (The caller evaluates b first when it reads a itself, as in S += S.T.)
+template <class F, class D>
+void broadcast_into(Mat& a, const Eigen::ArrayBase<D>& b, F f) {
+    if (b.rows() == a.rows() && b.cols() == a.cols()) {
+        if constexpr (std::is_same_v<F, add_op>) a += b;
+        else if constexpr (std::is_same_v<F, sub_op>) a -= b;
+        else if constexpr (std::is_same_v<F, mul_op>) a *= b;
+        else if constexpr (std::is_same_v<F, div_op>) a /= b;
+        else a = a.binaryExpr(b, f);
+        return;
+    }
+    const Mat y = b;
+    if ((y.rows() != a.rows() && y.rows() != 1) || (y.cols() != a.cols() && y.cols() != 1))
+        throw shape_error("non-broadcastable output operand");
+    for (Index i = 0; i < a.rows(); ++i)
+        for (Index j = 0; j < a.cols(); ++j)
+            a(i, j) = f(a(i, j), y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
+}
+
+// =====================================================================================
+// Boolean-mask indexing: a[mask] picks the elements where mask is true, in row-major order
+// (a copy, as in NumPy); A[row_mask] picks whole rows.
+// =====================================================================================
+template <class D, class M>
+Vec select(const Eigen::ArrayBase<D>& a, const Eigen::ArrayBase<M>& mask) {
+    const plain_t<D> p = a;
+    const Eigen::Array<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> m = mask;
+    if (p.rows() != m.rows() || p.cols() != m.cols())
+        throw index_error("boolean index did not match indexed array");
+    Vec out(m.count());
+    Index k = 0;
+    for (Index i = 0; i < p.size(); ++i)
+        if (m.data()[i]) out(k++) = p.data()[i];
+    return out;
+}
+
+template <class D, class M>
+Mat select_rows(const Eigen::ArrayBase<D>& a, const Eigen::ArrayBase<M>& mask) {
+    const Mat p = a;
+    const Mask m = mask;
+    if (p.rows() != m.size()) throw index_error("boolean index did not match indexed array");
+    Mat out(m.count(), p.cols());
+    Index k = 0;
+    for (Index i = 0; i < p.rows(); ++i)
+        if (m(i)) out.row(k++) = p.row(i);
+    return out;
+}
+
+// a[mask] = v and a[mask] += v with a scalar v: only the selected elements change.
+template <class A, class M, class F>
+void masked_update(A& a, const Eigen::ArrayBase<M>& mask, double v, F f) {
+    const Eigen::Array<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> m = mask;
+    if (a.rows() != m.rows() || a.cols() != m.cols())
+        throw index_error("boolean index did not match indexed array");
+    for (Index i = 0; i < a.rows(); ++i)
+        for (Index j = 0; j < a.cols(); ++j)
+            if (m(i, j)) a(i, j) = f(a(i, j), v);
+}
+struct set_op { double operator()(double, double y) const { return y; } };
+
 // =====================================================================================
 // numpy.linalg. LU with partial pivoting is the algorithm LAPACK's gesv uses; like LAPACK,
 // an exactly zero pivot means "Singular matrix".
@@ -587,6 +833,195 @@ Mat cholesky(const Eigen::ArrayBase<D>& a) {
     Eigen::LLT<Eigen::MatrixXd> llt{Eigen::MatrixXd(a.matrix())};
     if (llt.info() != Eigen::Success) throw linalg_error("Matrix is not positive definite");
     return Eigen::MatrixXd(llt.matrixL()).array();
+}
+
+// np.linalg.eigh(A): eigenvalues in ascending order and eigenvectors as columns, read from the
+// lower triangle as LAPACK's syevd does (NumPy's default UPLO='L'). Each eigenvector is only
+// defined up to its sign (and, for a repeated eigenvalue, up to a rotation within its
+// eigenspace), and LAPACK and Eigen may choose differently: results built from V diag(f(w)) V^T
+// agree; code that reads individual eigenvector entries may not. NaN in the lower triangle
+// gives NaN everywhere, as LAPACK does.
+template <class D>
+std::tuple<Vec, Mat> eigh(const Eigen::ArrayBase<D>& a) {
+    if (a.rows() != a.cols()) throw linalg_error("Last 2 dimensions of the array must be square");
+    const Eigen::MatrixXd m = a.matrix();
+    const Index n = m.rows();
+    for (Index j = 0; j < n; ++j)
+        for (Index i = j; i < n; ++i)
+            if (std::isnan(m(i, j))) return {Vec::Constant(n, nan), Mat::Constant(n, n, nan)};
+    if (n == 0) return {Vec(0), Mat(0, 0)};
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(m);  // uses the lower triangle
+    if (es.info() != Eigen::Success) throw linalg_error("Eigenvalues did not converge");
+    return {es.eigenvalues().array(), Mat(es.eigenvectors().array())};
+}
+
+template <class D>
+Vec eigvalsh(const Eigen::ArrayBase<D>& a) { return std::get<0>(eigh(a)); }
+
+// np.linalg.pinv(A, rcond=1e-15). NumPy keeps the singular values s > rcond * max(s) and
+// returns V diag(1/s) U^T. The rank is decided here by exactly that rule, on Eigen's SVD.
+// When every singular value is kept, the pseudo-inverse is unique, and it is computed from a
+// column-pivoted complete orthogonal decomposition instead: rebuilding it from the SVD loses
+// accuracy on badly scaled matrices (entries of 1e8 next to 1e-2), where the QR route stays
+// as accurate as LAPACK's (checked against a 60-digit reference). A rank-deficient matrix uses
+// the SVD formula, as NumPy does. Either way the result agrees with NumPy to rounding; singular
+// values within rounding of the cutoff can be kept by one and dropped by the other.
+template <class D>
+Mat pinv(const Eigen::ArrayBase<D>& a, double rcond = 1e-15) {
+    const Eigen::MatrixXd m = a.matrix();
+    if (m.size() == 0) return Mat(m.cols(), m.rows());
+    if (m.hasNaN()) throw linalg_error("SVD did not converge");
+#if EIGEN_VERSION_AT_LEAST(3, 4, 90)
+    Eigen::BDCSVD<Eigen::MatrixXd, Eigen::ComputeThinU | Eigen::ComputeThinV> svd(m);
+#else
+    Eigen::BDCSVD<Eigen::MatrixXd> svd(m, Eigen::ComputeThinU | Eigen::ComputeThinV);
+#endif
+    Eigen::VectorXd s = svd.singularValues();
+    const double cutoff = rcond * s.maxCoeff();
+    Index rank = 0;
+    for (Index i = 0; i < s.size(); ++i) rank += s(i) > cutoff;
+    if (rank == s.size() && rank > 0) {
+        Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> cod(m);
+        cod.setThreshold(0.0);  // full rank by NumPy's rule: keep every direction
+        if (cod.rank() == rank) return cod.pseudoInverse().array();
+    }
+    for (Index i = 0; i < s.size(); ++i) s(i) = s(i) > cutoff ? 1.0 / s(i) : 0.0;
+    const Eigen::MatrixXd res = svd.matrixV() * s.asDiagonal() * svd.matrixU().transpose();
+    return res.array();
+}
+
+// np.einsum for one or two operands of rank <= 2 ("ij,ij->i", "ij,jk->ik", "ii->", ...).
+// Every combination of index values is visited and the products added in sequence; NumPy's
+// own kernels add in a different order, so results agree to rounding, not bit for bit.
+// An einsum operand: a stored Mat is used where it is; a Vec becomes a 1 x n row; any other
+// expression is evaluated once.
+struct EinsumArg {
+    const Mat* ptr = nullptr;
+    Mat own;
+    EinsumArg(const Mat& m) : ptr(&m) {}  // NOLINT: implicit on purpose, for {A, B}
+    EinsumArg(const Vec& v) : own(as_row(v)) {}
+    template <class D>
+    EinsumArg(const Eigen::ArrayBase<D>& x) : own(x) {
+        if constexpr (D::ColsAtCompileTime == 1) own = as_row(x);
+    }
+    const Mat& get() const { return ptr ? *ptr : own; }
+};
+
+inline std::vector<std::string> einsum_split(const std::string& spec, std::string& out) {
+    std::vector<std::string> ins;
+    const auto arrow = spec.find("->");
+    const std::string lhs = arrow == std::string::npos ? spec : spec.substr(0, arrow);
+    std::string cur;
+    for (char ch : lhs) {
+        if (ch == ',') { ins.push_back(cur); cur.clear(); }
+        else if (ch != ' ') cur += ch;
+    }
+    ins.push_back(cur);
+    out.clear();
+    if (arrow != std::string::npos) {
+        for (char ch : spec.substr(arrow + 2)) if (ch != ' ') out += ch;
+    } else {  // implicit mode: the labels that appear exactly once, in alphabetical order
+        for (char ch = 'a'; ch <= 'z'; ++ch) {
+            int count = 0;
+            for (const auto& s : ins) for (char c : s) count += c == ch;
+            if (count == 1) out += ch;
+        }
+    }
+    return ins;
+}
+
+inline Mat einsum_core(const std::string& spec, std::initializer_list<EinsumArg> mats, const std::vector<int>& ranks) {
+    std::string outl;
+    const std::vector<std::string> ins = einsum_split(spec, outl);
+    if (ins.size() != mats.size()) throw shape_error("einsum: wrong number of operands");
+    std::vector<const Mat*> ops;
+    for (const EinsumArg& m : mats) ops.push_back(&m.get());
+    // labels in order of first appearance; each gets a slot 0..L-1 and a size
+    std::string all;
+    for (const auto& l : ins) for (char c : l) if (all.find(c) == std::string::npos) all += c;
+    for (char c : outl) if (all.find(c) == std::string::npos) throw shape_error("einsum: output label not in inputs");
+    const auto slot = [&](char c) { return static_cast<int>(all.find(c)); };
+    std::vector<long long> size(all.size(), -1);
+    // per operand: the slot of each of its (up to two) dimensions, -1 where it broadcasts or is absent
+    struct Access { int s0 = -1, s1 = -1; };
+    std::vector<Access> acc(ops.size());
+    for (std::size_t q = 0; q < ops.size(); ++q) {
+        const std::string& l = ins[q];
+        const Mat& m = *ops[q];
+        if (static_cast<int>(l.size()) != ranks[q]) throw shape_error("einsum: subscripts don't match the operand's dimensions");
+        for (std::size_t d = 0; d < l.size(); ++d) {
+            const long long n = ranks[q] == 1 ? static_cast<long long>(m.size()) : (d == 0 ? m.rows() : m.cols());
+            long long& z = size[slot(l[d])];
+            // a dimension of size 1 broadcasts against any other size, as in NumPy
+            if (z >= 0 && z != n && z != 1 && n != 1)
+                throw shape_error("einsum: operands could not be broadcast together");
+            if (z < 0 || z == 1) z = n;
+        }
+    }
+    for (std::size_t q = 0; q < ops.size(); ++q) {
+        const std::string& l = ins[q];
+        const Mat& m = *ops[q];
+        const long long n0 = ranks[q] == 1 ? static_cast<long long>(m.size()) : m.rows();
+        if (l.size() > 0) acc[q].s0 = n0 == 1 && size[slot(l[0])] != 1 ? -1 : slot(l[0]);
+        if (l.size() > 1) acc[q].s1 = m.cols() == 1 && size[slot(l[1])] != 1 ? -1 : slot(l[1]);
+    }
+    const int o0 = outl.size() > 0 ? slot(outl[0]) : -1, o1 = outl.size() > 1 ? slot(outl[1]) : -1;
+    // nothing broadcasts: the common patterns go to direct loops / products
+    bool plain = true;
+    for (std::size_t q = 0; q < ops.size(); ++q)
+        plain = plain && (ins[q].size() < 1 || acc[q].s0 >= 0) && (ins[q].size() < 2 || acc[q].s1 >= 0);
+    if (plain && ops.size() == 2) {
+        const Mat& A = *ops[0];
+        const Mat& B = *ops[1];
+        const bool same = ins[0] == ins[1] && ins[0].size() == 2 && ins[0][0] != ins[0][1];
+        if (same && outl == ins[0].substr(0, 1)) {  // "ij,ij->i": a dot product per row
+            Mat out(A.rows(), 1);
+            for (Index i = 0; i < A.rows(); ++i) {
+                double acc_ = 0.0;
+                for (Index j = 0; j < A.cols(); ++j) acc_ += A(i, j) * B(i, j);
+                out(i, 0) = acc_;
+            }
+            return out;
+        }
+        if (ins[0].size() == 2 && ins[1].size() == 2 && ins[0][1] == ins[1][0] && ins[0][0] != ins[0][1] &&
+            ins[1][0] != ins[1][1] && ins[0][0] != ins[1][1] && outl == std::string{ins[0][0], ins[1][1]})
+            return (A.matrix() * B.matrix()).array();  // "ij,jk->ik"
+    }
+    Mat out = Mat::Zero(o0 >= 0 ? size[o0] : 1, o1 >= 0 ? size[o1] : 1);
+    for (long long z : size) if (z == 0) return out;
+    std::vector<long long> at(all.size(), 0);
+    const std::size_t L = all.size();
+    for (;;) {
+        double prod = 1.0;
+        for (std::size_t q = 0; q < ops.size(); ++q) {
+            const Mat& m = *ops[q];
+            const long long i = acc[q].s0 >= 0 ? at[acc[q].s0] : 0;
+            if (ranks[q] == 0) prod *= m(0, 0);
+            else if (ranks[q] == 1) prod *= m.data()[i];
+            else prod *= m(i, acc[q].s1 >= 0 ? at[acc[q].s1] : 0);
+        }
+        out(o0 >= 0 ? at[o0] : 0, o1 >= 0 ? at[o1] : 0) += prod;
+        std::size_t d = L;
+        while (d > 0) {
+            if (++at[d - 1] < size[d - 1]) break;
+            at[d - 1] = 0;
+            --d;
+        }
+        if (d == 0) break;
+    }
+    return out;
+}
+
+// The result as a number, a Vec or a Mat, by the number of output labels. A Vec operand is
+// passed as a 1 x n Mat and its rank as 1.
+inline double einsum0(const std::string& spec, std::initializer_list<EinsumArg> mats, const std::vector<int>& ranks) {
+    return einsum_core(spec, mats, ranks)(0, 0);
+}
+inline Vec einsum1(const std::string& spec, std::initializer_list<EinsumArg> mats, const std::vector<int>& ranks) {
+    return ravel(einsum_core(spec, mats, ranks));
+}
+inline Mat einsum2(const std::string& spec, std::initializer_list<EinsumArg> mats, const std::vector<int>& ranks) {
+    return einsum_core(spec, mats, ranks);
 }
 
 }  // namespace qt

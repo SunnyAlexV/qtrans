@@ -77,6 +77,7 @@ EXCEPTIONS = {
     "RuntimeError": "std::runtime_error",
     "NotImplementedError": "std::runtime_error",
     "Exception": "std::runtime_error",
+    "TypeError": "qt::type_error",
 }
 
 

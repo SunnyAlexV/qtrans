@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace qt {
@@ -16,6 +17,26 @@ inline constexpr double e = 2.718281828459045;
 inline constexpr double tau = 6.283185307179586;
 inline constexpr double inf = std::numeric_limits<double>::infinity();
 inline constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+
+// ---------------------------------------------------------------------------------
+// `x: float | None` is std::optional<double>. Where Python needs the number itself
+// (arithmetic, a comparison, int(x), passing it on as a float), None raises TypeError;
+// qt::value checks the same way. Truthiness: None is false, otherwise the value's own.
+// ---------------------------------------------------------------------------------
+struct type_error : std::runtime_error {  // Python: TypeError
+    using std::runtime_error::runtime_error;
+};
+
+template <class T>
+const T& value(const std::optional<T>& x) {
+    if (!x) throw type_error("'NoneType' used where a value is needed");
+    return *x;
+}
+
+template <class T>
+bool truthy(const std::optional<T>& x) {
+    return x.has_value() && *x != T(0);
+}
 
 // ---------------------------------------------------------------------------------
 // Integer // and %.  Python rounds the quotient toward -infinity and gives the
@@ -101,16 +122,32 @@ inline long long ipow(long long base, long long exp) {
 
 // ---------------------------------------------------------------------------------
 // numpy.maximum / numpy.minimum propagate NaN from either argument; std::max does not.
+// On a tie they return the SECOND argument, which shows with signed zeros:
+// np.maximum(-0.0, 0.0) is 0.0 and np.maximum(0.0, -0.0) is -0.0 (and 1/x tells them apart).
+// np.clip breaks ties the other way, keeping x: np.clip(-0.0, 0.0, 1.0) is -0.0.
 // ---------------------------------------------------------------------------------
 inline double np_maximum(double a, double b) {
     if (std::isnan(a) || std::isnan(b)) return nan;
-    return a >= b ? a : b;
+    return a > b ? a : b;
 }
 
 inline double np_minimum(double a, double b) {
     if (std::isnan(a) || std::isnan(b)) return nan;
-    return a <= b ? a : b;
+    return a < b ? a : b;
 }
+
+// np.clip(x, lo, hi) = min(max(x, lo), hi), with NaN from any argument giving NaN and ties
+// keeping x. When lo > hi the result is hi, as in NumPy.
+inline double np_clip(double x, double lo, double hi) {
+    if (std::isnan(x) || std::isnan(lo) || std::isnan(hi)) return nan;
+    const double m = x >= lo ? x : lo;
+    return m <= hi ? m : hi;
+}
+
+// np.where(c, x, y) with a scalar condition: both branches are evaluated first, as NumPy
+// evaluates its arguments, and then one is chosen.
+inline double where(bool c, double x, double y) { return c ? x : y; }
+inline long long where(bool c, long long x, long long y) { return c ? x : y; }
 
 template <class T>
 inline T np_sign(T x) {

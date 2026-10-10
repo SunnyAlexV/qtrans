@@ -17,8 +17,9 @@ from dataclasses import dataclass
 
 from . import library as lib
 from .errors import Unsupported
-from .arrays import ArrayOps
-from .types import BOOL, FLOAT, INT, RNG, VOID, ArrayType, MaskType, Scalar, TupleType, assignable, is_array, join
+from .arrays import STACKERS, ArrayOps
+from .types import (BOOL, FLOAT, INT, NONE, RNG, VOID, ArrayType, MaskType, OptionalType, Scalar, TupleType,
+                    assignable, is_array, join)
 
 from .core import (CPP_RESERVED, P_ADD, P_AND, P_ATOM, P_COND, P_EQ, P_MUL, P_OR, P_REL,  # noqa: F401
                    P_UNARY, Expr, cpp_ident, float_literal, wrap)
@@ -60,6 +61,14 @@ _REJECTED_BUILTINS = {
 
 class _Unknown(Exception):
     """Raised during type inference when a variable's type isn't known yet."""
+
+
+_FOLD = {ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b, ast.Gt: lambda a, b: a > b,
+         ast.GtE: lambda a, b: a >= b, ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b}
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 class ExprTranslator(ArrayOps):
@@ -118,9 +127,20 @@ class ExprTranslator(ArrayOps):
             return self.as_double(e)
         return e
 
+    def cond(self, node) -> Expr:
+        """`if x:` / `while x:` / `not x`: an optional is false when None."""
+        return self.truth(self.expr_raw(node), node)
+
     def truth(self, e: Expr, node=None) -> Expr:
         """Python truthiness written out explicitly (`if x:` -> `if (x != 0.0)`).
         NaN is truthy in Python and NaN != 0.0 is true in C++, so they agree."""
+        if e.type == NONE:
+            return Expr("false", P_ATOM, BOOL, value=False, simple=True)
+        if isinstance(e.type, OptionalType):
+            if not isinstance(e.type.inner, Scalar):
+                raise Unsupported(node or self.current, "the truth value of an array that may be None",
+                                  "test `x is None` explicitly")
+            return Expr(f"qt::truthy({e.code})", P_ATOM, BOOL)
         if e.type == BOOL:
             return e
         if e.type == INT:
@@ -134,11 +154,38 @@ class ExprTranslator(ArrayOps):
 
     # --- dispatch ----------------------------------------------------------------------
     def expr(self, node) -> Expr:
+        """The value of `node`, as a number or array. An optional (`x: float | None`) is
+        unwrapped with a check, because wherever the value itself is used Python raises
+        TypeError on None; the few places that accept None call expr_raw instead."""
+        e = self.expr_raw(node)
+        if isinstance(e.type, OptionalType):
+            return self.unwrap(e)
+        if e.type == NONE:
+            raise Unsupported(node, "None is used as a value here (Python raises TypeError)",
+                              "annotate the variable or parameter as `float | None` and test `x is None`")
+        return e
+
+    def expr_raw(self, node) -> Expr:
         method = getattr(self, "e_" + type(node).__name__, None)
         if method is None:
             what, hint = _UNSUPPORTED_EXPR.get(type(node).__name__, (type(node).__name__, None))
             raise Unsupported(node, f"{what} are not supported in stage 1", hint)
         return method(node)
+
+    def unwrap(self, e: Expr) -> Expr:
+        return Expr(f"qt::value({e.code})", P_ATOM, e.type.inner)
+
+    def to_optional(self, e: Expr, t: OptionalType) -> Expr:
+        """e (None, a value, or an optional) as the C++ type t, ready to store or pass."""
+        if e.type == NONE:
+            return Expr("std::nullopt", P_ATOM, t)
+        if isinstance(e.type, OptionalType):
+            if e.type.inner == t.inner:
+                return e
+            return Expr(f"({e.code} ? {t.cpp()}({self.as_type(self.unwrap(e), t.inner).code}) : {t.cpp()}())",
+                        P_ATOM, t)
+        v = self.as_type(e, t.inner) if isinstance(t.inner, Scalar) else e
+        return Expr(v.code, v.prec, t)
 
     def e_Constant(self, node):
         v = node.value
@@ -157,8 +204,7 @@ class ExprTranslator(ArrayOps):
             raise Unsupported(node, "string values are not supported",
                               "strings are only allowed as exception messages")
         if v is None:
-            raise Unsupported(node, "None is not supported as a value",
-                              "return a number, or raise an exception for the error case")
+            return Expr("std::nullopt", P_ATOM, NONE, simple=True)
         raise Unsupported(node, f"{type(v).__name__} literals are not supported")
 
     def e_Name(self, node):
@@ -285,6 +331,8 @@ class ExprTranslator(ArrayOps):
         return Expr(f"std::pow({L.code}, {R.code})", P_ATOM, FLOAT)
 
     def e_UnaryOp(self, node):
+        if isinstance(node.op, ast.Not):
+            return Expr(f"!{wrap(self.cond(node.operand), P_ATOM)}", P_UNARY, BOOL)
         e = self.expr(node.operand)
         if isinstance(e.type, MaskType) and isinstance(node.op, ast.Invert):
             return Expr(f"!{wrap(e, P_ATOM)}", P_UNARY, e.type)
@@ -294,8 +342,9 @@ class ExprTranslator(ArrayOps):
                 return Expr("-" + (f"({inner})" if inner.startswith("-") else inner), P_UNARY, e.type)
             if isinstance(node.op, ast.UAdd):
                 return e
-        if isinstance(node.op, ast.Not):
-            return Expr(f"!{wrap(self.truth(e, node), P_ATOM)}", P_UNARY, BOOL)
+        return self._unary(node, e)
+
+    def _unary(self, node, e):
         self.need_scalar(e, node, "unary +/-")
         t = INT if e.type == BOOL else e.type
         if isinstance(node.op, ast.UAdd):
@@ -323,6 +372,8 @@ class ExprTranslator(ArrayOps):
         return Expr(" || ".join(wrap(p, P_AND - 1) for p in parts), P_OR, BOOL)
 
     def e_Compare(self, node):
+        if any(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
+            return self._is_none(node)
         vals = [node.left] + list(node.comparators)
         exprs = [self.expr(v) for v in vals]
         if any(is_array(e.type) for e in exprs):
@@ -345,15 +396,49 @@ class ExprTranslator(ArrayOps):
             sym, p = _CMP[type(op)]
             parts.append(Expr(f"{wrap(a, p)} {sym} {wrap(b, p - 1)}", p, BOOL))
         if len(parts) == 1:
+            a, b = exprs
+            if _is_num(a.value) and _is_num(b.value):
+                # both sides known when translating (A.ndim == 1 for a Mat): fold it, so a
+                # branch that can never run is recognised as such
+                v = _FOLD[type(node.ops[0])](a.value, b.value)
+                return Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True)
             return parts[0]
         return Expr(" && ".join(wrap(x, P_AND) for x in parts), P_AND, BOOL)
 
+    def _is_none(self, node):
+        """`x is None` / `x is not None`. Only comparisons with None are supported: `is` between
+        numbers asks whether two objects are the same, which C++ values don't have."""
+        if len(node.ops) != 1:
+            raise Unsupported(node, "chained `is` comparisons are not supported")
+        a, b = node.left, node.comparators[0]
+        none = lambda n: isinstance(n, ast.Constant) and n.value is None  # noqa: E731
+        if not (none(a) or none(b)):
+            raise Unsupported(node, "`is` is supported only as `x is None` / `x is not None`",
+                              "compare values with == or !=")
+        e = self.expr_raw(b if none(a) else a)
+        negate = isinstance(node.ops[0], ast.IsNot)
+        if e.type == NONE:
+            v = not negate
+            return Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True)
+        if not isinstance(e.type, OptionalType):  # a number or array is never None
+            return Expr("false" if not negate else "true", P_ATOM, BOOL, value=negate, simple=True)
+        return Expr(f"{wrap(e, P_ATOM)}.has_value()" if negate else f"!{wrap(e, P_ATOM)}.has_value()",
+                    P_ATOM if negate else P_UNARY, BOOL)
+
     def e_IfExp(self, node):
-        c = self.truth(self.expr(node.test), node)
-        b, o = self.expr(node.body), self.expr(node.orelse)
+        c = self.cond(node.test)
+        b, o = self.expr_raw(node.body), self.expr_raw(node.orelse)
         t = join(b.type, o.type)
-        if t is None or t == VOID:
+        if t is None or t == VOID or t == NONE:
             raise Unsupported(node, f"the two branches of `x if c else y` have types {b.type} and {o.type}")
+        if isinstance(t, OptionalType):
+            b, o = self.to_optional(b, t), self.to_optional(o, t)
+            if is_array(t.inner):  # two different expression types: make both the stored type
+                b, o = Expr(f"{t.cpp()}({b.code})", P_ATOM, t), Expr(f"{t.cpp()}({o.code})", P_ATOM, t)
+            else:
+                b = Expr(f"{t.cpp()}({b.code})", P_ATOM, t) if b.code == "std::nullopt" else b
+                o = Expr(f"{t.cpp()}({o.code})", P_ATOM, t) if o.code == "std::nullopt" else o
+            return Expr(f"{wrap(c, P_COND - 1)} ? {wrap(b, P_COND - 1)} : {wrap(o, P_COND)}", P_COND, t)
         if isinstance(t, Scalar):
             b, o = self.as_type(b, t), self.as_type(o, t)
         if isinstance(t, MaskType):
@@ -451,6 +536,13 @@ class ExprTranslator(ArrayOps):
                 if isinstance(a, ast.Name):
                     passed_arrays.append(a.id)
                 codes.append(e.code)
+                continue
+            if p.name in bound and isinstance(p.type, OptionalType):
+                e = self.expr_raw(bound[p.name])
+                if not assignable(p.type, e.type):
+                    raise Unsupported(bound[p.name], f"argument '{p.name}' of {name}() is declared "
+                                                     f"{p.type} but a {e.type} is passed")
+                codes.append(self.to_optional(e, p.type).code)
                 continue
             if p.name in bound:
                 e = self.expr(bound[p.name])
@@ -568,7 +660,26 @@ class ExprTranslator(ArrayOps):
             raise Unsupported(node, f"{src}() uses NumPy's legacy global random state",
                               "create a generator and draw from it: rng = np.random.default_rng(seed); "
                               "rng.standard_normal(n)")
+        if qual == "numpy.clip":  # a bound may be None, which is not a value
+            if not node.args:
+                raise Unsupported(node, "np.clip() needs an array or number to clip")
+            return self._clip(node, self.expr(node.args[0]), node.args[1:],
+                              {k.arg: k.value for k in node.keywords})
+        if qual in STACKERS:
+            return self.stack_call(node, qual)
+        if qual == "numpy.einsum":
+            return self.einsum_call(node)
         args = [self.expr(a) for a in node.args]
+        if qual == "numpy.where" and len(args) == 3 and not node.keywords and \
+                not any(is_array(a.type) or isinstance(a.type, MaskType) for a in args):
+            for a, n in zip(args, node.args):
+                self.need_scalar(a, n, "np.where()")
+            t = join(args[1].type, args[2].type)
+            t = INT if t == BOOL else t
+            # NumPy evaluates both branches before choosing (no short circuit), so qt::where
+            # takes all three as arguments rather than becoming `c ? x : y`
+            return Expr(f"qt::where({self.truth(args[0], node).code}, {self.as_type(args[1], t).code}, "
+                        f"{self.as_type(args[2], t).code})", P_ATOM, t)
         if self.wants_array_call(qual, args):
             kws = {k.arg: self.expr(k.value) for k in node.keywords if k.arg != "dtype"}
             return self.array_call(node, qual, args, kws)

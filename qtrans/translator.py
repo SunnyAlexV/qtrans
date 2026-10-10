@@ -22,9 +22,10 @@ from .errors import Unsupported
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from .functions import FunctionTranslator, is_docstring, subscript_root, target_leaves, view_root
 from .report import FunctionReport, ModuleReport
-from .types import BOOL, FLOAT, INT, MAT, RNG, VEC, VOID, ArrayType, RngType, Scalar, TupleType, assignable, is_array
+from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
+                    TupleType, assignable, is_array)
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
 # code. Reported once per module instead of under every function.
@@ -43,6 +44,10 @@ class Param:
     # how an array parameter is passed: "cref" (read only), "value" (rebound in the body),
     # "ref" (modified in place, so the caller sees the change, as in Python)
     mode: str = "value"
+
+
+def _optional_array(t) -> bool:
+    return isinstance(t, OptionalType) and is_array(t.inner)
 
 
 @dataclass
@@ -117,6 +122,7 @@ class ModuleTranslator:
         self.doc = None
         self.type_aliases: set = set()     # module-level `Vec = ...` / `Mat = ...`
         self.returns_alias: dict = {}      # function -> indices of array params it may return
+        self.errstate_funcs: set[str] = set()
 
     # --- annotations -----------------------------------------------------------------
     def parse_annotation(self, node, allow_void=False):
@@ -125,6 +131,11 @@ class ModuleTranslator:
         if isinstance(node, ast.Constant) and node.value is None:
             if allow_void:
                 return VOID
+        elif (opt := self._optional_inner(node)) is not None:
+            inner = self.parse_annotation(opt)
+            if not isinstance(inner, (Scalar, ArrayType)):
+                raise Unsupported(node, f"'{ast.unparse(node)}': only a number or an array can be optional")
+            return OptionalType(inner)
         elif isinstance(node, ast.Name) and node.id in ("float", "int", "bool"):
             return {"float": FLOAT, "int": INT, "bool": BOOL}[node.id]
         elif isinstance(node, ast.Name) and self.imports.get(node.id) == "numpy.random.Generator":
@@ -152,6 +163,28 @@ class ModuleTranslator:
                               "annotate with Vec (1-D) or Mat (2-D): `from qtrans.typing import Vec, Mat`")
         raise Unsupported(node, f"type annotation '{text}' is not supported",
                           "use float, int, bool, Vec, Mat, or tuple[...] of those")
+
+    def _optional_inner(self, node):
+        """X | None, None | X, Optional[X], Union[X, None] -> the X node; otherwise None."""
+        def is_none(n):
+            return isinstance(n, ast.Constant) and n.value is None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            if is_none(node.right) and not is_none(node.left):
+                return node.left
+            if is_none(node.left) and not is_none(node.right):
+                return node.right
+        if isinstance(node, ast.Subscript):
+            q = self._qualify_path(node.value) if isinstance(node.value, ast.Attribute) else \
+                self.imports.get(node.value.id) if isinstance(node.value, ast.Name) else None
+            if q == "typing.Optional":
+                return node.slice
+            if q == "typing.Union" and isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
+                a, b = node.slice.elts
+                if is_none(b) and not is_none(a):
+                    return a
+                if is_none(a) and not is_none(b):
+                    return b
+        return None
 
     # --- names visible inside functions -----------------------------------------------
     def global_name(self, node, tr):
@@ -222,12 +255,81 @@ class ModuleTranslator:
                 self.report.module_notes.append(f"line {node.lineno}: module-level "
                                                 f"{type(node).__name__} statement skipped")
 
+        for f in self.fdefs.values():
+            self._strip_errstate(f)
         for name, f in self.fdefs.items():
             try:
                 self.sigs[name] = self.signature(f)
             except Unsupported as e:
                 self.rejected[name] = e
         self.analyze_array_params()
+
+    def _qualify_path(self, node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name) or node.id not in self.imports:
+            return None
+        return ".".join([self.imports[node.id]] + parts[::-1])
+
+    def is_asarray_of(self, value, name) -> bool:
+        """`np.asarray(name)` / `np.asarray(name, dtype=float)`: for a float64 array NumPy returns
+        the array itself, so `name = np.asarray(name, ...)` changes nothing."""
+        if not (isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Name)
+                and value.args[0].id == name and len(value.args) == 1):
+            return False
+        f = value.func
+        q = self._qualify_path(f) if isinstance(f, ast.Attribute) else self.imports.get(getattr(f, "id", None))
+        if q != "numpy.asarray":
+            return False
+        return all(k.arg == "dtype" and ast.unparse(k.value) in ("float", "np.float64", "numpy.float64")
+                   for k in value.keywords)
+
+    def _strip_errstate(self, f):
+        """`with np.errstate(...):` only decides whether NumPy warns about inf/NaN; the values
+        are the same either way. Replace each such block by its body (Python's `with` opens no
+        new scope, so variables assigned inside stay visible after it)."""
+        mod = self
+
+        class Strip(ast.NodeTransformer):
+            def visit_With(self, node):
+                self.generic_visit(node)
+                if node.items and all(
+                        it.optional_vars is None and isinstance(it.context_expr, ast.Call)
+                        and mod._qualify_path(it.context_expr.func) == "numpy.errstate" for it in node.items):
+                    mod.errstate_funcs.add(f.name)
+                    return node.body
+                return node
+
+        Strip().visit(f)
+
+    @staticmethod
+    def _starts_fresh(f, name, sigs) -> bool:
+        """Is the first statement that mentions array parameter `name` a plain rebinding to a
+        new array (`S = S.copy()`, `X = X - X.mean()`)? Then every later in-place change hits the
+        new array, never the caller's, exactly as in Python."""
+        body = f.body[1:] if f.body and is_docstring(f.body[0]) else f.body
+        for stmt in body:
+            if not any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(stmt)):
+                continue
+            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.value is None:
+                return False
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name) or targets[0].id != name:
+                return False
+            value = stmt.value
+            types = {p.name: p.type for p in sigs[f.name].params}
+            branches = [value.body, value.orelse] if isinstance(value, ast.IfExp) else [value]
+            if any(view_root(b, types) == name for b in branches):
+                return False
+            # passing it to one of our functions could modify it (or hand it back)
+            for n in ast.walk(value):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in sigs and any(
+                        isinstance(a, ast.Name) and a.id == name for a in list(n.args) + [k.value for k in n.keywords]):
+                    return False
+            return True
+        return False
 
     def analyze_array_params(self):
         """Decide how each array parameter is passed so the C++ behaves like Python, where
@@ -237,7 +339,7 @@ class ModuleTranslator:
             if name not in self.sigs:
                 continue
             sig = self.sigs[name]
-            arr = {p.name for p in sig.params if is_array(p.type) or p.type == RNG}
+            arr = {p.name for p in sig.params if is_array(p.type) or p.type == RNG or _optional_array(p.type)}
             ip, rb, cl = set(), set(), []
             for n in ast.walk(f):
                 if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
@@ -249,6 +351,8 @@ class ModuleTranslator:
                                 if root in arr:
                                     ip.add(root)
                             elif isinstance(leaf, ast.Name) and leaf.id in arr:
+                                if isinstance(n, ast.Assign) and self.is_asarray_of(n.value, leaf.id):
+                                    continue  # x = np.asarray(x): the same array, not a rebinding
                                 (ip if isinstance(n, ast.AugAssign) else rb).add(leaf.id)
                 elif isinstance(n, ast.For) and isinstance(n.target, ast.Name) and n.target.id in arr:
                     rb.add(n.target.id)
@@ -259,6 +363,10 @@ class ModuleTranslator:
                     for i, a in pairs:
                         if isinstance(a, ast.Name) and a.id in arr and i >= 0:
                             cl.append((n.func.id, i, a.id))
+            # `S = S.copy()` first, then `S += ...`: the changes never reach the caller
+            fresh = {p for p in ip & rb if self._starts_fresh(f, p, self.sigs)}
+            ip -= fresh
+            cl = [c for c in cl if c[2] not in fresh]
             inplace[name], rebound[name], calls[name] = ip, rb, cl
             # which parameters a function may hand straight back (return a / return a[1:])
             for n in ast.walk(f):
@@ -287,6 +395,15 @@ class ModuleTranslator:
                             self.fdefs[name], f"generator parameter '{p.name}' is reassigned",
                             "use a new name for the new generator")
                     p.mode = "ref"
+                    continue
+                if _optional_array(p.type):
+                    # an array that may be None: read it, or rebind the name, but don't modify it
+                    # in place (std::optional<qt::Mat> holds its own copy, Python shares the array)
+                    if p.name in ip:
+                        self.rejected[name] = Unsupported(
+                            self.fdefs[name], f"'{p.name}' may be None and is modified in place; that is "
+                            "not supported", f"check for None, then work on a copy: {p.name}_ = {p.name}.copy()")
+                    p.mode = "value" if p.name in rebound[name] else "cref"
                     continue
                 if not is_array(p.type):
                     continue
@@ -355,7 +472,7 @@ class ModuleTranslator:
                                   f"`{arg.arg}: Vec` / `{arg.arg}: Mat` for a 1-D / 2-D float array "
                                   f"(from qtrans.typing import Vec, Mat)")
             t = self.parse_annotation(arg.annotation)
-            if not isinstance(t, (Scalar, ArrayType, RngType)):
+            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType)):
                 raise Unsupported(arg, f"parameter '{arg.arg}': {t} parameters are not supported; "
                                        "use float, int, bool, Vec, Mat or np.random.Generator")
             if d is not None and isinstance(t, RngType):
@@ -364,10 +481,11 @@ class ModuleTranslator:
             if d is not None and isinstance(t, ArrayType):
                 raise Unsupported(d, f"array parameter '{arg.arg}' can't have a default value")
             if d is not None:
-                e = tr.expr(d)
+                e = tr.expr_raw(d) if isinstance(t, OptionalType) else tr.expr(d)
                 if not assignable(t, e.type):
                     raise Unsupported(d, f"default for '{arg.arg}' is a {e.type} but the parameter is {t}")
-                code = tr.as_double(e).code if t == FLOAT else e.code
+                code = tr.as_double(e).code if FLOAT in (t, getattr(t, "inner", None)) and e.type != NONE \
+                    else e.code
             params.append(Param(arg.arg, cpp_ident(arg.arg), t, code))
         if f.returns is None:
             raise Unsupported(f, f"function '{f.name}' has no return annotation",
@@ -433,7 +551,7 @@ class ModuleTranslator:
         parts = []
         for p in sig.params:
             attr = "[[maybe_unused]] " if used_params is not None and p.name not in used_params else ""
-            if is_array(p.type) or p.type == RNG:
+            if is_array(p.type) or p.type == RNG or _optional_array(p.type):
                 ty = {"cref": f"const {p.type.cpp()}&", "ref": f"{p.type.cpp()}&"}.get(p.mode, p.type.cpp())
             else:
                 ty = p.type.cpp()
