@@ -387,8 +387,11 @@ def test_deep_copy_breaks_the_sharing():
      "changes field 'w' in place"),
     ("@dataclass\nclass P:\n    w: Vec = np.zeros(3)\n", "default_factory"),
     ("class Base:\n    pass\n\n@dataclass\nclass P(Base):\n    x: float\n", "inheritance"),
-    ("class P:\n    def __init__(self, x: float):\n        self.x = x\n", "plain class"),
-    ("@dataclass\nclass P:\n    rng: np.random.Generator\n", "Generator inside an object"),
+    ("class P:\n    def __init__(self, x: float):\n        self.x = x\n\n    def later(self) -> None:\n"
+     "        self.y = 1.0\n", "which __init__ doesn't set"),
+    ("@dataclass\nclass P:\n    rng: np.random.Generator\n\n    def draw(self) -> float:\n"
+     "        return self.rng.random()\n\ndef f(g: np.random.Generator) -> float:\n    p = P(g)\n    return p.draw()\n",
+     "share it with the caller"),
     ("@dataclass\nclass P:\n    x: float\n\n    @property\n    def y(self) -> float:\n        return self.x\n\n"
      "    @y.setter\n    def y(self, v: float) -> None:\n        self.x = v\n", "setters"),
     ("@dataclass\nclass P:\n    x: float\n\n    def __eq__(self, o) -> bool:\n        return True\n",

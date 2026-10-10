@@ -3,7 +3,8 @@
 Option and Bond are frozen dataclasses with validation in __post_init__ (Bond derives its
 number of coupon periods there, with the frozen-dataclass idiom object.__setattr__). Curve is
 a frozen dataclass holding arrays; Quote is a NamedTuple with a property. Portfolio is a
-mutable dataclass whose methods change it, and an Account holds one. Functions take and
+mutable dataclass whose methods change it, and an Account holds one. GBMEngine is a plain
+class (its fields come from __init__) that owns its random generator. Functions take and
 return these objects, change them in place, copy them, and configure behaviour with strings.
 """
 import copy
@@ -149,6 +150,51 @@ class Account:
         return self.port.value(prices)
 
 
+class GBMEngine:
+    """Monte Carlo under geometric Brownian motion; owns its random generator."""
+
+    def __init__(self, s0: float, r: float, sigma: float, seed: int, steps_per_year: int = 252):
+        if s0 <= 0 or sigma < 0 or steps_per_year <= 0:
+            raise ValueError("need s0 > 0, sigma >= 0, steps_per_year > 0")
+        self.s0 = s0
+        self.r = r
+        self.sigma = sigma
+        self.dt = 1.0 / steps_per_year
+        self.rng = np.random.default_rng(seed)
+        self.paths_run = 0
+
+    def terminal(self, n_paths: int, years: float) -> Vec:
+        if years <= 0 or years > 10 or n_paths < 1 or n_paths > 100_000:
+            raise ValueError("need 0 < years <= 10 and 1 <= n_paths <= 100000")
+        steps = max(1, int(round(years / self.dt)))
+        h = years / steps
+        drift = (self.r - 0.5 * self.sigma ** 2) * h
+        vol = self.sigma * math.sqrt(h)
+        logs = np.zeros(n_paths)
+        for _ in range(steps):
+            z = self.rng.standard_normal(n_paths)
+            logs += drift + vol * z
+        self.paths_run += n_paths
+        return self.s0 * np.exp(logs)
+
+    def call(self, K: float, years: float, n_paths: int) -> float:
+        st = self.terminal(n_paths, years)
+        return math.exp(-self.r * years) * float(np.mean(np.maximum(st - K, 0.0)))
+
+
+def mc_vs_black_scholes(seed: int, K: float, years: float) -> tuple[float, float, int]:
+    """A Monte Carlo call price next to the closed form, and how many paths the engine ran."""
+    eng = GBMEngine(100.0, 0.04, 0.2, seed, 52)
+    mc = eng.call(K, years, 4000)
+    exact = Option(100.0, K, years, 0.2, 0.04).price()
+    return mc, exact, eng.paths_run
+
+
+def reprice(eng: GBMEngine, K: float) -> float:
+    """Draws from the caller's engine: its generator moves on, as in Python."""
+    return eng.call(K, 0.25, 2000)
+
+
 def weight_bounds(stance: str, cap: float) -> tuple[float, float]:
     """The box each weight must stay in, for a portfolio stance."""
     if stance == "Long only":
@@ -232,6 +278,8 @@ QTRANS_CASES = {
     "parallel_shift": [(QTRANS_CURVE, 0.0025)],
     "run_rebalances": [(Portfolio(QTRANS_W.copy(), 1000.0), np.full(5, 0.2), QTRANS_PX, 3)],
     "scaled_copy": [(Portfolio(QTRANS_W.copy(), 5.0), 1.5)],
+    "mc_vs_black_scholes": [(1, 100.0, 1.0), (2, 110.0, 0.5)],
+    "reprice": [(GBMEngine(100.0, 0.04, 0.3, 11), 100.0)],
     "leveraged_nav": [(Account(Portfolio(QTRANS_W.copy(), 50.0)), QTRANS_PX, 2.0),
                       (Account(Portfolio(QTRANS_W.copy()), stance="Long-short"), QTRANS_PX, -1.0)],
 }

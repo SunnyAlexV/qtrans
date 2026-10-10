@@ -121,6 +121,11 @@ inline void seed_sequence_state(std::uint64_t seed, std::uint64_t out[4]) {
 // np.random.Generator(PCG64(seed)), i.e. np.random.default_rng(seed).
 class Rng {
 public:
+    // A placeholder with an all-zero state, only so an object holding a generator can be
+    // declared before it is assigned; Python has no unseeded generators, so translated code
+    // never draws from one.
+    Rng() = default;
+
     explicit Rng(long long seed) {
         if (seed < 0) throw std::invalid_argument("expected non-negative integer");
         std::uint64_t v[4];
@@ -132,6 +137,16 @@ public:
         step();
         state_ = detail::add128(state_, initstate);
         step();
+    }
+
+    // The generator in exactly this PCG64 state: Generator.bit_generator.state["state"] and
+    // ["inc"], split into high and low 64-bit halves. (How an object holding a generator that
+    // has already drawn is handed to C++ mid-stream.)
+    static Rng from_state(std::uint64_t state_hi, std::uint64_t state_lo, std::uint64_t inc_hi, std::uint64_t inc_lo) {
+        Rng g(0);
+        g.state_ = {state_hi, state_lo};
+        g.inc_ = {inc_hi, inc_lo};
+        return g;
     }
 
     // Generator.bit_generator.random_raw(): the next raw 64-bit output.

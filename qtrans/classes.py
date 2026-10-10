@@ -65,6 +65,7 @@ class ClassInfo:
     frozen: bool = False
     eq: bool = True
     namedtuple: bool = False
+    plain: bool = False             # a plain class: fields come from __init__, which is the constructor
     fields: list = field(default_factory=list)
     methods: dict = field(default_factory=dict)
     doc: str | None = None
@@ -84,7 +85,7 @@ class ClassInfo:
 
     @property
     def init_fields(self):
-        return [f for f in self.fields if f.init]
+        return [] if self.plain else [f for f in self.fields if f.init]
 
     def has_array_field(self, classes, seen=None) -> bool:
         """Is an array somewhere inside (so Python's == would raise on it)?"""
@@ -143,6 +144,8 @@ def dataclass_options(mod, node: ast.ClassDef):
     namedtuple = False
     for b in node.bases:
         q = mod._qualify_path(b) if isinstance(b, ast.Attribute) else mod.imports.get(getattr(b, "id", None))
+        if isinstance(b, ast.Name) and b.id == "object":
+            continue
         if q == "typing.NamedTuple":
             namedtuple = True
         else:
@@ -166,6 +169,9 @@ def collect_class_body(mod, info: ClassInfo):
     for s in body:
         if isinstance(s, ast.Pass):
             continue
+        if info.plain and isinstance(s, ast.AnnAssign) and s.value is not None:
+            raise Unsupported(s, f"class attribute '{ast.unparse(s.target)}' with a value is shared by every "
+                                 "object in Python", "set it in __init__ (self.x = ...), or use @dataclass")
         if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant):
             continue  # a stray string or `...`
         if isinstance(s, ast.AnnAssign):
@@ -187,6 +193,8 @@ def collect_class_body(mod, info: ClassInfo):
             raise Unsupported(s, "class attributes without a type annotation are not fields of a dataclass",
                               "annotate it (x: float = 1.0) or make it a module-level constant")
         raise Unsupported(s, f"{type(s).__name__} statements in a class body are not supported")
+    if info.plain:
+        _fields_from_init(info)
     seen_default = False
     for f in info.init_fields:
         has = f.default is not None or f.factory is not None
@@ -197,6 +205,35 @@ def collect_class_body(mod, info: ClassInfo):
     for m in info.methods:
         if m in names:
             raise Unsupported(info.methods[m].fdef, f"method '{m}' has the same name as a field")
+
+
+def _fields_from_init(info):
+    """A plain class's fields: names annotated in the class body (`x: float`), then every
+    `self.x = ...` in __init__, in order of first assignment."""
+    init = info.methods.get("__init__")
+    if init is None:
+        raise Unsupported(info.node, f"class {info.name} has no __init__", "add one, or use @dataclass")
+    for n in ast.walk(init.fdef):
+        targets = []
+        if isinstance(n, ast.Assign):
+            targets = n.targets
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+            targets = [n.target]
+        for t in targets:
+            for leaf in (t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t]):
+                if isinstance(leaf, ast.Attribute) and isinstance(leaf.value, ast.Name) and leaf.value.id == "self":
+                    if info.field(leaf.attr) is None:
+                        ann = n.annotation if isinstance(n, ast.AnnAssign) else None
+                        info.fields.append(FieldInfo(leaf.attr, cpp_ident(leaf.attr), annotation=ann))
+    for m in info.methods.values():
+        if m.kind in ("instance", "property"):
+            for n in ast.walk(m.fdef):
+                if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                        if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self" \
+                                and info.field(t.attr) is None:
+                            raise Unsupported(n, f"{m.name} creates attribute '{t.attr}', which __init__ doesn't set",
+                                              "set every attribute in __init__ (to a starting value if need be)")
 
 
 def _field_default(mod, info, f: FieldInfo, value):
@@ -251,9 +288,13 @@ def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
     if len(s.decorator_list) > 1:
         raise Unsupported(s, "a method with more than one decorator is not supported")
     if s.name == "__post_init__":
-        if info.namedtuple:
-            raise Unsupported(s, "NamedTuple doesn't call __post_init__")
+        if info.namedtuple or info.plain:
+            raise Unsupported(s, "__post_init__ is only called by @dataclass")
         kind = "post_init"
+    elif s.name == "__init__" and info.plain:
+        if s.decorator_list:
+            raise Unsupported(s, "__init__ can't have decorators")
+        kind = "init"
     elif s.name in DUNDERS_REFUSED:
         raise Unsupported(s, f"defining {s.name} is not supported: it changes what Python operators mean",
                           "use a plainly named method")
@@ -262,7 +303,7 @@ def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
     args = s.args
     if args.vararg or args.kwarg or args.kwonlyargs or args.posonlyargs:
         raise Unsupported(s, "*args, **kwargs and keyword-only parameters are not supported")
-    if kind in ("instance", "property", "post_init", "class"):
+    if kind in ("instance", "property", "post_init", "class", "init"):
         want = "cls" if kind == "class" else "self"
         if not args.args or args.args[0].arg != want:
             raise Unsupported(s, f"the first parameter of {s.name} must be '{want}'")
@@ -273,11 +314,11 @@ def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
 
 def check_field_types(mod, info: ClassInfo):
     for f in info.fields:
+        if f.annotation is None:  # a plain class's field typed by __init__ (translator.infer_init_fields)
+            continue
         t = mod.parse_annotation(f.annotation)
-        if not (isinstance(t, (Scalar, ArrayType, OptionalType, StructType)) or str(t) == "str"):
-            raise Unsupported(f.annotation, f"field '{f.name}': {t} fields are not supported",
-                              "a Generator inside an object is not supported yet: pass it to the method that "
-                              "draws" if str(t) == "Generator" else None)
+        if not (isinstance(t, (Scalar, ArrayType, OptionalType, StructType)) or str(t) in ("str", "Generator")):
+            raise Unsupported(f.annotation, f"field '{f.name}': {t} fields are not supported")
         if isinstance(t, StructType) and t.name == info.name:
             raise Unsupported(f.annotation, f"field '{f.name}' holds a {info.name} inside a {info.name}")
         f.type = t

@@ -203,7 +203,7 @@ class FunctionTranslator(ExprTranslator):
         self.all_names = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)} | set(self.params)
         self.owner = mod.classes.get(sig.owner) if sig.owner else None
         self.py_names = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)} | {a.arg for a in fdef.args.args}
-        self.has_self = sig.kind in ("instance", "property", "post_init")
+        self.has_self = sig.kind in ("instance", "property", "post_init", "init")
         self.all_names.discard("self")
 
     def ident(self, name: str) -> str:
@@ -545,6 +545,12 @@ class FunctionTranslator(ExprTranslator):
                 if ev is None:
                     raise Unsupported(self.fdef, f"'{name}' is annotated but never assigned")
                 try:
+                    if all(self.event_type(e) == NONE for e in self.events if e.name == name):
+                        self.local_types[name] = NONE  # only ever None: any use of it is refused later
+                        continue
+                except (Unsupported, _Unknown):
+                    pass
+                try:
                     self.event_type(ev)  # re-run outside inference mode to surface the real error
                 except _Unknown as u:
                     raise Unsupported(ev.stmt, f"could not infer a type for '{name}': it depends on "
@@ -688,38 +694,50 @@ class FunctionTranslator(ExprTranslator):
         return any(isinstance(n, ast.Name) and n.id == target for n in ast.walk(value_node))
 
     # --- pass 3c: random draws ----------------------------------------------------------------
-    def _draws(self, node, types) -> int:
-        """How many times evaluating `node` advances a generator: rng.method(...) calls, and
-        calls that pass a generator to another function."""
-        count = 0
-        for n in ast.walk(node):
-            if not isinstance(n, ast.Call):
-                continue
-            f = n.func
-            if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and types.get(f.value.id) == RNG:
-                count += 1
-            elif isinstance(f, ast.Name) and any(isinstance(a, ast.Name) and types.get(a.id) == RNG
-                                                 for a in list(n.args) + [k.value for k in n.keywords]):
-                count += 1
-        return count
+    def _effect(self, n, types):
+        """What a call changes: (variables it modifies, whether it draws random numbers).
+        A draw from a generator (also one held in an object: self.rng.normal()), a method that
+        isn't const, and a function given an argument it modifies all count."""
+        roots, draw = set(), False
+        f = n.func
+        callee = None
+        if isinstance(f, ast.Attribute) and not self._is_module_path(f.value):
+            bt = _chain_type(f.value, types, self.mod)
+            if bt == RNG:
+                roots.add(subscript_root(f.value))
+                draw = True
+            elif isinstance(bt, StructType) and bt.name in self.mod.classes:
+                m = self.mod.classes[bt.name].methods.get(f.attr)
+                if m is not None and m.key in self.mod.sigs:
+                    callee = self.mod.sigs[m.key]
+                    if m.kind == "instance" and not callee.const:
+                        roots.add(subscript_root(f.value))
+        elif isinstance(f, ast.Name) and f.id in self.mod.sigs:
+            callee = self.mod.sigs[f.id]
+        if callee is not None:
+            pos = {p.name: i for i, p in enumerate(callee.params)}
+            pairs = list(enumerate(n.args)) + [(pos.get(k.arg, -1), k.value) for k in n.keywords]
+            for i, a in pairs:
+                if 0 <= i < len(callee.params) and callee.params[i].mode == "ref" and \
+                        isinstance(a, (ast.Name, ast.Attribute, ast.Subscript)):
+                    roots.add(subscript_root(a))
+                    draw = draw or callee.params[i].type == RNG
+        roots.discard(None)
+        return roots, draw
 
     def check_random_draws(self):
         """Python evaluates left to right; C++ leaves the order of operands and arguments
-        unspecified. With two draws in one expression (rng.random() - rng.random()), C++ could
-        take them in the other order and compute a different number, so that is refused."""
+        unspecified (GCC on x86 often goes right to left). So a statement may contain at most
+        one call that changes something (a random draw, a method that changes its object, a
+        function that changes an argument), and must not otherwise read what that call changes:
+        rng.random() - rng.random(), p.step() + p.cash and push(a) + a[0] are all refused."""
         types = {**self.local_types, **self.params}
-        if RNG not in types.values():
-            return
-
-        def own_exprs(s):
-            return [e for e in self._own_exprs(s) if e is not None]
+        if self.has_self:
+            types["self"] = self.owner.type
 
         def visit(stmts):
             for s in stmts:
-                if sum(self._draws(e, types) for e in own_exprs(s)) > 1:
-                    raise Unsupported(s, "two random draws in one statement: C++ doesn't fix which is "
-                                         "evaluated first, so the draws could be used in a different order",
-                                      "draw into separate variables, one per line")
+                self._check_order(s, types)
                 if isinstance(s, (ast.Assign, ast.AnnAssign)) and s.value is not None:
                     targets = s.targets if isinstance(s, ast.Assign) else [s.target]
                     if any(isinstance(t, ast.Name) and types.get(t.id) == RNG for t in targets) and not (
@@ -731,6 +749,40 @@ class FunctionTranslator(ExprTranslator):
                               *[h.body for h in getattr(s, "handlers", [])]):
                     visit(block)
         visit(self.body)
+
+    def _check_order(self, s, types):
+        if isinstance(s, (ast.Assign, ast.AnnAssign)):
+            reads = [s.value] if s.value is not None else []  # the right side runs first in both languages
+            exprs = reads + (list(s.targets) if isinstance(s, ast.Assign) else [s.target])
+        elif isinstance(s, ast.AugAssign):
+            # Python reads the target before the right side; C++17 evaluates the right side first
+            reads = exprs = [s.target, s.value]
+        else:
+            reads = exprs = [e for e in self._own_exprs(s) if e is not None]
+        effects = []
+        for e in exprs:
+            for n in ast.walk(e):
+                if isinstance(n, ast.Call):
+                    roots, draw = self._effect(n, types)
+                    if roots:
+                        effects.append((n, roots, draw))
+        if len(effects) > 1:
+            if all(d for _, _, d in effects):
+                raise Unsupported(s, "two random draws in one statement: C++ doesn't fix which is "
+                                     "evaluated first, so the draws could be used in a different order",
+                                  "draw into separate variables, one per line")
+            raise Unsupported(s, "two calls that change something, in one statement: Python runs them left to "
+                                 "right, C++ in an unspecified order", "make each call on its own line")
+        if effects:
+            call, roots, _ = effects[0]
+            inside = {id(x) for x in ast.walk(call)}
+            for e in reads:
+                for x in ast.walk(e):
+                    if isinstance(x, ast.Name) and x.id in roots and id(x) not in inside:
+                        raise Unsupported(s, f"this statement calls {ast.unparse(call.func)}(...), which changes "
+                                             f"'{x.id}', and also reads '{x.id}': Python does them left to right, "
+                                             "C++ in an unspecified order",
+                                          "make the call on its own line, into a variable")
 
     def check_generator_declarations(self):
         for s, names in ((s, n) for s in ast.walk(self.fdef) for n in [self.hoist_at.get(id(s), ())]):

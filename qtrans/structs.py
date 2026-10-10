@@ -10,7 +10,7 @@ import ast
 
 from .core import P_ATOM, P_EQ, Expr, wrap
 from .errors import Unsupported
-from .types import BOOL, OptionalType, Scalar, StructType, assignable
+from .types import BOOL, RNG, OptionalType, Scalar, StructType, assignable
 
 THIS = "(*this)"
 
@@ -118,7 +118,16 @@ class StructOps:
 
     def construct(self, node, info) -> Expr:
         """Option(S=100.0, K=95.0, ...): the arguments in field order, defaults spelled out where
-        a later field is given. The C++ constructor then runs __post_init__, as Python does."""
+        a later field is given. The C++ constructor then runs __post_init__, as Python does.
+        For a plain class the arguments are __init__'s."""
+        for a in list(node.args) + [k.value for k in node.keywords]:
+            if not isinstance(a, ast.Call) and self.expr_raw(a).type == RNG:
+                raise Unsupported(a, f"passing a generator to {info.name}(): the object would share it with the "
+                                     "caller in Python, but hold a copy in C++",
+                                  "create the generator inside, from a seed: self.rng = np.random.default_rng(seed)")
+        if info.plain:
+            sig = self._method_sig(info.methods["__init__"], node)
+            return Expr(f"{info.cpp}({', '.join(self.bind_args(node, sig, info.name))})", P_ATOM, info.type)
         fields = info.init_fields
         if len(node.args) > len(fields):
             raise Unsupported(node, f"{info.name}() takes {len(fields)} arguments but {len(node.args)} were given")
@@ -154,6 +163,9 @@ class StructOps:
         info = self.class_info(o.type.name, node)
         if info.namedtuple:
             raise Unsupported(node, "use ._replace for a NamedTuple; it is not supported yet")
+        if info.plain:
+            raise Unsupported(node, f"dataclasses.replace needs a dataclass; {info.name} is a plain class "
+                                    "(Python raises TypeError)")
         if not o.simple:
             raise Unsupported(node.args[0], "store the object in a variable before replace()")
         given = {k.arg: k.value for k in node.keywords}
@@ -180,7 +192,9 @@ class StructOps:
             raise Unsupported(node, f"comparing a {a.type} with a {b.type}: Python says they are never equal")
         info = self.class_info(a.type.name, node)
         if not info.eq:
-            raise Unsupported(node, f"{info.name} has eq=False, so == compares identity in Python")
+            what = "is a plain class" if info.plain else "has eq=False"
+            raise Unsupported(node, f"{info.name} {what}, so == asks whether both are the same object in Python",
+                              "compare the fields you mean")
         if info.has_array_field(self.mod.classes):
             raise Unsupported(node, f"== on {info.name}: it holds an array, and Python's dataclass == then raises "
                                     "ValueError (the truth value of an array is ambiguous)",
