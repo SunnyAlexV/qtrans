@@ -264,28 +264,29 @@ def test_length_1_arrays_broadcast_like_numpy(tmp_path):
                    if c.source != "given"), f.name
 
 
-def test_singular_matrix_is_a_knife_edge_when_a_nudge_flips_it():
-    import sys
+def test_an_outcome_that_a_nudge_flips_is_a_knife_edge(tmp_path):
+    """python_flips: does a rounding-sized nudge change whether Python raises? Tested on exact
+    knife edges rather than on LAPACK, whose verdict on a singular matrix (the case this exists
+    for) depends on the LAPACK build: that is the point, and why it can't be pinned in a test."""
     import numpy as np
     import qtrans.verify as V
     from qtrans.project import translate_project
-    ex = Path(__file__).resolve().parent.parent / "examples"
-    sys.path.insert(0, str(ex))
-    try:
-        import portfolio
-    finally:
-        sys.path.remove(str(ex))
-    sig = translate_project([ex / "portfolio.py"]).modules["portfolio"].signatures["black_litterman"]
-    # a 1 x 1 omega stretched over a rank-1 5 x 5 matrix: exactly singular, cond ~1e18
-    args = (np.array([[1.77650635]]), np.array([0.07687194]), np.array([[0.97940554], [1.0], [0.10371793],
-            [2.67377371], [0.02512121]]), np.array([0.36947283, 0.07374591, 2.0, 31.6024018, 1.81425788]),
-            np.array([0.25885975]), -0.0, 1.5090684060311994)
-    c = V.Case("black_litterman", args, "given")
-    c.py = V.run_python(portfolio.black_litterman, args, sig)
-    assert c.py[0] == "exc" and "Singular" in c.py[2]
-    assert V.python_flips(portfolio.black_litterman, c, sig, np.random.default_rng(1), trials=6)
-    # a matrix that is singular whatever the rounding is no knife edge
-    z = (np.zeros((2, 2)), np.zeros(2), np.zeros((1, 2)), np.zeros(1), np.ones(1), 2.5, 0.05)
-    c = V.Case("black_litterman", z, "given")
-    c.py = V.run_python(portfolio.black_litterman, z, sig)
-    assert not V.python_flips(portfolio.black_litterman, c, sig, np.random.default_rng(1), trials=6)
+    p = write(tmp_path, "edge", '''
+        def at_one(x: float) -> float:
+            if x == 1.0:
+                raise ValueError("Singular matrix")  # only exactly 1.0, as an exactly-zero pivot
+            return x
+
+        def below_two(x: float) -> float:
+            if x < 2.0:
+                raise ValueError("Singular matrix")  # raises however 1.0 is rounded
+            return x
+        ''')
+    project = translate_project([p])
+    mod = V.load_project(project)["edge"]
+    sigs = project.modules["edge"].signatures
+    for name, args, flips in (("at_one", (1.0,), True), ("at_one", (3.0,), False), ("below_two", (1.0,), False)):
+        fn = getattr(mod, name)
+        c = V.Case(name, args, "given")
+        c.py = V.run_python(fn, args, sigs[name])
+        assert V.python_flips(fn, c, sigs[name], np.random.default_rng(1)) is flips, (name, args)
