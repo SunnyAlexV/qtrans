@@ -65,7 +65,8 @@ def test_slices_use_python_rules():
 
 def test_matrix_rows_columns_and_elements():
     h = cpp("def f(A: Mat, i: int) -> float:\n    return A[0, 1] + np.sum(A[:, 2]) + np.sum(A[1])\n")
-    assert "A(0, 1)" in h and "A.col(2)" in h and "A.row(1).transpose()" in h
+    # rows and columns are checked before Eigen forms the view (Python's index rules)
+    assert "A(0, 1)" in h and "qt::col(A, 2)" in h and "qt::row(A, 1).transpose()" in h
 
 
 def test_two_dimensional_slice():

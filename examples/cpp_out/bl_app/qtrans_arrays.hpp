@@ -149,6 +149,14 @@ inline Index idx(long long i, Index n) {
     return static_cast<Index>(j);
 }
 
+// A[i] and A[:, j]: Python's index (negative counts from the end), checked before Eigen
+// forms the row or column view. Eigen computes the view's address before its own bounds check,
+// which is undefined behaviour out of range (the last column of an n x 0 matrix, say).
+template <class D> auto row(Eigen::DenseBase<D>& a, long long i) { return a.row(idx(i, a.rows())); }
+template <class D> auto row(const Eigen::DenseBase<D>& a, long long i) { return a.row(idx(i, a.rows())); }
+template <class D> auto col(Eigen::DenseBase<D>& a, long long j) { return a.col(idx(j, a.cols())); }
+template <class D> auto col(const Eigen::DenseBase<D>& a, long long j) { return a.col(idx(j, a.cols())); }
+
 // a[start:stop:step]: CPython's PySlice_Unpack + PySlice_AdjustIndices, so negative and
 // out-of-range bounds are clipped exactly as Python clips them (a[1:100] is fine).
 struct Span { Index first, size, step; };
@@ -887,7 +895,8 @@ plain_t<DB> solve(const Eigen::ArrayBase<DA>& a, const Eigen::ArrayBase<DB>& b) 
     // then that b fits (ValueError)
     if (a.rows() != a.cols()) throw linalg_error("Last 2 dimensions of the array must be square");
     if (b.rows() != a.rows()) throw shape_error("solve: right-hand side has the wrong number of rows");
-    const auto lu = lu_checked(a);
+    const auto lu = lu_checked(a);  // singular raises even with an empty right side, as in NumPy
+    if (b.size() == 0) return plain_t<DB>(b.rows(), b.cols());  // Eigen 3.4's triangular solve reads x(0, 0) of an empty x
     const Eigen::MatrixXd x = lu.solve(b.matrix().eval());
     return x.array();
 }

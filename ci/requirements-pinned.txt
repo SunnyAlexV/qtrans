@@ -1,0 +1,11 @@
+# The reference job's packages (.github/workflows/tests.yml). The numbers in README.md and
+# examples/RESULTS.md come from this configuration: Ubuntu 24.04, x86-64, GCC 13, Python 3.13.
+# Results that depend on NumPy's or SciPy's own exp / log / pow / erf can change with these
+# versions, so they are pinned here; the "latest" jobs show what newer releases do.
+numpy==2.5.4
+scipy==1.18.1
+pandas==3.0.6
+pytest==9.1.1
+mpmath==1.4.1
+pybind11==3.1.0
+setuptools==84.0.0

@@ -106,10 +106,10 @@ warnings** under the strict flags above. The full table is in
 
   | Kind of code | Speed-up | Why |
   |---|---|---|
-  | Scalar arithmetic | 7x to 39x | Python call overhead removed, code compiled |
-  | Calls to `scipy.stats.norm` | 1,198x to 5,705x | Mostly SciPy's ~25-30 µs per-call overhead, against ~100-150 ns for `scipy.special.ndtr` |
-  | Array code | 4x to 132x | Small where NumPy already runs in C (`cumprod`: 5x); large where Python loops over elements (drawdown: 127x, EWMA: 132x) |
-  | Large vectorised Monte Carlo | about 1x to 4x | The time goes in `exp` over millions of elements, where NumPy uses run-time AVX code; portable `-O2` C++ calls the C library once per element (5.5x slower per `exp` in isolation). The C++ is still the same speed with no Python needed; `gbm_paths`, which loops over time steps, is 48x |
+  | Scalar arithmetic | 7x to 44x | Python call overhead removed, code compiled |
+  | Calls to `scipy.stats.norm` | 947x to 6,643x | Mostly SciPy's ~25-30 µs per-call overhead, against ~100-150 ns for `scipy.special.ndtr` |
+  | Array code | 4x to 160x | Small where NumPy already runs in C (`cumprod`: 5x); large where Python loops over elements (drawdown: 140x, EWMA: 160x) |
+  | Large vectorised Monte Carlo | about 1x to 6x | The time goes in `exp` over millions of elements, where NumPy uses run-time AVX code; portable `-O2` C++ calls the C library once per element (5.5x slower per `exp` in isolation). The C++ is still the same speed with no Python needed; `gbm_paths`, which loops over time steps, is 43x |
 
 Three C++ programs in [`examples/use_from_cpp/`](https://github.com/SunnyAlexV/qtrans/tree/main/examples/use_from_cpp) use the generated
 headers directly and print exactly what the Python prints:
@@ -381,10 +381,10 @@ uses pandas; some helpers return strings or dicts; the bootstrap uses integer ar
   classification).
 - **Now: 21 of 21 translate**, and over 4,233 cases (random, plus realistic ones: 500 days of
   returns on 10 assets, three views) there are **0 mismatches**. 7 functions are bit-identical
-  to NumPy; the others use LAPACK, `pow` or BLAS and agree to rounding. Per call, 1x to 55x
+  to NumPy; the others use LAPACK, `pow` or BLAS and agree to rounding. Per call, 1x to 40x
   faster at the realistic sizes: near 1x where NumPy already spends its time in optimised C
-  (`_ewma_weights`; `ledoit_wolf_identity`'s matrix products, 2x), 12x to 55x where Python
-  overhead dominates (`posterior_mu` 12x, `_cvar` 20x, `portfolio_stats` 55x).
+  (`_ewma_weights`; `ledoit_wolf_identity`'s matrix products), 15x to 40x where Python
+  overhead dominates (`posterior_mu` 15x, `_cvar` 36x, `portfolio_stats` 37x).
 
 What it turned up, beyond the missing features:
 
@@ -533,11 +533,11 @@ about 100 ns of overhead with number arguments and about 0.5 µs with two small 
 
 | Kind of code | Speed-up from Python | Examples |
 |---|---|---|
-| Calls to `scipy.stats.norm` | 200x to 1,700x | `bs_price` 626x, `implied_vol` 1,669x |
-| Python loops over elements or objects | 20x to 125x | `max_drawdown` 122x, `leveraged_nav` 66x, `american_binomial` 30x |
-| Array code at the examples' sizes | 2x to 16x | `black_litterman` 14x, `posterior_mu` 9x, `nearest_psd` 3x |
-| Scalar arithmetic only | about 1x to 8x | `d1` 1.7x: the work is as small as the call overhead |
-| Tiny functions, exp-bound Monte Carlo | 0.4x to 2x | `weight_bounds` 0.4x (a string compare); `european_from_draws` 0.9x, as for the standalone C++ |
+| Calls to `scipy.stats.norm` | 200x to 1,700x | `bs_price` 496x, `implied_vol` 1,644x |
+| Python loops over elements or objects | 20x to 115x | `max_drawdown` 114x, `leveraged_nav` 94x, `american_binomial` 29x |
+| Array code at the examples' sizes | 2x to 16x | `black_litterman` 9x, `posterior_mu` 9x, `nearest_psd` 4x |
+| Scalar arithmetic only | about 1x to 8x | `d1` 1.4x: the work is as small as the call overhead |
+| Tiny functions, exp-bound Monte Carlo | 0.5x to 2x | `weight_bounds` 0.5x (a string compare); `european_from_draws` 0.6x, as for the standalone C++ |
 
 **Not quite Python, by design:** a function returning its argument returns a copy, not the
 same array; reading an array field of a compiled object gives a read-only copy (writing to it
@@ -575,6 +575,15 @@ an array field to an array *equal* to the old one, the compiled side keeps the o
    itself can hang (its SVD, inside `np.linalg.pinv`, never returns on some matrices holding
    inf). So every Python call runs in a separate worker process with a 10-second limit; a call
    that doesn't finish is reported and left out, and the worker restarted.
+
+   CI also compiles the drivers with AddressSanitizer and UndefinedBehaviorSanitizer
+   (`QTRANS_CXXFLAGS`, see [Platforms](#platforms)). On the empty matrices above they found
+   two cases of undefined behaviour that gave the right answers anyway: `A[:, -1]` of an
+   n×0 matrix formed Eigen's column view (pointer arithmetic on a null pointer) before Eigen's
+   bounds check raised the `IndexError`; and Eigen 3.4's triangular solve read element (0, 0)
+   of an empty right-hand side. Rows and columns are now checked before the view is formed
+   (`qt::row(A, i)`, `qt::col(A, j)`, with Python's negative indices), and `qt::solve` returns
+   an empty result itself.
 3. **Transfers values exactly.** Numbers go to C++ as hex floats and come back through
    `printf("%a")`, so nothing is rounded in transit.
 4. **Compares everything a call produces.** That means the return value, the final state of
@@ -608,6 +617,28 @@ Module-level settings the verifier reads (the translator ignores names starting 
 `QTRANS_CASES = {"f": [(args...), ...]}` (trailing defaults may be omitted, arrays as NumPy
 arrays) and `QTRANS_TOLERANCE = {"f": 1e-8}` for an algorithm that guarantees less than 1e-10.
 No example needs `QTRANS_TOLERANCE`, and every hand-picked case is an outright match.
+
+## Platforms
+
+CI ([`.github/workflows/tests.yml`](https://github.com/SunnyAlexV/qtrans/blob/main/.github/workflows/tests.yml))
+runs the tests on every push, in these configurations:
+
+| Job | What it shows |
+|---|---|
+| **Reference**: Ubuntu 24.04, x86-64, GCC 13, Python 3.13, NumPy and SciPy pinned ([`ci/requirements-pinned.txt`](https://github.com/SunnyAlexV/qtrans/blob/main/ci/requirements-pinned.txt)) | Where this README's numbers come from. It also runs `run_examples.py --check`: every number in `examples/RESULTS.md` other than the timings, and every header in `examples/cpp_out/`, must reproduce |
+| Ubuntu latest, latest NumPy and SciPy | An early warning: a new compiler or NumPy release that changes a result shows up here first |
+| Clang | The generated C++ doesn't depend on GCC |
+| `-O0` and `-O3` | The numbers don't depend on the optimisation level (`-ffp-contract=off` and no `-ffast-math`: no operation is reordered or fused) |
+| AddressSanitizer + UndefinedBehaviorSanitizer | No out-of-bounds access, signed overflow or other undefined behaviour in the generated code or the runtime, on any input the verifier tries |
+| Python 3.10 and 3.14 | The oldest and newest supported Python |
+| Windows | MinGW g++ for the verifier, MSVC for the bindings |
+| macOS ARM64 | Apple Clang on another CPU, C library and NumPy build |
+
+Results built from `+ - * /` and `sqrt` are exactly rounded by IEEE-754, so they can be the
+same bits on every platform. Results that use the C library's or NumPy's own `exp`, `log`,
+`pow` or `erf` are checked against the verifier's tolerance everywhere; their ULP counts are
+those of the reference platform. `QTRANS_CXXFLAGS` adds flags to the verifier's compile command
+(after its own, so `-O3` replaces `-O2`).
 
 ## Differences kept by design
 

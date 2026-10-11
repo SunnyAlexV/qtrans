@@ -312,7 +312,7 @@ class ArrayOps:
                     raise Unsupported(node, "row slices with a step are not supported")
                 code = self._slice2d(B.code, parts[0], ast.Slice(), node)
                 return (code, "mat") if target else Expr(code, P_ATOM, MAT)
-            code = f"{b}.row({self._index(parts[0], f'{b}.rows()', named)})"
+            code = f"qt::row({B.code}, {self._int_code(parts[0])})"
             self._last_target_dims = dims_of(B)[1:]
             return (code, "row") if target else Expr(f"{code}.transpose()", P_ATOM, VEC, dims=dims_of(B)[1:])
         if len(parts) != 2:
@@ -322,11 +322,11 @@ class ArrayOps:
             code = f"{b}({self._index(r, f'{b}.rows()', named)}, {self._index(c, f'{b}.cols()', named)})"
             return (code, "scalar") if target else Expr(code, P_ATOM, FLOAT)
         if self._full(r) and not slices[1]:
-            code = f"{b}.col({self._index(c, f'{b}.cols()', named)})"
+            code = f"qt::col({B.code}, {self._int_code(c)})"
             self._last_target_dims = dims_of(B)[:1]
             return (code, "vec") if target else Expr(code, P_ATOM, VEC, dims=dims_of(B)[:1])
         if not slices[0] and self._full(c):
-            code = f"{b}.row({self._index(r, f'{b}.rows()', named)})"
+            code = f"qt::row({B.code}, {self._int_code(r)})"
             self._last_target_dims = dims_of(B)[1:]
             return (code, "row") if target else Expr(f"{code}.transpose()", P_ATOM, VEC, dims=dims_of(B)[1:])
         if slices[0] and slices[1]:
@@ -374,7 +374,9 @@ class ArrayOps:
                 raise Unsupported(node, "assigning into rows picked by a mask (A[mask] = ...) is not supported")
             return (B.code, M.code), "mask"
         if M.type.rank == B.type.rank:
-            return Expr(f"qt::select({B.code}, {M.code})", P_ATOM, VEC)
+            # as many elements as the mask has true values: a[ok] and b[ok] agree
+            count = ("count", M.dimtok) if M.dimtok is not None else None
+            return Expr(f"qt::select({B.code}, {M.code})", P_ATOM, VEC, dims=(count,))
         if B.type == MAT and M.type.rank == 1:
             return Expr(f"qt::select_rows({B.code}, {M.code})", P_ATOM, MAT)
         raise Unsupported(node, "a 2-D mask can only index a 2-D array")

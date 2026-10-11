@@ -4,10 +4,16 @@ It translates every example in examples/, writes the C++ to examples/cpp_out/, c
 checks it against Python on hand-picked and random inputs, times both, and writes the
 results table to examples/RESULTS.md.
 
+`python run_examples.py --check` writes nothing: it runs the same checks (without timing) and
+fails if anything deterministic differs from the committed examples/RESULTS.md and
+examples/cpp_out/ (CI runs it on the reference platform, where those files come from).
+
 If no C++ compiler is found it still translates (so you can read the C++), and tells you
 how to install one. On Windows you can point COMPILER at a g++.exe directly, e.g.
 COMPILER = r"C:\\winlibs\\mingw64\\bin\\g++.exe".
 """
+import sys
+import tempfile
 from pathlib import Path
 
 from qtrans import translate_file, translate_project, verify_file
@@ -21,8 +27,15 @@ EXAMPLES = ["black_scholes", "implied_vol", "futures_options", "bonds", "exotics
             "portfolio", "lattice_pde", "risk", "monte_carlo", "black_litterman_app", "instruments"]
 
 
-def main():
-    out = HERE / "examples" / "cpp_out"
+def _det(line):
+    """The columns of a RESULTS.md row that don't depend on timing."""
+    c = [x.strip() for x in line.split("|")[1:-1]]
+    return tuple(c[:9])
+
+
+def main(check=False):
+    committed = HERE / "examples" / "cpp_out"
+    out = Path(tempfile.mkdtemp(prefix="qtrans_check_")) / "cpp_out" if check else committed
     for name in EXAMPLES + ["not_yet_supported"]:
         r = translate_file(HERE / "examples" / f"{name}.py", out)
         print(r.report.to_text(), "\n")
@@ -35,11 +48,11 @@ def main():
     rows = []
     for name in EXAMPLES:
         try:
-            rep = verify_file(HERE / "examples" / f"{name}.py", n_random=RANDOM_CASES, bench=BENCHMARK,
+            rep = verify_file(HERE / "examples" / f"{name}.py", n_random=RANDOM_CASES, bench=BENCHMARK and not check,
                               compiler=COMPILER, build_dir=HERE / "build" / name)
         except RuntimeError as e:
             print(e)
-            return
+            return 1
         print(rep.to_text(), "\n")
         for f in rep.functions:
             rows.append((name, f, rep))
@@ -64,10 +77,35 @@ def main():
     lines += ["", f"**Total mismatches: {total}.** Compiler: {rows[0][2].compiler}, flags: "
               "`-std=c++17 -O2 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wdouble-promotion "
               "-ffp-contract=off`; warnings in generated code: "
-              f"{sum(len(r.warnings) for r in {id(r): r for _, _, r in rows}.values())}."]
-    (HERE / "examples" / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"Results table written to {HERE / 'examples' / 'RESULTS.md'}")
+              f"{sum(len(r.warnings) for r in {id(r): r for _, _, r in rows}.values())}.",
+              "", f"Platform: {rows[0][2].environment}. Results using the C library's or NumPy's own "
+              "`exp`, `log`, `pow` or `erf` (and the ULP counts and speeds) hold for this platform; "
+              "other platforms' results are in CI (`.github/workflows/tests.yml`)."]
+    results = HERE / "examples" / "RESULTS.md"
+    if check:
+        return _check(lines, results, out, committed)
+    results.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Results table written to {results}")
+    return 0
+
+
+def _check(lines, results, out, committed) -> int:
+    rows = lambda ls: [_det(x) for x in ls if x.startswith("| ") and not x.startswith("| module")]
+    new, old = rows(lines), rows(results.read_text(encoding="utf-8").splitlines())
+    bad = [f"  committed {o}\n  now       {n}" for o, n in zip(old, new) if o != n]
+    if len(new) != len(old):
+        bad.append(f"  {len(old)} rows committed, {len(new)} now")
+    for f in sorted(out.rglob("*")):
+        if f.is_file():
+            c = committed / f.relative_to(out)
+            if not c.exists() or c.read_text(encoding="utf-8") != f.read_text(encoding="utf-8"):
+                bad.append(f"  examples/cpp_out/{f.relative_to(out).as_posix()} differs from the committed one")
+    if bad:
+        print("examples/RESULTS.md or examples/cpp_out/ don't reproduce:\n" + "\n".join(bad))
+        return 1
+    print(f"OK: {len(new)} rows of examples/RESULTS.md and every header in examples/cpp_out/ reproduce")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(check="--check" in sys.argv[1:]))

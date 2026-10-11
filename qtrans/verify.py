@@ -30,6 +30,8 @@ import importlib.util
 import inspect
 import math
 import os
+import platform
+import shlex
 import shutil
 import struct
 import subprocess
@@ -64,6 +66,12 @@ _KNOWN_MESSAGES = ("math domain error", "math range error", "cannot convert floa
 
 
 # --- compiler ------------------------------------------------------------------------
+def extra_flags() -> list:
+    """QTRANS_CXXFLAGS: flags added to the verifier's compile command, after its own (so -O0 or
+    -O3 replaces -O2), e.g. "-fsanitize=address,undefined" in CI. Not used for `qtrans bind`."""
+    return shlex.split(os.environ.get("QTRANS_CXXFLAGS", ""), posix=os.name != "nt")
+
+
 @dataclass
 class Compiler:
     path: str
@@ -73,13 +81,41 @@ class Compiler:
         if self.kind == "msvc":
             return ([self.path, "/nologo", "/std:c++17", "/EHsc", "/W4", "/fp:precise", "/bigobj",
                      "/O2" if optimise else "/Od", f"/I{include_dir}"]
-                    + [f"/external:I{d}" for d in system_includes] + ["/external:W0", str(source), f"/Fe{exe}"])
+                    + [f"/external:I{d}" for d in system_includes] + ["/external:W0"] + extra_flags()
+                    + [str(source), f"/Fe{exe}"])
         # Eigen goes in as a *system* include so its own internal warnings don't count against
         # the generated code
         return ([self.path, "-std=c++17", "-O2" if optimise else "-O0", "-Wall", "-Wextra",
                  "-Wpedantic", "-Wshadow", "-Wconversion", "-Wdouble-promotion",
                  "-ffp-contract=off", f"-I{include_dir}"]
-                + [f"-isystem{d}" for d in system_includes] + [str(source), "-o", str(exe)])
+                + [f"-isystem{d}" for d in system_includes] + extra_flags() + [str(source), "-o", str(exe)])
+
+    def version(self) -> str:
+        """The compiler's own version line (g++ --version; cl prints it to stderr)."""
+        try:
+            r = subprocess.run([self.path] + ([] if self.kind == "msvc" else ["--version"]),
+                               capture_output=True, text=True, timeout=30)
+            out = (r.stdout if self.kind != "msvc" else r.stderr) or r.stdout or r.stderr
+            return out.strip().splitlines()[0].strip() if out.strip() else Path(self.path).name
+        except (OSError, subprocess.SubprocessError):
+            return Path(self.path).name
+
+
+def environment(cxx: "Compiler | None" = None) -> str:
+    """What produced a result: OS, CPU, Python, NumPy, SciPy, the compiler and extra flags.
+    Results that depend on the platform's maths library (exp, pow, erf) hold only for it."""
+    parts = [f"{platform.system()} {platform.release()} {platform.machine()}",
+             f"Python {platform.python_version()}", f"NumPy {np.__version__}"]
+    try:
+        import scipy
+        parts.append(f"SciPy {scipy.__version__}")
+    except ImportError:
+        pass
+    if cxx is not None:
+        parts.append(cxx.version())
+    if extra_flags():
+        parts.append("QTRANS_CXXFLAGS=" + " ".join(extra_flags()))
+    return "; ".join(parts)
 
 
 def find_eigen(explicit: str | None = None) -> Path:
@@ -167,6 +203,7 @@ class VerifyReport:
     functions: list
     rtol: float
     atol: float
+    environment: str = ""
 
     @property
     def mismatches(self):
@@ -181,7 +218,10 @@ class VerifyReport:
         lines = [f"qtrans verify: {self.file}",
                  f"  translation: {t.summary()}",
                  f"  compiler:    {self.compiler} ({len(self.warnings)} warnings in generated code)",
-                 f"  tolerance:   rtol={self.rtol:g}, atol={self.atol:g}", ""]
+                 f"  tolerance:   rtol={self.rtol:g}, atol={self.atol:g}"]
+        if self.environment:
+            lines.append(f"  platform:    {self.environment}")
+        lines.append("")
         bench = any(f.cpp_ns for f in self.functions)
         head = (f"  {'function':<26}{'cases':>6}{'match':>7}{'ill-cond':>9}{'known':>7}{'MISMATCH':>9}"
                 f"{'max rel err':>13}{'max ULP':>9}")
@@ -1514,10 +1554,11 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 fc.cpp_ns = float(r.stdout.split()[1])
 
     reports = {}
+    env = environment(cxx)
     for module in targets:
         warns = [w.strip() for w in diagnostics if "warning" in w.lower() and f"{module}.hpp" in w]
         reports[module] = VerifyReport(str(project.paths[module]), project.modules[module], f"{Path(cxx.path).name}",
-                                       " ".join(cmd), warns, checks[module], rtol, atol)
+                                       " ".join(cmd), warns, checks[module], rtol, atol, env)
     return ProjectVerifyReport(reports)
 
 

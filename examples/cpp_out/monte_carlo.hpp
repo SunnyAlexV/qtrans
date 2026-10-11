@@ -58,10 +58,10 @@ inline qt::Mat gbm_paths(double S0, double mu, double sigma, double T, long long
     double growth = (mu - 0.5 * (sigma * sigma)) * dt;
     double shock = sigma * std::sqrt(dt);
     qt::Mat paths = qt::zeros(n_paths, qt::iadd(n_steps, 1LL));
-    paths.col(0) = S0;
+    qt::col(paths, 0) = S0;
     for (long long k = 0; k < n_steps; ++k) {
         qt::Vec z = rng.standard_normal(n_paths);  // one draw per path per step, in time order
-        paths.col(k + 1) = (paths.col(k) * qt::exp(growth + shock * z)).eval();
+        qt::col(paths, k + 1) = (qt::col(paths, k) * qt::exp(growth + shock * z)).eval();
     }
     return paths;
 }

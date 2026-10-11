@@ -319,6 +319,9 @@ class FunctionTranslator(ExprTranslator):
             t = tracked[name]
             return 0 if t == INT else t.rank
 
+        self._once = {n for n in self.locals_order
+                      if isinstance(self.local_types.get(n), MaskType) and self._rebinds(n, self.local_types[n]) == 1
+                      and n not in self._in_loop and sum(ev.name == n for ev in self.events) == 1}
         saved = (list(self.notes), set(self._noted), self.inferring)
         self.inferring = True
         self.dims_h = {}
@@ -380,6 +383,12 @@ class FunctionTranslator(ExprTranslator):
         now_ok = getattr(self, "_now_ok", False) and self.current is not None
         if t == INT:
             return None, h if h is not None else (("now", name, id(self.current)) if now_ok else None)
+        if isinstance(t, MaskType):
+            # a mask's *values* decide how many elements a[mask] has; one assigned once,
+            # outside loops (or read twice in one statement) has the same values at every read
+            if name in getattr(self, "_once", set()):
+                return None, ("mask", name)
+            return None, (("now", "mask", name, id(self.current)) if now_ok else None)
         if not is_array(t):
             return None, None
         h = h or (None,) * t.rank
@@ -1373,6 +1382,8 @@ class FunctionTranslator(ExprTranslator):
             code = f"({code}).eval()"  # Eigen is lazy: read all of the old value before overwriting it
         if name in inline_set:
             self.emit(f"{vt.cpp()} {self.ident(name)} = {code};")
+        elif code == self.ident(name):  # w = w.copy() of a parameter passed by value
+            self.emit(f"// {ast.unparse(s)}: {name} is already this function's own copy")
         else:
             self.emit(f"{self.ident(name)} = {code};")
 

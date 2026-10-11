@@ -71,7 +71,7 @@ inline std::tuple<qt::Vec, qt::Vec> buy_and_hold_returns(const qt::Mat& R, const
     // weights the portfolio has DRIFTED to by the end — what the next rebalance
     // actually trades away from, and therefore what turnover must be measured
     // against.
-    qt::Vec end_val = qt::broadcast(w, growth.row(growth.rows() - 1).transpose(), qt::mul_op{});
+    qt::Vec end_val = qt::broadcast(w, qt::row(growth, -1).transpose(), qt::mul_op{});
     double tot = qt::sum(end_val);
     qt::Vec w_end = std::fabs(tot) > 1e-12 ? qt::Vec(end_val / tot) : qt::Vec(w);
     return {r, w_end};

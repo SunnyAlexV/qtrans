@@ -1,6 +1,8 @@
-# Runs the full test suite (translation, compiled semantics, every example, the Python bindings)
-# on Linux and Windows. On Windows, verify uses MinGW g++ and the bindings use MSVC, which is
-# what Python's own build tools use there.
+# Runs the test suite (translation, compiled semantics, every example, the Python bindings)
+# across platforms, compilers and optimisation levels. Results built only from + - * / and
+# sqrt (exactly rounded by IEEE-754) must agree everywhere; results that use the C library's or
+# NumPy's own exp, log, pow or erf are checked to the verifier's tolerance everywhere, and to
+# the bit on the reference platform, where README.md's numbers come from.
 name: tests
 
 on:
@@ -9,19 +11,75 @@ on:
 
 jobs:
   test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: reference (Ubuntu 24.04, GCC, pinned packages)
+            os: ubuntu-24.04
+            python: "3.13"
+            pinned: true
+            reference: true
+          - name: Ubuntu latest, GCC, latest packages
+            # ubuntu-latest moves to Ubuntu 26.04 from October 19, 2026: an early warning for a
+            # new compiler or NumPy changing results
+            os: ubuntu-latest
+            python: "3.13"
+          - name: Clang (Ubuntu 24.04)
+            os: ubuntu-24.04
+            python: "3.13"
+            pinned: true
+            cxx: clang++
+          - name: -O0 (Ubuntu 24.04)
+            os: ubuntu-24.04
+            python: "3.13"
+            pinned: true
+            cxxflags: "-O0"
+            pytest_args: "--ignore=tests/test_bindings.py"
+          - name: -O3 (Ubuntu 24.04)
+            os: ubuntu-24.04
+            python: "3.13"
+            pinned: true
+            cxxflags: "-O3"
+            pytest_args: "--ignore=tests/test_bindings.py"
+          - name: sanitizers (ASan + UBSan, Ubuntu 24.04)
+            os: ubuntu-24.04
+            python: "3.13"
+            pinned: true
+            cxxflags: "-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+            # the verifier's C++ drivers run sanitized; the bindings are Python extensions
+            pytest_args: "--ignore=tests/test_bindings.py"
+          - name: Python 3.10 (oldest supported)
+            os: ubuntu-24.04
+            python: "3.10"
+          - name: Python 3.14 (newest)
+            os: ubuntu-24.04
+            python: "3.14"
+          - name: Windows (MinGW g++ and MSVC)
+            os: windows-latest
+            python: "3.12"
+          - name: macOS ARM64 (Apple Clang)
+            os: macos-15
+            python: "3.13"
+    env:
+      QTRANS_REQUIRE_CXX: "1"
+      QTRANS_CXXFLAGS: ${{ matrix.cxxflags }}
+      QTRANS_REFERENCE_PLATFORM: ${{ matrix.reference && '1' || '' }}
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
-      - name: Install Python packages
+      - name: Install Python packages (pinned)
+        if: matrix.pinned
+        run: python -m pip install -r ci/requirements-pinned.txt
+
+      - name: Install Python packages (latest)
+        if: ${{ !matrix.pinned }}
         run: python -m pip install numpy scipy pandas pytest mpmath pybind11 setuptools
 
       - name: Install Eigen (Linux)
@@ -30,6 +88,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libeigen3-dev
 
+      - name: Install Eigen (macOS)
+        if: runner.os == 'macOS'
+        run: brew install eigen
+
       - name: Install Eigen (Windows, through conda, as on an Anaconda machine)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -37,13 +99,18 @@ jobs:
           & "$env:CONDA\Scripts\conda.exe" install -y -q -c conda-forge eigen
           "QTRANS_EIGEN=$env:CONDA\Library\include\eigen3" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Show the C++ compiler and Eigen qtrans will use
+      - name: Use ${{ matrix.cxx }}
+        if: matrix.cxx
+        run: echo "CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+
+      - name: Show the platform, compiler and Eigen qtrans will use
         run: |
-          g++ --version
-          python -c "from qtrans.verify import find_compiler, find_eigen; print(find_compiler()); print(find_eigen())"
+          python -c "from qtrans.verify import environment, find_compiler, find_eigen; print(environment(find_compiler())); print(find_eigen())"
           python -c "import pybind11; print('pybind11', pybind11.__version__)"
 
       - name: Run tests (a skipped test fails the run)
-        env:
-          QTRANS_REQUIRE_CXX: "1"
-        run: python -m pytest -q -rs
+        run: python -m pytest -q -rs ${{ matrix.pytest_args }}
+
+      - name: Check examples/RESULTS.md reproduces (reference only)
+        if: matrix.reference
+        run: python run_examples.py --check
