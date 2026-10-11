@@ -2,6 +2,7 @@
 indexing, new axes, keepdims and Mat-Mat broadcasting, var/std/cumsum/cumprod over an axis,
 trace, stacking, scalar np.where. Compiled against NumPy on hand-picked edge cases (signed
 zeros, NaN, empty selections, shapes that don't broadcast) and random inputs."""
+import platform
 import textwrap
 
 import numpy as np
@@ -184,12 +185,34 @@ def test_all_translate_without_warnings(report):
     assert report.warnings == []
 
 
+# Which zero np.clip returns when x ties with a bound (clip(0.0, -0.0, None)) differs between
+# NumPy's own SIMD kernels: x86-64 returns the bound, ARM keeps x (IEEE-754 leaves max(-0, +0)
+# unspecified). The C++ follows x86-64; elsewhere only the sign of such a zero may differ.
+X86_64 = platform.machine().lower() in ("x86_64", "amd64")
+ZERO_TIE_CLIPS = {"clip_lo", "clip_hi_method"}
+
+
+def _zero_sign_only(c) -> bool:
+    """py and cpp differ only in the sign of zeros (seen through 1/x as +-inf)."""
+    if c.py[0] != "ok" or c.cpp[0] != "ok":
+        return False
+    a, b = np.asarray(c.py[1], dtype=float), np.asarray(c.cpp[1], dtype=float)
+    return a.shape == b.shape and np.array_equal(np.abs(a), np.abs(b), equal_nan=True)
+
+
+def _real_mismatches(name, cases):
+    bad = [c for c in cases if c.outcome == "mismatch"]
+    if not X86_64 and name in ZERO_TIE_CLIPS:
+        bad = [c for c in bad if not _zero_sign_only(c)]
+    return bad
+
+
 @compiled
 @pytest.mark.parametrize("name", FUNCTIONS)
 def test_matches_numpy_bit_for_bit(report, name):
     """No BLAS or libm in any of these: every result must be identical, not just close."""
     f = fn(report, name)
-    bad = [c for c in f.cases if c.outcome == "mismatch"]
+    bad = _real_mismatches(name, f.cases)
     assert not bad, [(c.args, c.py, c.cpp) for c in bad[:3]]
     for c in f.cases:
         if c.outcome == "match" and c.py[0] == "ok":
@@ -210,7 +233,7 @@ def test_signed_zero_ties_follow_numpy(report):
     assert list(py[:2]) == [-np.inf, np.inf]
     for name in ("max_tie", "min_tie", "clip_lo", "clip_hi_method", "clip_scalar"):
         for c in _given(report, name):
-            assert c.outcome == "match", (name, c.args, c.py, c.cpp)
+            assert c.outcome == "match" or not _real_mismatches(name, [c]), (name, c.args, c.py, c.cpp)
 
 
 @compiled

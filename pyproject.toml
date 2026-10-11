@@ -33,8 +33,8 @@ Issues = "https://github.com/SunnyAlexV/qtrans/issues"
 Results = "https://github.com/SunnyAlexV/qtrans/blob/main/examples/RESULTS.md"
 
 [project.optional-dependencies]
-test = ["pytest", "mpmath", "pybind11", "setuptools", "pandas"]
-bind = ["pybind11", "setuptools"]
+test = ["pytest", "mpmath", "pybind11>=2.10", "setuptools", "pandas"]
+bind = ["pybind11>=2.10", "setuptools"]
 tools = ["mpmath"]
 
 [project.scripts]

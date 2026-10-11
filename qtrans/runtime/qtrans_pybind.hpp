@@ -69,7 +69,11 @@ inline void register_exceptions(py::module_& m) {
                                      py::arg("__module__") = m.attr("__name__")));
     m.attr("ShapeError") = shape;
     shape_error_type() = shape.release().ptr();
-    py::register_exception_translator([](std::exception_ptr p) {
+    // local: this module translates its own exceptions only. Each compiled module has its own
+    // qt::linalg_error (hidden visibility); a process-wide translator from another module would
+    // see ours as a different type where the C++ library compares types by identity (libc++ on
+    // macOS) and turn LinAlgError into a plain ValueError.
+    py::register_local_exception_translator([](std::exception_ptr p) {
         try {
             if (p) std::rethrow_exception(p);
         } catch (const py::builtin_exception& e) {  // pybind11's own (py::type_error, ...): as they are

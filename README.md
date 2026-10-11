@@ -625,7 +625,7 @@ runs the tests on every push, in these configurations:
 
 | Job | What it shows |
 |---|---|
-| **Reference**: Ubuntu 24.04, x86-64, GCC 13, Python 3.13, NumPy and SciPy pinned ([`ci/requirements-pinned.txt`](https://github.com/SunnyAlexV/qtrans/blob/main/ci/requirements-pinned.txt)) | Where this README's numbers come from. It also runs `run_examples.py --check`: every number in `examples/RESULTS.md` other than the timings, and every header in `examples/cpp_out/`, must reproduce |
+| **Reference**: Ubuntu 24.04, x86-64, GCC 13, Python 3.13, NumPy and SciPy pinned ([`ci/requirements-pinned.txt`](https://github.com/SunnyAlexV/qtrans/blob/main/ci/requirements-pinned.txt)) | Where this README's numbers come from. It also runs `run_examples.py --check`: every header in `examples/cpp_out/` and every count in `examples/RESULTS.md` must reproduce, and so must the error and ULP columns of every function that doesn't use matrix products or `np.linalg` (OpenBLAS picks its kernels for the CPU, so NumPy's own rounding there changes from one CPU to another) |
 | Ubuntu latest, latest NumPy and SciPy | An early warning: a new compiler or NumPy release that changes a result shows up here first |
 | Clang | The generated C++ doesn't depend on GCC |
 | `-O0` and `-O3` | The numbers don't depend on the optimisation level (`-ffp-contract=off` and no `-ffast-math`: no operation is reordered or fused) |
@@ -639,6 +639,22 @@ same bits on every platform. Results that use the C library's or NumPy's own `ex
 `pow` or `erf` are checked against the verifier's tolerance everywhere; their ULP counts are
 those of the reference platform. `QTRANS_CXXFLAGS` adds flags to the verifier's compile command
 (after its own, so `-O3` replaces `-O2`).
+
+What the first runs found, all fixed:
+- **macOS**: with two compiled modules loaded, `LinAlgError` from one came out as a plain
+  `ValueError`. pybind11's exception translators were process-wide, and each module's copy of
+  `qt::linalg_error` is a different type to macOS's C++ library (which compares types by
+  identity; Linux's compares names). Each module now translates only its own exceptions.
+- **Python 3.14** words math domain errors by the argument ("expected a nonnegative input,
+  got -1.0" for `math.sqrt(-1)`), which the verifier didn't recognise as the known
+  IEEE-754 difference.
+- **ARM**: NumPy's own `np.clip` returns a different zero than on x86-64 when `x` ties with a
+  bound (`np.clip(0.0, -0.0, None)`); IEEE-754 leaves `max(-0, +0)` unspecified. The C++
+  follows x86-64; on ARM only the sign of such a zero differs.
+- **Clang** warned about `w = w;`, from `w = w.copy()` on a parameter passed by value (now a
+  comment: the parameter is already the function's own copy).
+- **Sanitizers**: the two undefined behaviours on empty matrices described under
+  [Verification](#verification).
 
 ## Differences kept by design
 

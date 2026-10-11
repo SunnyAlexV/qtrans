@@ -31,6 +31,7 @@ import inspect
 import math
 import os
 import platform
+import re
 import shlex
 import shutil
 import struct
@@ -62,7 +63,17 @@ CPP_EXC_MATCHES = {
     # Eigen's internal shape / bounds checks can't tell NumPy's ValueError and IndexError apart
     "ShapeError": {"ValueError", "IndexError"},
 }
+# Python's float errors, by message. Python 3.14 words most math domain errors by what the
+# function expected and the argument it got: math.sqrt(-1) -> "expected a nonnegative input,
+# got -1.0", math.acos(2) -> "expected a number in range from -1 up to 1, got 2.0",
+# math.sin(inf) -> "expected a finite input, got inf" (math.pow and math.fmod still say
+# "math domain error").
 _KNOWN_MESSAGES = ("math domain error", "math range error", "cannot convert float")
+_MATH_314 = re.compile(r"^expected .+, got [-+]?(inf|nan|[0-9][0-9.e+-]*)$")
+
+
+def _float_error_message(msg: str) -> bool:
+    return any(m in msg for m in _KNOWN_MESSAGES) or bool(_MATH_314.match(msg))
 
 
 # --- compiler ------------------------------------------------------------------------
@@ -1122,7 +1133,7 @@ def classify(case: Case, ret, rtol, atol):
         case.outcome = "known"
     elif py[0] == "exc" and (
             py[1] in ("ZeroDivisionError", "OverflowError")
-            or (py[1] == "ValueError" and any(m in py[2] for m in _KNOWN_MESSAGES))
+            or (py[1] == "ValueError" and _float_error_message(py[2]))
             # x ** y with x < 0 and fractional y: a Python float goes complex (and the next
             # real-only operation raises TypeError); C, like np.float64, gives NaN
             or (py[1] == "TypeError" and "complex" in py[2])):
