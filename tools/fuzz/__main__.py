@@ -1,13 +1,14 @@
 """The fuzzer: random typed programs, checked against Python, failures shrunk to minimal ones.
 
-    python -m tools.fuzz [--seed S] [--minutes M] [--batch N] [--cases C] [--out DIR] [--no-shrink]
+    python -m tools.fuzz [--seed S] [--minutes M] [--batches B] [--batch N] [--cases C] [--out DIR] [--no-shrink]
 
 Each batch is --batch generated functions in one module (one C++ compile for all of them),
 verified on --cases random inputs each (the verifier's own: non-square, empty and length-1
 arrays; every other batch with the stress profile's inf, NaN and extreme values). A failure is
 isolated to its function, shrunk, and written to DIR as a module that reproduces it (its
 failing input frozen in QTRANS_CASES), plus a summary in DIR/report.md. Exit code 1 if any bug
-was found. The same seed gives the same programs.
+was found. The same seed gives the same programs; with --batches the same number of them on
+any machine (--minutes alone stops by the clock, so a faster machine checks more).
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m tools.fuzz")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--minutes", type=float, default=5.0)
+    ap.add_argument("--batches", type=int, default=None, help="stop after this many batches")
     ap.add_argument("--batch", type=int, default=20)
     ap.add_argument("--cases", type=int, default=40)
     ap.add_argument("--out", default="fuzz_out")
@@ -47,7 +49,7 @@ def main(argv=None) -> int:
     stats, bugs, seen = Counter(), [], set()
     refusals = Counter()
     batch = 0
-    while time.time() < deadline:
+    while time.time() < deadline and (args.batches is None or batch < args.batches):
         names = [f"f{batch}_{k}" for k in range(args.batch)]
         gen.new_module()  # later functions of a batch may call earlier ones
         funcs = {n: gen.function(n) for n in names}
@@ -77,9 +79,13 @@ def main(argv=None) -> int:
     return 1 if bugs else 0
 
 
+def batch_note(args) -> str:
+    return f"{args.batches} batches" if args.batches else f"{args.minutes:g} minutes"
+
+
 def _write(out: Path, bugs, stats, refusals, args):
     lines = ["# Fuzzer report", "",
-             f"Seed {args.seed}, {args.minutes:g} minutes, batches of {args.batch}, {args.cases} random cases per function.", "",
+             f"Seed {args.seed}, {batch_note(args)}, batches of {args.batch}, {args.cases} random cases per function.", "",
              f"Generated {stats['generated']} functions: {stats['translated']} translated and checked "
              f"({stats['cases']:,} cases), {stats['refused']} refused with a reason. "
              f"Bugs: {len(bugs)}.", ""]

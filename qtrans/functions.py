@@ -12,6 +12,7 @@ The work happens in passes over the function body:
 from __future__ import annotations
 
 import ast
+import re
 import inspect
 
 from . import library as lib
@@ -207,6 +208,28 @@ def _crossing_view(target, value):
     if t and v and t[0] == v[0] and t[1] != v[1]:
         return v[1]
     return None
+
+
+_PLAIN = re.compile(r"[A-Za-z_]\w*(?:(?:\.|->)[A-Za-z_]\w*)*")
+
+
+def _evaluated(code: str, t) -> str:
+    """The right side as a temporary, read completely before the store. `.eval()` makes one of
+    an Eigen expression, but of a plain array (a variable, a field) it returns the array itself:
+    `v[::-1] = v` then reads elements it has already overwritten. Those are copied."""
+    if _PLAIN.fullmatch(code):
+        return f"{t.cpp()}({code})"
+    return f"({code}).eval()"
+
+
+def python_reads(fdef) -> set:
+    """Names the function reads. `x = x` is not a read: its translation is a comment (Clang
+    warns on a self-assignment), so a name read only there is unused in the C++."""
+    selfs = {id(n.value) for n in ast.walk(fdef) if isinstance(n, ast.Assign) and len(n.targets) == 1
+             and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.Name)
+             and n.value.id == n.targets[0].id}
+    return {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+            and id(n) not in selfs}
 
 
 class FunctionTranslator(ExprTranslator):
@@ -433,7 +456,7 @@ class FunctionTranslator(ExprTranslator):
         otherwise draw -Wunused-variable (the generated code is meant to compile warning-free,
         also under -Werror), and the attribute says what the Python says: this value is not used."""
         if not hasattr(self, "_read_names"):
-            self._read_names = {n.id for n in ast.walk(self.fdef) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+            self._read_names = python_reads(self.fdef)
         return "" if name in self._read_names else "[[maybe_unused]] "
 
     def ident(self, name: str) -> str:
@@ -1551,7 +1574,7 @@ class FunctionTranslator(ExprTranslator):
                                      "part of an array")
             rhs = f"{wrap(v, P_ATOM)}.transpose()" if kind == "row" else v.code
             if self._needs_eval(value_node, root, whole_array=False):
-                rhs = f"({rhs}).eval()"  # NumPy computes the whole right side before storing
+                rhs = _evaluated(rhs, v.type)  # NumPy computes the whole right side before storing
             if not all(same_dim(a, b) for a, b in zip(part, dims_of(v))):
                 # NumPy broadcasts the right side into the part (a length-1 Vec fills it)
                 op = {"=": "", "+=": ", qt::add_op{}", "-=": ", qt::sub_op{}", "*=": ", qt::mul_op{}",
@@ -1582,7 +1605,7 @@ class FunctionTranslator(ExprTranslator):
         e = self.convert_to(e, f.type, s, f"field '{f.name}'")
         rhs = e.code
         if is_array(f.type) and self._needs_eval(value_node, subscript_root(t), whole_array=False):
-            rhs = f"({rhs}).eval()"  # NumPy computes the right side before storing it
+            rhs = _evaluated(rhs, f.type)  # NumPy computes the right side before storing it
         self.emit(f"{code} = {rhs};")
 
     def s_AnnAssign(self, s):
@@ -1664,7 +1687,7 @@ class FunctionTranslator(ExprTranslator):
             if is_array(rhs.type):
                 rc = rhs.code
                 if self._needs_eval(s.value, subscript_root(s.target), whole_array=False):
-                    rc = f"({rc}).eval()"
+                    rc = _evaluated(rc, rhs.type)
                 self._emit_inplace(s, code, f.type, (None,) * f.type.rank, rhs, rc, syms)
             else:
                 self.need_scalar(rhs, s.value, "array arithmetic")

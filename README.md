@@ -140,7 +140,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (378 tests).
+`python -m pytest` (380 tests).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -601,11 +601,19 @@ an array field to an array *equal* to the old one, the compiled side keeps the o
      implementation could do better, e.g. one in higher precision. Also ill-cond: for functions
      using matrix products or `np.linalg`, one side raising `LinAlgError` ("Singular matrix")
      where the other returns, when the nudge itself flips Python between raising and
-     returning (an exactly-zero pivot is then a matter of rounding). These cases are listed
-     separately, never hidden.
+     returning, or when a matrix the Python code gave `np.linalg` to factor was singular to
+     working precision (smallest singular value at most n·eps times the largest; for
+     `cholesky`, smallest eigenvalue at most n·eps times the largest): an exactly-zero pivot
+     is then a matter of rounding; and results that agree
+     except at elements that are inf, -inf or NaN on both sides (a value that is zero up to
+     rounding, `1e-16` from LAPACK and exactly `0` from Eigen, divided by zero: its sign, so
+     rounding, decides between `-inf` and NaN). These cases are listed separately, never hidden.
    - **known**: Python raised a float error that IEEE-754 arithmetic doesn't raise
      (`ZeroDivisionError`, `OverflowError`, math domain error), or a Python float went complex
-     (`(-8.0) ** (1/3)`), where C, like `np.float64`, gives NaN; or an int left 64 bits, where
+     (`(-8.0) ** (1/3)`), where C, like `np.float64`, gives NaN: in the result, in an array
+     (or added into one in place, where NumPy raises a `TypeError`), or anywhere earlier in the
+     call (`v > x ** 0.5` compares by the real part in NumPy and with NaN in C++; on a
+     mismatch the verifier reruns Python with every `a ** b` watched); or an int left 64 bits, where
      Python's int grows and C++ raises `OverflowError`.
    - **edge**: linear algebra (matrix products, `np.linalg`) on inf, NaN, subnormal or
      near-overflow inputs, where NumPy's BLAS/LAPACK and Eigen add in different orders, so
@@ -629,16 +637,19 @@ and checks them against Python on the verifier's inputs (non-square, empty and l
 and every other batch the stress profile's inf, NaN and extreme values). A crash, a compile
 error, a warning or a mismatch is isolated to its function and shrunk automatically, by
 deleting and simplifying the program while it still fails the same way, to a minimal
-reproducer. CI runs it on every push with a fixed seed for 3 minutes, and nightly with a new
-seed for 30 minutes ([`fuzz.yml`](https://github.com/SunnyAlexV/qtrans/blob/main/.github/workflows/fuzz.yml));
-a nightly failure uploads the reproducer with the run.
+reproducer. CI runs it on every push on the same 500 programs (seed 1, `--batches 25`), and
+by hand (Actions → fuzz → Run workflow) on new ones, a new seed for 30 minutes
+([`fuzz.yml`](https://github.com/SunnyAlexV/qtrans/blob/main/.github/workflows/fuzz.yml)); a
+failure uploads the reproducer with the run. A long run on new seeds goes before each release.
 
-On this release, `python -m tools.fuzz --seed 9 --minutes 20` (on the reference platform)
-generated 1,140 functions: 780 translated and checked on 31,200 inputs with no failure, and 360
-refused with a reason. Most refusals are calls to a function that was itself refused, or two
-calls in one statement that both change an argument (Python runs them left to right; C++ leaves
-the order unspecified). The finished development runs before it (seeds 1, 2, 3, 6 and 8: 1,780 functions, 1,445
-translated, 57,762 inputs) found 12 failures, which come down to the 8 below.
+On this release, `python -m tools.fuzz --seed 107 --minutes 40` (on the reference platform)
+generated 2,400 functions: 1,519 translated and checked on 60,760 inputs with no failure, and
+881 refused with a reason. Most refusals are calls to a function that was itself refused, or
+two calls in one statement that both change an argument (Python runs them left to right; C++
+leaves the order unspecified). The CI check (`--seed 1 --batches 25`) is clean too. The
+development runs before them (seeds 1 to 9 and 101 to 106, and CI's first run: 13,660
+functions, 9,614 translated, 384,522 inputs) found 22 failures, which come down to the 12 items
+below.
 
 What it found, each fixed and kept as a test
 ([`tests/data/fuzz_regressions.py`](https://github.com/SunnyAlexV/qtrans/blob/main/tests/data/fuzz_regressions.py)):
@@ -666,9 +677,32 @@ What it found, each fixed and kept as a test
   column 3). The C++ gave column 3. Refused, with `.copy()` as the hint; every other
   overlapping assignment NumPy gets right (`v[1:] = v[:-1]`, `A[0:2] = A[1:3]`, `A[:] = A.T`)
   and the C++ agrees.
+- **`v[::-1] = v`** gave `[0, 1, 2, 1, 0]` for `np.arange(5.)`, not `[4, 3, 2, 1, 0]`.
+  NumPy computes the right side before storing it; the C++ asked Eigen for a temporary with
+  `.eval()`, which makes one of an expression but returns a plain array itself, so the store
+  read elements it had already overwritten. A plain array on the right is now copied.
+- **A parameter set but never read in the C++**: `p = 0.0; p = p` (`p = p` becomes a
+  comment, as Clang warns on a self-assignment), or `p` read only in an `if False:` branch
+  and assigned after it. GCC 13 warns (`-Wunused-but-set-parameter`); such parameters are
+  `[[maybe_unused]]` now.
+- **The verifier compared a complex result as if it were real.** Python's `x ** 0.5` with
+  `x < 0` is complex; put in an array, the verifier's float64 copy of Python's result dropped
+  the imaginary part (with a `ComplexWarning`) and compared the real part with the C++'s NaN.
+  Added into an array in place, NumPy raises `UFuncTypeError`, which the verifier didn't
+  recognise as a `TypeError`. And in `v[v > x ** 0.5]` no complex value reaches the result
+  at all (NumPy compares by the real part, C++ with NaN). All three are the documented
+  complex-power difference now.
+- **Two verifier rules were too strict** for linear algebra whose answer rounding decides:
+  `np.linalg.solve(A, A) / 0` (Eigen solves exactly, NumPy leaves `1e-16` off the diagonal:
+  NaN against `-inf`), and `np.linalg.inv(np.exp(P))` on a matrix singular to working
+  precision (LAPACK returned, Eigen met an exactly-zero pivot). Both are `ill-cond` now, by
+  the rules above.
 - **Which of two errors is raised** when one expression breaks two checks: documented under
   [Differences kept by design](#differences-kept-by-design), and counted as `known` only when
-  both sides raise.
+  both sides raise. (GCC evaluates a call's arguments right to left and raises the other
+  error; Clang goes left to right and raises Python's.) The other error can be one C++ meets
+  only because of an IEEE-754 difference: `int(math.log(0.0))` is `int(-inf)`, an
+  `OverflowError`, where Python already raised `ValueError` at the `log`.
 
 ## Platforms
 
@@ -827,7 +861,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               378 tests: generated text, refusals, compiled semantics, every example,
+tests/               380 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`)

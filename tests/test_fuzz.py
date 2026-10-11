@@ -16,8 +16,21 @@ def test_fuzzer_findings_stay_fixed(tmp_path):
     assert not r.translation.report.rejected, [(f.name, f.reason) for f in r.translation.report.rejected]
     assert r.warnings == [], r.warnings
     assert r.ok, r.to_text()
+    by_name = {f.name: f for f in r.functions}
+    given = lambda name: [c for c in by_name[name].cases if c.source == "given"]  # noqa: E731
+    # a complex Python value is the documented difference, a real one is compared
+    assert [c.outcome for c in given("complex_power_in_an_array")] == ["known", "match"]
+    assert [c.outcome for c in given("complex_power_in_place")] == ["known", "match"]
+    assert [c.outcome for c in given("solve_then_divide_by_zero")] in (["illcond"], ["match"])
+    assert [c.outcome for c in given("inv_of_a_numerically_singular_matrix")] in (["illcond"], ["match"])
+    for c in given("broadcast_error_and_overflow"):
+        assert c.py[0] == "exc" and c.cpp[0] == "exc" and c.outcome in ("known", "match"), (c.py, c.cpp)
+    assert [c.outcome for c in given("complex_power_absorbed_by_a_comparison")] == ["known", "match"]
     two = [c for f in r.functions if f.name == "two_errors" for c in f.cases if c.source == "given"][0]
-    assert two.py[0] == "exc" and two.cpp[0] == "exc" and two.outcome == "known" and two.order
+    # both sides reject it; which error comes first is the compiler's choice: GCC (right to
+    # left) raises the other one, `known` with the order flag; Clang (left to right) Python's
+    assert two.py[0] == "exc" and two.cpp[0] == "exc"
+    assert (two.outcome == "known" and two.order) or two.outcome == "match", (two.outcome, two.py, two.cpp)
 
 
 def test_unused_names_are_marked_not_warned():
@@ -26,6 +39,9 @@ def test_unused_names_are_marked_not_warned():
     assert "double param_only_assigned([[maybe_unused]] long long p)" in h
     assert "param_in_dead_branch(double p, [[maybe_unused]] double q)" in h
     assert '#include "qtrans_arrays.hpp"' in h
+    assert "param_set_then_self_assigned([[maybe_unused]] double p)" in h
+    assert "param_read_only_in_dead_code_then_set([[maybe_unused]] double p)" in h
+    assert "[[maybe_unused]] double x = 1.0;" in h
 
 
 def test_views_into_an_in_place_parameter_are_refused():
@@ -130,3 +146,36 @@ def test_shrinker_finds_a_minimal_failure(tmp_path):
         check.translate_only = real
     assert b.shrunk is not None and "PLANT(" in b.shrunk
     assert len(b.shrunk.splitlines()) <= 2, b.shrunk  # def + return PLANT(...)
+
+
+def test_singular_probe_sees_only_numerically_singular_matrices():
+    """The probe behind "one side raised Singular matrix, the other returned": true only when a
+    matrix the Python code gave np.linalg to factor was singular to working precision."""
+    import numpy as np
+    from qtrans import verify as V
+    from qtrans.translator import Param, Signature
+    from qtrans.types import FLOAT, MAT
+
+    def f(A):
+        np.linalg.inv(A)
+        return 0.0
+    sig = Signature("f", "f", [Param("A", "A", MAT, None, "cref")], FLOAT, 1, None)
+    case = V.Case("f", (np.eye(3),), "")
+    assert not V.python_near_singular(f, case, sig)
+    case = V.Case("f", (np.array([[1.0, 2.0], [2.0, 4.0 + 1e-17]]),), "")
+    assert V.python_near_singular(f, case, sig)
+    case = V.Case("f", (np.array([[1e-300, 0.0], [0.0, 1e-300]]),), "")
+    assert not V.python_near_singular(f, case, sig)  # tiny but perfectly conditioned
+
+
+def test_complex_probe_sees_only_powers_that_went_complex():
+    from qtrans import verify as V
+    from qtrans.translator import Param, Signature
+    from qtrans.types import FLOAT, VEC
+    mod = V.load_module(DATA / "fuzz_regressions.py")
+    fn = mod.complex_power_absorbed_by_a_comparison
+    sig = Signature(fn.__name__, fn.__name__, [Param("x", "x", FLOAT, None), Param("v", "v", VEC, None, "cref")],
+                    VEC, 1, None)
+    import numpy as np
+    assert V.python_went_complex(fn, (-1.0, np.array([1.0, 2.0])), sig)
+    assert not V.python_went_complex(fn, (4.0, np.array([1.0, 2.0])), sig)

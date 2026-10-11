@@ -1,20 +1,20 @@
 # The program fuzzer (tools/fuzz): random typed Python programs in qtrans's subset, translated,
 # compiled and checked against Python; a failure is shrunk to a minimal reproducer, which is
 # uploaded with the run (Summary page -> Artifacts -> fuzz-report).
-#   on every push: a fixed seed for 3 minutes, the same programs each time (a regression check)
-#   nightly:       a new seed for 30 minutes (new programs; GitHub emails when it fails)
+#   on every push: a fixed seed, 25 batches (500 programs), the same ones each time on any
+#                  runner (a regression check; about 4 minutes)
+#   by hand (Actions -> fuzz -> Run workflow): a new seed for 30 minutes, new programs; run
+#   before each release, after the translator changes (a long local run does the same job)
 name: fuzz
 
 on:
   push:
   pull_request:
-  schedule:
-    - cron: "17 2 * * *"
   workflow_dispatch:
 
 jobs:
   fuzz:
-    name: ${{ github.event_name == 'schedule' && 'nightly (new seed, 30 min)' || 'fixed seed (3 min)' }}
+    name: ${{ github.event_name == 'workflow_dispatch' && 'new seed (30 min)' || 'fixed seed (500 programs)' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -36,10 +36,10 @@ jobs:
 
       - name: Fuzz
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python -m tools.fuzz --seed ${{ github.run_number }}000 --minutes 30 --shrink-minutes 8 --out fuzz_out
           else
-            python -m tools.fuzz --seed 1 --minutes 3 --shrink-minutes 4 --out fuzz_out
+            python -m tools.fuzz --seed 1 --batches 25 --minutes 20 --shrink-minutes 4 --out fuzz_out
           fi
 
       - name: Upload the report and reproducers

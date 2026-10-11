@@ -1010,9 +1010,14 @@ def _outcome(py, cpp, t, rtol, atol, sens_fn=None, flip_fn=None):
     if py[0] == "exc" and cpp[0] == "exc" and isinstance(py[1], (ValueError, IndexError, ZeroDivisionError)) \
             and isinstance(cpp[1], (ValueError, IndexError, ArithmeticError)):
         return "known"  # two broken checks in one expression, reported in a different order (see verify.classify)
-    if flip_fn is not None and (py[0] == "ok") != (cpp[0] == "ok") \
-            and isinstance(py[1] if py[0] == "exc" else cpp[1], ValueError) and flip_fn():
+    err = py[1] if py[0] == "exc" else cpp[1]
+    if flip_fn is not None and (py[0] == "ok") != (cpp[0] == "ok") and isinstance(err, ValueError) \
+            and flip_fn("ingular" in str(err) or "positive definite" in str(err)):
         return "illcond"  # a singular matrix on one side only, and Python's own verdict is a knife edge
+    if py[0] == "ok" and V._has_complex(py[1]):
+        # x ** y with x < 0 and fractional y: Python's value went complex, C++'s is NaN
+        # (verify's documented difference); never compared as if it were real
+        return "known"
     case = V.Case("", (), "")
     case.py = ("ok", py[1]) if py[0] == "ok" else ("exc", V._py_category(py[1]), str(py[1]))
     case.cpp = ("ok", cpp[1]) if cpp[0] == "ok" else ("exc", type(cpp[1]).__name__, str(cpp[1]))
@@ -1135,12 +1140,13 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
                 return V.python_sensitivity(fn, c, sig, V.output_type(sig), nudge_rng,
                                             normwise_too=name in normwise)
 
-            def flips(args=args):
+            def flips(singular, args=args):
                 if name not in linalg:
                     return False
                 c = V.Case(name, tuple(args), "")
                 c.py = V.run_python(fn, c.args, sig)
-                return V.python_flips(fn, c, sig, nudge_rng, normwise_too=name in normwise)
+                return V.python_flips(fn, c, sig, nudge_rng, normwise_too=name in normwise) \
+                    or (singular and V.python_near_singular(fn, c, sig))
             variants = [_fresh(args, types)]
             if has_obj:
                 variants.append([_to_compiled(a, t, compiled_classes) for a, t in zip(_fresh(args, types), types)])
@@ -1152,6 +1158,8 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
                 if k == 0 and o != "mismatch" and not _same_trace(ptrace, _trace(bargs, bsnap), f_rtol, f_atol):
                     o = "mismatch"  # changed in place where Python re-points, or the other way round
                     cpp = ("ok", ("arrays held by the objects passed in:", _trace(bargs, bsnap), "Python:", ptrace))
+                if o == "mismatch" and V.python_went_complex(fn, _fresh(args, types), sig):
+                    o = "known"  # a ** b went complex in Python, NaN in C++ (see verify)
                 if o == "mismatch":
                     fc.add("mismatch", (tuple(args), py[1], cpp[1]) + (("compiled objects",) if k else ()))
                     worst = None

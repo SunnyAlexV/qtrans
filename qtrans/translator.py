@@ -22,7 +22,7 @@ from . import library as lib
 from .errors import Unsupported
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
-from .functions import FunctionTranslator, is_docstring, subscript_root, target_leaves, view_root
+from .functions import FunctionTranslator, is_docstring, python_reads, subscript_root, target_leaves, view_root
 from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, assignable, is_array)
@@ -128,10 +128,16 @@ def _used_params(fdef, body_lines, sig) -> set:
     """Parameters the C++ body uses: read in Python, and still named in the generated body
     (comments aside). The others get [[maybe_unused]]: a parameter only assigned, or used
     only in code the translation dropped (the else of `if True:`), would draw a warning."""
-    loads = {x.id for x in ast.walk(fdef) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+    loads = python_reads(fdef)
     loads |= {x.target.id for x in ast.walk(fdef) if isinstance(x, ast.AugAssign) and isinstance(x.target, ast.Name)}  # a *= k
-    text = "\n".join(re.sub(r"//.*", "", line) for line in body_lines)
-    return {p.name for p in sig.params if p.name in loads and re.search(rf"\b{re.escape(p.cpp)}\b", text)}
+    code = [re.sub(r"//.*", "", line) for line in body_lines]
+
+    def read_in_cpp(ident):
+        # every mention but the left side of a plain `p = ...;` (a read only in dropped code,
+        # the `if False:` branch, leaves just the writes: -Wunused-but-set-parameter)
+        word, write = re.compile(rf"\b{re.escape(ident)}\b"), re.compile(rf"^\s*{re.escape(ident)} = ")
+        return sum(len(word.findall(line)) - (1 if write.match(line) else 0) for line in code) > 0
+    return {p.name for p in sig.params if p.name in loads and read_in_cpp(p.cpp)}
 
 
 class ModuleTranslator:

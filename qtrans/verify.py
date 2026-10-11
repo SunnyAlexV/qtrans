@@ -502,10 +502,19 @@ def _py_category(exc):
                       (FloatingPointError, "FloatingPointError"), (ArithmeticError, "ArithmeticError"),
                       (ValueError, "ValueError"), (IndexError, "IndexError"),
                       (AssertionError, "AssertionError"),
-                      (NotImplementedError, "NotImplementedError"), (RuntimeError, "RuntimeError")):
+                      (NotImplementedError, "NotImplementedError"), (RuntimeError, "RuntimeError"),
+                      # NumPy's UFuncTypeError (a complex result cast back into a float array)
+                      # is a TypeError: its name is NumPy's detail
+                      (TypeError, "TypeError")):
         if isinstance(exc, cls):
             return name
     return type(exc).__name__
+
+
+def _has_complex(v):
+    if isinstance(v, (list, tuple)):
+        return any(_has_complex(x) for x in v)
+    return isinstance(v, (complex, np.complexfloating)) or (isinstance(v, np.ndarray) and np.iscomplexobj(v))
 
 
 def _py_value(v, t):
@@ -525,6 +534,10 @@ def _py_value(v, t):
         return int(v)
     if isinstance(t, TupleType):
         return tuple(_py_value(x, et) for x, et in zip(v, t.elts))
+    if _has_complex(v):
+        # x ** y with x < 0 and fractional y made Python's value complex; float() and a
+        # float64 copy would drop the imaginary part silently (a ComplexWarning)
+        raise TypeError("Python returned a complex number")
     if isinstance(t, ArrayType):
         a = np.array(v, dtype=np.float64, copy=True)
         if a.ndim != t.rank:
@@ -569,6 +582,136 @@ def run_python(fn, args, sig, limit=None):
         if r is not None:
             return r
     return _run_python(fn, args, sig)
+
+
+def _probe_singular(fn, args, sig):
+    """("ok", True) when a matrix the call gave np.linalg.inv / solve was singular to working
+    precision (smallest singular value <= n * eps * the largest), or one it gave
+    np.linalg.cholesky was not positive definite to working precision (smallest eigenvalue
+    <= n * eps * the largest |eigenvalue|). LU on such a matrix meets an exactly-zero pivot,
+    or Cholesky a non-positive one, or not, as rounding decides: LAPACK and Eigen, adding in
+    different orders, can decide differently, and neither is wrong."""
+    import numpy.linalg as la
+    found = []
+    real = {name: getattr(la, name) for name in ("inv", "solve", "cholesky")}
+
+    def edge(a, definite):
+        m = np.asarray(a, dtype=np.float64)
+        if m.ndim != 2 or m.shape[0] != m.shape[1] or m.size == 0 or not np.isfinite(m).all():
+            return False
+        tol = m.shape[0] * np.finfo(np.float64).eps
+        if definite:
+            w = np.linalg.eigvalsh(m)
+            return bool(w[0] <= tol * max(np.max(np.abs(w)), np.finfo(np.float64).tiny))
+        sv = np.linalg.svd(m, compute_uv=False)
+        return bool(sv[-1] <= tol * sv[0])
+
+    def wrap(name):
+        def probe(a, *rest, **kw):
+            try:
+                found.append(edge(a, name == "cholesky"))
+            except Exception:  # noqa: BLE001 - the probe never changes what the call does
+                pass
+            return real[name](a, *rest, **kw)
+        return probe
+
+    for name in real:
+        setattr(la, name, wrap(name))
+    try:
+        _run_python(fn, args, sig)
+    finally:
+        for name, f in real.items():
+            setattr(la, name, f)
+    return ("ok", any(found))
+
+
+class _PowProbe(ast.NodeTransformer):
+    """a ** b -> __qtrans_pow__(a, b), and x **= b -> x = __qtrans_pow__(x, b) for a name x."""
+
+    def visit_BinOp(self, n):
+        self.generic_visit(n)
+        if isinstance(n.op, ast.Pow):
+            return ast.copy_location(ast.Call(ast.Name("__qtrans_pow__", ast.Load()), [n.left, n.right], []), n)
+        return n
+
+    def visit_AugAssign(self, n):
+        self.generic_visit(n)
+        if isinstance(n.op, ast.Pow) and isinstance(n.target, ast.Name):
+            call = ast.Call(ast.Name("__qtrans_pow__", ast.Load()), [ast.Name(n.target.id, ast.Load()), n.value], [])
+            return ast.copy_location(ast.Assign([n.target], call), n)
+        return n
+
+
+_POW_MODULES: dict = {}
+
+
+def _probe_complex(fn, args, sig):
+    """("ok", True) when a ** b anywhere in the call (fn's module, its other functions included)
+    gave a complex number: a Python float raised to a non-integer power with a negative base.
+    From there Python computes with complex numbers and C++, like np.float64, with NaN (the
+    documented complex-power difference), even when no complex value reaches the result
+    (`v > x ** 0.5` compares by the real part)."""
+    try:
+        path = inspect.getsourcefile(fn)
+        src = Path(path).read_text(encoding="utf-8")
+    except (TypeError, OSError):
+        return ("ok", False)
+    went = []
+
+    def pow_(a, b):
+        r = a ** b
+        if isinstance(r, (complex, np.complexfloating)) or (isinstance(r, np.ndarray) and np.iscomplexobj(r)):
+            went.append(True)
+        return r
+    key = (path, hash(src))  # the shrinker rewrites one file over and over
+    if key not in _POW_MODULES:
+        tree = ast.fix_missing_locations(_PowProbe().visit(ast.parse(src, path)))
+        ns = {"__name__": f"_qtrans_pow_probe_{uuid.uuid4().hex[:8]}", "__file__": path}
+        ns["__qtrans_pow__"] = lambda a, b: ns["__qtrans_pow_impl__"](a, b)
+        try:
+            exec(compile(tree, path, "exec"), ns)  # noqa: S102 - the user's own module, as load_module does
+        except Exception:  # noqa: BLE001 - the probe never changes a verdict when it can't run
+            return ("ok", False)
+        _POW_MODULES[key] = ns
+    ns = _POW_MODULES[key]
+    ns["__qtrans_pow_impl__"] = pow_
+    try:
+        probe = _resolve(_Namespace(ns), fn.__qualname__)
+    except AttributeError:
+        return ("ok", False)
+    _run_python(probe, args, sig)
+    return ("ok", bool(went))
+
+
+class _Namespace:
+    def __init__(self, d):
+        self.__dict__.update(d)
+
+
+def python_went_complex(fn, args, sig) -> bool:
+    """Did a ** b go complex during this call? See _probe_complex (run in the worker, with the
+    time limit, when there is one)."""
+    r = _WORKER.call(fn, args, sig, PYTHON_CASE_SECONDS, mode="complex") if _WORKER is not None else None
+    if r is None:
+        r = _probe_complex(fn, args, sig)
+    return r[0] == "ok" and r[1] is True
+
+
+def _singular_verdict(case) -> bool:
+    """The side that raised said "singular" or "not positive definite" (the C++ driver reports
+    shape errors as ShapeError, so its ValueError is a LinAlgError)."""
+    if case.py[0] == "exc":
+        return "ingular" in case.py[2] or "positive definite" in case.py[2]
+    return case.cpp[0] == "exc" and case.cpp[1] == "ValueError"
+
+
+def python_near_singular(fn, case, sig) -> bool:
+    """Was a matrix this call factored singular (or, for Cholesky, semi-definite) to working
+    precision? See _probe_singular; run in the worker, with the time limit, when there is one."""
+    r = _WORKER.call(fn, case.args, sig, PYTHON_CASE_SECONDS, mode="singular") if _WORKER is not None else None
+    if r is None:
+        r = _probe_singular(fn, case.args, sig)
+    return r[0] == "ok" and r[1] is True
 
 
 def _run_python(fn, args, sig):
@@ -638,8 +781,10 @@ def _worker_main(conn, specs, path, class_names):
         msg = conn.recv()
         if msg is None:
             return
-        key, fname, args, sig = msg
-        r = _run_python(_resolve(mods[key], fname), args, sig)
+        key, fname, args, sig, mode = msg
+        fn = _resolve(mods[key], fname)
+        r = (_probe_singular(fn, args, sig) if mode == "singular" else
+             _probe_complex(fn, args, sig) if mode == "complex" else _run_python(fn, args, sig))
         try:
             conn.send(r)
         except Exception as e:  # noqa: BLE001 - a result that can't be pickled
@@ -687,14 +832,14 @@ class PythonWorker:
     def _alive(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def call(self, fn, args, sig, limit):
+    def call(self, fn, args, sig, limit, mode=None):
         where = self.funcs.get(id(fn))
         if where is None:
             return None
         if not self._alive():
             self._start()
         try:
-            self.conn.send((where[0], where[1], args, sig))
+            self.conn.send((where[0], where[1], args, sig, mode))
         except Exception:  # noqa: BLE001 - arguments that can't be pickled: run here
             return None
         if self.conn.poll(limit + (30.0 if self.restarts == 0 and not getattr(self, "_warm", False) else 0.0)):
@@ -1126,6 +1271,35 @@ def _compare_arrays(p, c, rtol, atol):
     return (eq, rel, ulps)
 
 
+def _nonfinite_ties(p, c, rtol, atol) -> bool:
+    """p and c agree except at elements that are non-finite on both sides (inf vs NaN, or
+    inf vs -inf), of which there is at least one."""
+    if isinstance(p, tuple) or isinstance(c, tuple):
+        if not (isinstance(p, tuple) and isinstance(c, tuple) and len(p) == len(c)):
+            return False
+        ties = [_nonfinite_ties(a, b, rtol, atol) for a, b in zip(p, c)]
+        return any(ties) and all(t or _compare_values_loose(a, b, rtol, atol) for t, a, b in zip(ties, p, c))
+    try:
+        pa, ca = np.asarray(p, dtype=np.float64), np.asarray(c, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    if pa.shape != ca.shape:
+        return False
+    both = ~np.isfinite(pa) & ~np.isfinite(ca)
+    differ = both & ~((pa == ca) | (np.isnan(pa) & np.isnan(ca)))
+    if not differ.any():
+        return False
+    return _compare_arrays(np.where(both, 0.0, pa).reshape(-1), np.where(both, 0.0, ca).reshape(-1), rtol, atol)[0]
+
+
+def _compare_values_loose(a, b, rtol, atol) -> bool:
+    try:
+        pa, ca = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    except (TypeError, ValueError):
+        return a == b
+    return pa.shape == ca.shape and _compare_arrays(pa.reshape(-1), ca.reshape(-1), rtol, atol)[0]
+
+
 def classify(case: Case, ret, rtol, atol):
     py, cpp = case.py, case.cpp
     if py[0] == "ok" and cpp[0] == "ok":
@@ -1163,7 +1337,10 @@ def classify(case: Case, ret, rtol, atol):
 # The errors that reject an input (a shape, an index, a singular matrix, a division by zero),
 # as opposed to a wrong value: when an input breaks two of these checks, which one is raised
 # first may differ (see classify).
-_ARG_ERRORS = {"ValueError", "IndexError", "ShapeError", "LinAlgError", "ZeroDivisionError", "ArithmeticError"}
+# OverflowError: int(x) of an inf the C++ carried on with (math.log(0.0) is -inf in C++, a
+# ValueError in Python), raised before Python's own first error in another argument
+_ARG_ERRORS = {"ValueError", "IndexError", "ShapeError", "LinAlgError", "ZeroDivisionError", "ArithmeticError",
+               "OverflowError"}
 
 
 def _ulps(v, k):
@@ -1548,6 +1725,10 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         sig = project.modules[fc.module].signatures[fc.name]
         c.cpp = _parse_cpp_line(outline, output_type(sig))
         classify(c, output_type(sig), fc.rtol, fc.atol)
+        if c.outcome == "mismatch" and python_went_complex(getattr(pymods[fc.module], fc.name), c.args, sig):
+            # x ** y with x < 0 and fractional y went complex in Python and NaN in C++ before
+            # this result: the documented difference, wherever it shows (or doesn't) in the value
+            c.outcome = "known"
         if c.outcome == "mismatch" and c.py[0] == "ok" and c.cpp[0] == "ok":
             c.sensitivity = python_sensitivity(getattr(pymods[fc.module], fc.name), c, sig, output_type(sig),
                                                nudge_rng, normwise_too=fc.name in normwise)
@@ -1557,9 +1738,18 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 and "ValueError" in (c.py[1] if c.py[0] == "exc" else c.cpp[1]):
             # one side found the matrix singular (LinAlgError is a ValueError): ill-conditioned
             # when Python's own verdict changes under a rounding-sized nudge
-            if python_flips(getattr(pymods[fc.module], fc.name), c, sig, nudge_rng, normwise_too=fc.name in normwise):
+            fn = getattr(pymods[fc.module], fc.name)
+            if python_flips(fn, c, sig, nudge_rng, normwise_too=fc.name in normwise) \
+                    or (_singular_verdict(c) and python_near_singular(fn, c, sig)):
                 c.sensitivity = math.inf
                 c.outcome = "illcond"
+        if c.outcome == "mismatch" and fc.name in linalg and c.py[0] == "ok" and c.cpp[0] == "ok" \
+                and _nonfinite_ties(c.py[1], c.cpp[1], fc.rtol, fc.atol):
+            # differing elements are inf / -inf / NaN on both sides, all else agrees: a value that
+            # is zero up to LAPACK's or Eigen's rounding (1e-16 vs exactly 0) was divided by
+            # zero, so its sign decided the result. Rounding decides it: ill-conditioned.
+            c.sensitivity = math.inf
+            c.outcome = "illcond"
         if c.outcome == "mismatch" and fc.name in linalg and edge_inputs(c.args):
             # matrix products / LAPACK on inf, NaN, subnormals or values near overflow: NumPy's
             # BLAS and Eigen add in different orders, so inf - inf -> NaN, or an intermediate
