@@ -187,7 +187,8 @@ def test_float_to_int_never_undefined(report):
     limitation and raises rather than returning garbage."""
     f = next(f for f in report.functions if f.name == "huge_round")
     got = {c.args[0] if c.args[0] == c.args[0] else "nan": c.cpp for c in f.cases if c.source == "given"}
-    assert got[1e300] == ("exc", "OverflowError") and got[-1e19] == ("exc", "OverflowError")
+    # beyond 64 bits: Python returns a big int, C++ raises OverflowError (reported as IntOverflow)
+    assert got[1e300] == ("exc", "IntOverflow") and got[-1e19] == ("exc", "IntOverflow")
     assert got[float("inf")] == ("exc", "OverflowError") and got["nan"] == ("exc", "ValueError")
 
 

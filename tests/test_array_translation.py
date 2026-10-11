@@ -75,7 +75,8 @@ def test_two_dimensional_slice():
 
 def test_shape_entries():
     h = cpp("def f(A: Mat) -> int:\n    return A.shape[0] * A.shape[1]\n")
-    assert "A.rows() * A.cols()" in h
+    # each size is below 2**45 (address space), but a product of two could leave 64 bits: checked
+    assert "qt::imul(A.rows(), A.cols())" in h
 
 
 # --- broadcasting and products --------------------------------------------------------------

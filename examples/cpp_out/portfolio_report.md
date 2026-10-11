@@ -17,7 +17,7 @@
 
 These only matter on inputs where Python would raise an exception or overflow.
 
-- int arithmetic uses 64-bit long long; Python ints are unbounded, so results beyond ±9.2e18 would differ (applies to: sample_cov)
+- int arithmetic that could leave 64 bits is checked: where Python's unbounded int would exceed ±9.2e18, C++ raises OverflowError (applies to: sample_cov)
 - division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: frontier_weights)
 
 ## Module-level notes

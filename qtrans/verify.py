@@ -55,6 +55,8 @@ CPP_EXC_MATCHES = {
     "RuntimeError": {"RuntimeError", "NotImplementedError", "Exception"},
     "IndexError": {"IndexError"},
     "TypeError": {"TypeError"},
+    # an int result beyond 64 bits (Python returns a big int there; see classify)
+    "IntOverflow": {"OverflowError"},
     # Eigen's internal shape / bounds checks can't tell NumPy's ValueError and IndexError apart
     "ShapeError": {"ValueError", "IndexError"},
 }
@@ -139,6 +141,8 @@ class FunctionCheck:
     atol: float = 0.0
     key: str = ""      # how the driver names it ("module:function" in a project)
     module: str = ""
+    shape_plans: list = field(default_factory=list)  # the non-square shapes it was tried on
+    timeouts: int = 0  # cases left out because Python didn't finish one in time
 
     @property
     def max_rel_err(self):
@@ -200,6 +204,17 @@ class VerifyReport:
         lines += ["", "  max rel err / max ULP exclude results within atol of each other (values near zero)",
                   "  and ill-conditioned cases; for arrays, rel err is normwise and ULPs count elements",
                   "  >= 1% of the array's largest value."]
+        for f in self.functions:
+            if f.timeouts:
+                lines += ["", f"  {f.name}: {f.timeouts} case(s) left out: Python didn't finish a call within "
+                              f"{PYTHON_CASE_SECONDS:g} s (it hung), so there is nothing to compare; after a hang on",
+                          "  inf / NaN / near-overflow inputs, its other such cases are skipped"]
+        edge = [c for f in self.functions for c in f.cases if c.outcome == "edge"]
+        if edge:
+            c = edge[0]
+            lines += ["", f"  'edge': {len(edge)} case(s) of linear algebra on inf, NaN, subnormal or near-overflow inputs,",
+                      "  where NumPy's BLAS/LAPACK and Eigen add in different orders (inf - inf -> NaN on one side,",
+                      f"  an intermediate overflow on the other). Not counted as mismatches. First: {c.func}"]
         ill = [c for f in self.functions for c in f.cases if c.outcome == "illcond"]
         if ill:
             worst = max(ill, key=lambda c: c.sensitivity)
@@ -207,10 +222,18 @@ class VerifyReport:
                       f"  value; for functions using np.linalg, also of a matrix's largest value) moves Python's",
                       f"  own answer by up to {worst.sensitivity:.1e} (relative); C++ agreed within 100x that."]
         known = [c for f in self.functions for c in f.cases if c.outcome == "known"]
-        if known:
-            c = known[0]
+        ints = [c for c in known if c.cpp[0] == "exc" and c.cpp[1] == "IntOverflow"]
+        floats = [c for c in known if c not in ints]
+        if floats:
+            c = floats[0]
             lines += ["", f"  'known' = Python raised a float error where IEEE-754 C++ returns inf/NaN,",
-                      f"  e.g. {c.func}{c.args}: Python {c.py[1]} ({c.py[2]}), C++ {c.cpp[1]}"]
+                      f"  e.g. {c.func}{c.args}: Python {c.py[1]} ({c.py[2] if len(c.py) > 2 else ''}), "
+                      f"C++ {c.cpp[1]}"]
+        if ints:
+            c = ints[0]
+            py = f"{c.py[1]}" if c.py[0] == "ok" else f"{c.py[1]} ({c.py[2]})"
+            lines += ["", f"  'known' also counts {len(ints)} case(s) where an int left 64 bits: Python's int grows,",
+                      f"  C++ raises OverflowError, e.g. {c.func}{c.args}: Python {py}"]
         if self.warnings:
             lines += ["", "  Compiler warnings in generated code:"] + [f"    {w}" for w in self.warnings[:10]]
         lines += ["", "  RESULT: " + ("PASS (no mismatches)" if self.ok else f"FAIL ({len(self.mismatches)} mismatches)")]
@@ -219,6 +242,9 @@ class VerifyReport:
 
 # --- input generation -------------------------------------------------------------------
 _STRINGS = ["", "x"]  # replaced per module by the string literals it contains
+_STRESS = False       # profile "stress": extreme floats and longer arrays (see random_value)
+_EXTREME = [math.inf, -math.inf, math.nan, 1e308, -1e308, 5e-324, -5e-324, 2.2250738585072014e-308,
+            0.0, -0.0, 1e-300, 1e300, 1e-16, 1.0 + 2.0 ** -52, 0.49999999999999994, 2.5, -2.5]
 _CLASSES = {}         # name -> (ClassInfo, the Python class), per module
 _INIT_PARAMS = {}     # plain class -> its __init__ parameters (how random objects are built)
 
@@ -235,10 +261,11 @@ def _is_object(v) -> bool:
             or type(v).__name__ in _CLASSES)
 
 
-def random_value(rng, t, n=3):
+def random_value(rng, t, n=3, shape=None):
     """A random argument of type t. Arrays use size n (Vec of n, Mat of n x n) so that the
-    arguments of one call have compatible shapes. Strings come from the module's own string
-    literals (plus "" and one that matches none), so `if stance == "Long only"` branches run."""
+    arguments of one call have compatible shapes, unless `shape` is given (see shape_plans).
+    Strings come from the module's own string literals (plus "" and one that matches none), so
+    `if stance == "Long only"` branches run."""
     if t == STR:
         return str(rng.choice(_STRINGS))
     if isinstance(t, StructType):
@@ -256,14 +283,18 @@ def random_value(rng, t, n=3):
                 continue
         raise _CantBuild(t.name)
     if isinstance(t, OptionalType):
-        return None if rng.random() < 0.25 else random_value(rng, t.inner, n)
+        return None if rng.random() < 0.25 else random_value(rng, t.inner, n, shape)
     if t == RNG:
         return int(rng.integers(0, 2 ** 31))  # a seed: each side builds its own generator from it
     if isinstance(t, ArrayType):
-        shape = (n,) if t.rank == 1 else (n, n)
+        shape = shape if shape is not None else (n,) if t.rank == 1 else (n, n)
         return np.array([random_value(rng, FLOAT) for _ in range(int(np.prod(shape)))],
                         dtype=np.float64).reshape(shape)
     if t == FLOAT:
+        if _STRESS and rng.random() < 0.3:
+            # infinities, NaN, the largest and smallest doubles, subnormals, signed zeros, the
+            # doubles next to 1 and 0.5, and halves (where rounding ties live)
+            return float(_EXTREME[int(rng.integers(len(_EXTREME)))])
         u = rng.random()
         if u < 0.70:
             return float(10 ** rng.uniform(-2, 2))      # positive, spread over 4 decades
@@ -277,6 +308,80 @@ def random_value(rng, t, n=3):
     if t == BOOL:
         return bool(rng.random() < 0.5)
     raise TypeError(t)
+
+
+# --- rectangular and empty arrays ---------------------------------------------------------------------
+_SLOT_CHOICES = {1: ("n", "m"), 2: ("nn", "nm", "mn", "mm")}
+
+
+def _rank_of(t):
+    inner = t.inner if isinstance(t, OptionalType) else t
+    return inner.rank if isinstance(inner, ArrayType) else None
+
+
+def shape_plans(fn, sig, rng, limit=12, max_combos=243):
+    """Which non-square shapes the function accepts. Square cases (every Vec of n, every Mat
+    n x n) can't catch a transposed dimension, so each array parameter is also tried as length
+    n or m (a Vec) and n x n, n x m or m x n (a Mat), with n = 3, m = 4; an assignment is kept
+    when Python runs the function on it. Python is the judge of which shapes make sense.
+    -> [plan], each plan a tuple with an entry per parameter ("n", "nm", ... or None)"""
+    import itertools
+    slots = [i for i, p in enumerate(sig.params) if _rank_of(p.type)]
+    if not slots:
+        return []
+    combos = list(itertools.product(*[_SLOT_CHOICES[_rank_of(sig.params[i].type)] for i in slots]))
+    combos = [c for c in combos if any(x in ("m", "nm", "mn") for x in c)]  # not square (all n, or all m)
+    if len(combos) > max_combos:
+        idx = rng.choice(len(combos), size=max_combos, replace=False)
+        combos = [combos[i] for i in sorted(idx)]
+    plans = []
+    for combo in combos:
+        plan = [None] * len(sig.params)
+        for i, c in zip(slots, combo):
+            plan[i] = c
+        for _ in range(2):
+            try:
+                args = plan_args(rng, sig, tuple(plan), 3, 4, optional_none=False)
+            except _CantBuild:
+                break
+            r = run_python(fn, args, sig)
+            if is_timeout(r):
+                return plans  # the function hangs on some inputs: don't keep probing it
+            if r[0] == "ok":
+                plans.append(tuple(plan))
+                break
+        if len(plans) >= limit:
+            break
+    return plans
+
+
+def plan_args(rng, sig, plan, n, m, optional_none=True):
+    dims = {"n": n, "m": m}
+    out = []
+    for p, c in zip(sig.params, plan):
+        if c is None:
+            out.append(random_value(rng, p.type, n))
+            continue
+        shape = tuple(dims[ch] for ch in c)
+        if isinstance(p.type, OptionalType):
+            out.append(None if optional_none and rng.random() < 0.25 else random_value(rng, p.type.inner, n, shape))
+        else:
+            out.append(random_value(rng, p.type, n, shape))
+    return tuple(out)
+
+
+def random_args(rng, sig, plans):
+    """One random call: usually square (every array of size n), and in 40% of calls, when the
+    function accepts non-square shapes, one of its rectangular plans with n != m, either of
+    them possibly 0 (an empty matrix of 0 x m) or 1."""
+    if plans and rng.random() < 0.4:
+        plan = plans[int(rng.integers(len(plans)))]
+        n, m = (int(x) for x in rng.choice(7, size=2, replace=False))
+        return plan_args(rng, sig, plan, n, m)
+    n = 0 if rng.random() < 0.05 else int(rng.integers(1, 7))
+    if _STRESS and rng.random() < 0.15:
+        n = int(rng.integers(7, 41))  # longer arrays: blocked sums, loops past small sizes
+    return tuple(random_value(rng, p.type, n) for p in sig.params)
 
 
 def _encode(v, t):
@@ -389,7 +494,25 @@ def _call_args(args, sig):
     return out
 
 
-def run_python(fn, args, sig):
+PYTHON_CASE_SECONDS = 10.0
+
+
+def is_timeout(r) -> bool:
+    return r[0] == "exc" and r[1] == "Timeout"
+
+
+def run_python(fn, args, sig, limit=None):
+    """Python's result for one call: in the worker process with a time limit of `limit`
+    seconds (PYTHON_CASE_SECONDS) while a verification runs (see PythonWorker), else here."""
+    limit = PYTHON_CASE_SECONDS if limit is None else limit
+    if _WORKER is not None:
+        r = _WORKER.call(fn, args, sig, limit)
+        if r is not None:
+            return r
+    return _run_python(fn, args, sig)
+
+
+def _run_python(fn, args, sig):
     args = _call_args(args, sig)
     try:
         with warnings.catch_warnings():
@@ -411,17 +534,140 @@ def run_python(fn, args, sig):
         return ("bad", f"{v!r} ({e})")
 
 
-def load_module(path):
+def load_module(path, name=None):
+    """Import a file under a fresh name (so two files of one name don't collide), registered
+    in sys.modules so its objects can be pickled to the Python worker (see PythonWorker)."""
     path = Path(path).resolve()
-    name = f"_qtrans_verify_{path.stem}_{uuid.uuid4().hex[:8]}"
+    name = name or f"_qtrans_verify_{path.stem}_{uuid.uuid4().hex[:8]}"
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
     sys.path.insert(0, str(path.parent))
     try:
         spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     finally:
         sys.path.remove(str(path.parent))
     return mod
+
+
+# --- running the Python side in a worker process ------------------------------------------------
+def _worker_client(address, authkey_hex):
+    """Entry point of the worker process (started with `python -c`, so the caller's own script
+    is never re-imported, as multiprocessing's spawn would): connect back, get the setup."""
+    from multiprocessing.connection import Client
+    conn = Client(address, authkey=bytes.fromhex(authkey_hex))
+    specs, path, class_names = conn.recv()
+    _worker_main(conn, specs, path, class_names)
+
+
+def _worker_main(conn, specs, path, class_names):
+    """The worker: imports the modules as the verifier did, then runs one call per message."""
+    sys.path[:0] = path
+    mods = {}
+    for key, (kind, where, name) in specs.items():
+        if kind == "file":
+            mods[key] = load_module(where, name)
+        else:
+            sys.path.insert(0, where)
+            mods[key] = importlib.import_module(name)
+    global _CLASSES
+    _CLASSES = {n: (None, None) for n in class_names}  # enough for _is_object
+    while True:
+        msg = conn.recv()
+        if msg is None:
+            return
+        key, fname, args, sig = msg
+        r = _run_python(_resolve(mods[key], fname), args, sig)
+        try:
+            conn.send(r)
+        except Exception as e:  # noqa: BLE001 - a result that can't be pickled
+            conn.send(("bad", f"result could not be sent back from the worker: {e}"))
+
+
+def _resolve(mod, dotted):
+    obj = mod
+    for part in dotted.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+class PythonWorker:
+    """Runs the Python side of verification in a child process, each call with a time limit.
+    A call can hang (NumPy's SVD on some matrices with inf in them never returns, sometimes
+    holding the interpreter lock), and a hang inside compiled code can't be interrupted from
+    within the process: the worker is then killed and restarted, and the call reported as a
+    timeout. Calls whose arguments can't be pickled run in this process instead."""
+
+    def __init__(self, specs, class_names):
+        self.specs, self.class_names = specs, list(class_names)
+        self.funcs = {}  # id(fn) -> (module key, name)
+        self.proc = self.conn = None
+        self.restarts = 0
+
+    def register(self, key, mod):
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if callable(obj):
+                self.funcs[id(obj)] = (key, name)
+
+    def _start(self):
+        import secrets
+        from multiprocessing.connection import Listener
+        key = secrets.token_bytes(16)
+        with Listener(authkey=key) as listener:  # a local socket / named pipe, authenticated
+            here = str(Path(__file__).resolve().parent.parent)
+            code = (f"import sys; sys.path.insert(0, {here!r}); from qtrans.verify import _worker_client; "
+                    f"_worker_client({listener.address!r}, {key.hex()!r})")
+            self.proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL)
+            self.conn = listener.accept()
+        self.conn.send((self.specs, list(sys.path), self.class_names))
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def call(self, fn, args, sig, limit):
+        where = self.funcs.get(id(fn))
+        if where is None:
+            return None
+        if not self._alive():
+            self._start()
+        try:
+            self.conn.send((where[0], where[1], args, sig))
+        except Exception:  # noqa: BLE001 - arguments that can't be pickled: run here
+            return None
+        if self.conn.poll(limit + (30.0 if self.restarts == 0 and not getattr(self, "_warm", False) else 0.0)):
+            self._warm = True
+            try:
+                return self.conn.recv()
+            except EOFError:  # the worker died (a crash in compiled code)
+                self.proc = None
+                return ("exc", "Crash", "Python crashed in compiled code")
+        self.stop(kill=True)
+        self.restarts += 1
+        self._warm = False
+        return ("exc", "Timeout", f"Python did not finish within {limit:g} s")
+
+    def stop(self, kill=False):
+        if self.proc is None:
+            return
+        try:
+            if kill:
+                self.proc.kill()
+            else:
+                self.conn.send(None)
+            self.proc.wait(5)
+        except Exception:  # noqa: BLE001
+            try:
+                self.proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        self.proc = None
+
+
+_WORKER = None  # the PythonWorker of the verification in progress
 
 
 # --- C++ side ---------------------------------------------------------------------------------
@@ -539,7 +785,8 @@ int main() {
 @@BRANCHES@@
             { std::printf("EXC UnknownFunction\n"); }
         }
-        catch (const qt::type_error&) { std::printf("EXC TypeError\n"); }@@ARRAY_CATCH@@
+        catch (const qt::type_error&) { std::printf("EXC TypeError\n"); }
+        catch (const qt::int_overflow&) { std::printf("EXC IntOverflow\n"); }@@ARRAY_CATCH@@
         catch (const std::invalid_argument&) { std::printf("EXC ValueError\n"); }
         catch (const std::domain_error&) { std::printf("EXC ArithmeticError\n"); }
         catch (const std::out_of_range&) { std::printf("EXC IndexError\n"); }
@@ -829,6 +1076,10 @@ def classify(case: Case, ret, rtol, atol):
         case.tiny = eq and not _compare_values(py[1], cpp[1], ret, rtol, 0.0)[0]
     elif py[0] == "exc" and cpp[0] == "exc" and py[1] in CPP_EXC_MATCHES.get(cpp[1], set()):
         case.outcome = "match"
+    elif cpp[0] == "exc" and cpp[1] == "IntOverflow":
+        # Python's int grew past 64 bits (or a float became one), where C++ raises
+        # OverflowError: the documented 64-bit int difference, never a silently wrong number
+        case.outcome = "known"
     elif py[0] == "exc" and (
             py[1] in ("ZeroDivisionError", "OverflowError")
             or (py[1] == "ValueError" and any(m in py[2] for m in _KNOWN_MESSAGES))
@@ -843,6 +1094,14 @@ def classify(case: Case, ret, rtol, atol):
         case.outcome = "mismatch"
 
 
+def _ulps(v, k):
+    """v moved by k ULPs (k may be an array of +-4): whole steps of the spacing between doubles,
+    so a subnormal moves too (multiplying it by 1 + 4 eps rounds back to itself). Zeros, inf
+    and NaN stay as they are."""
+    move = np.isfinite(v) & (v != 0)
+    return np.where(move, v + k * np.spacing(np.where(move, v, 1.0)), v)
+
+
 def _nudge(v, rng, normwise=False):
     """Move every float in v by 4 ULPs in a random direction: of itself, or (normwise=True,
     arrays only) of the array's largest element. The second is the size of error a backward-
@@ -855,9 +1114,9 @@ def _nudge(v, rng, normwise=False):
             finite = v[np.isfinite(v)]
             scale = float(np.max(np.abs(finite))) if finite.size else 0.0
             return v + rng.choice([-4.0, 4.0], size=v.shape) * eps * scale
-        return v * (1.0 + rng.choice([-4.0, 4.0], size=v.shape) * eps)
+        return _ulps(v, rng.choice([-4.0, 4.0], size=v.shape))
     if isinstance(v, float):
-        return v * (1.0 + float(rng.choice([-4.0, 4.0])) * eps)
+        return float(_ulps(np.float64(v), float(rng.choice([-4.0, 4.0]))))
     if _is_object(v):
         if isinstance(v, tuple):  # NamedTuple
             return type(v)(*(_nudge(x, rng, normwise) for x in v))
@@ -870,6 +1129,52 @@ def _nudge(v, rng, normwise=False):
 
 
 _LAPACK = {"solve", "inv", "pinv", "eigh", "eigvalsh", "cholesky", "det", "lstsq"}
+# BLAS-backed products: with inf/NaN or values near overflow, the order of their additions
+# decides inf vs NaN and whether an intermediate overflows
+_BLAS = {"dot", "matmul", "cov", "einsum", "outer", "inner", "vdot", "tensordot"}
+
+
+def linalg_functions(paths) -> set:
+    """Functions that use matrix products or numpy.linalg, directly or through other functions
+    (of any module given): where 'edge' applies (see edge_inputs)."""
+    direct, calls = set(), {}
+    for p in paths:
+        tree = ast.parse(Path(p).read_text(encoding="utf-8"))
+        defs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+        defs += [m for c in tree.body if isinstance(c, ast.ClassDef) for m in c.body if isinstance(m, ast.FunctionDef)]
+        for f in defs:
+            if any((isinstance(n, ast.Attribute) and n.attr in _LAPACK | _BLAS) or
+                   (isinstance(n, ast.BinOp) and isinstance(n.op, ast.MatMult)) for n in ast.walk(f)):
+                direct.add(f.name)
+            calls.setdefault(f.name, set()).update(
+                n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+                for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute)))
+    out, changed = set(direct), True
+    while changed:
+        changed = False
+        for name, cs in calls.items():
+            if name not in out and cs & out:
+                out.add(name)
+                changed = True
+    return out
+
+
+def edge_inputs(args) -> bool:
+    """Does any input number lie where floating point stops being ordinary: inf, NaN, a
+    subnormal, or beyond 1e150 (a product of two such overflows)?"""
+    def bad(x):
+        x = np.asarray(x, dtype=np.float64)
+        a = np.abs(x[np.isfinite(x)])
+        return bool((~np.isfinite(x)).any() or (a > 1e150).any() or ((a > 0) & (a < 2.2250738585072014e-308)).any())
+    for v in args:
+        if isinstance(v, (float, np.ndarray)) and not isinstance(v, bool):
+            if np.size(v) and bad(v):
+                return True
+        elif _is_object(v):
+            items = v if isinstance(v, tuple) else (vars(v).values() if hasattr(v, "__dict__") else ())
+            if edge_inputs(list(items)):
+                return True
+    return False
 
 
 def lapack_functions(path) -> set:
@@ -900,6 +1205,8 @@ def python_sensitivity(fn, case, sig, out_t, rng, trials=3, normwise_too=False):
     for normwise in ((False, True) if has_array and normwise_too else (False,)):
         for _ in range(trials):
             nudged = run_python(fn, tuple(_nudge(a, rng, normwise) for a in case.args), sig)
+            if is_timeout(nudged):
+                return worst  # stop: each hung call costs PYTHON_CASE_SECONDS and a busy thread
             if nudged[0] != "ok":
                 return math.inf  # a nudge changes the outcome: the problem sits on a knife edge
             worst = max(worst, _compare_values(case.py[1], nudged[1], out_t, 0.0, 0.0)[1])
@@ -908,10 +1215,10 @@ def python_sensitivity(fn, case, sig, out_t, rng, trials=3, normwise_too=False):
 
 # --- main entry point ----------------------------------------------------------------------------
 def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
-                compiler=None, build_dir=None, eigen=None) -> VerifyReport:
+                compiler=None, build_dir=None, eigen=None, profile="strict") -> VerifyReport:
     """Translate, compile and check one module. The project modules it imports are translated
     and compiled with it (their own functions are checked by verifying them)."""
-    rep = verify_project([path], n_random, seed, rtol, atol, bench, compiler, build_dir, eigen)
+    rep = verify_project([path], n_random, seed, rtol, atol, bench, compiler, build_dir, eigen, profile=profile)
     return rep.modules[Path(path).resolve().stem]
 
 
@@ -1003,9 +1310,19 @@ def project_lapack_functions(project) -> set:
 
 
 def verify_project(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
-                   compiler=None, build_dir=None, eigen=None, all_modules=False) -> ProjectVerifyReport:
+                   compiler=None, build_dir=None, eigen=None, all_modules=False,
+                   profile="strict") -> ProjectVerifyReport:
     """Translate the given files (and the project modules they import), compile one driver for
-    all of them, and check the functions of the given files (all_modules=True: of every module)."""
+    all of them, and check the functions of the given files (all_modules=True: of every module).
+
+    profile "strict" (the default): random inputs spread over typical magnitudes, square and
+    rectangular arrays, plus your hand-picked cases. "stress": also infinities, NaN, the largest
+    and smallest doubles, subnormals, signed zeros and rounding ties in 30% of the numbers, and
+    longer arrays. (Integers stay moderate: a loop over range(2**62) would run as long in Python.)"""
+    if profile not in ("strict", "stress"):
+        raise ValueError(f"unknown profile {profile!r}: use 'strict' or 'stress'")
+    global _STRESS
+    _STRESS = profile == "stress"
     from .project import translate_project
     build = Path(build_dir) if build_dir else Path(tempfile.mkdtemp(prefix="qtrans_"))
     build.mkdir(parents=True, exist_ok=True)
@@ -1013,6 +1330,33 @@ def verify_project(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fa
     targets = list(project.order) if all_modules else project.requested
     pymods = load_project(project)
     setup_inputs(project, pymods)
+    global _WORKER
+    _WORKER = PythonWorker(_worker_specs(project, pymods), _CLASSES)
+    for key, mod in pymods.items():
+        _WORKER.register(key, mod)
+    try:
+        return _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, bench, compiler, eigen)
+    finally:
+        _WORKER.stop()
+        _WORKER = None
+
+
+def _worker_specs(project, pymods):
+    """How the worker imports each module: by file under the same fresh name, or by name."""
+    specs = {}
+    for key, mod in pymods.items():
+        name = mod.__name__
+        if name.startswith("_qtrans_verify_"):
+            specs[key] = ("file", str(project.paths[key]), name)
+        else:
+            root = Path(project.paths[key]).parent
+            if "." in name:  # a package: import from the folder above it
+                root = root.parent
+            specs[key] = ("import", str(root), name)
+    return specs
+
+
+def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, bench, compiler, eigen):
     single = len(project.modules) == 1
     rng = np.random.default_rng(seed)
 
@@ -1045,15 +1389,29 @@ def verify_project(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fa
                                      f"{name}() takes {len(sig.params)}")
                 args = tuple(_py_value(a, p.type) for a, p in zip(args, sig.params))
                 fc.cases.append(Case(name, args, "given"))
+            plans = shape_plans(fn, sig, rng)
+            fc.shape_plans = plans
             for _ in range(n_random):
-                n = 0 if rng.random() < 0.05 else int(rng.integers(1, 7))
                 try:
-                    args = tuple(random_value(rng, p.type, n) for p in sig.params)
+                    args = random_args(rng, sig, plans)
                 except _CantBuild:
                     continue  # an object its own checks refuse for every draw tried
                 fc.cases.append(Case(name, args, "random"))
-            for c in fc.cases:
+            kept, hung_on_edge = [], False
+            for k, c in enumerate(fc.cases):
+                if hung_on_edge and edge_inputs(c.args):
+                    fc.timeouts += 1  # it hung on such inputs before: don't wait for it again
+                    continue
                 c.py = run_python(fn, c.args, sig)
+                if is_timeout(c.py):
+                    fc.timeouts += 1
+                    if edge_inputs(c.args) and not hung_on_edge:
+                        hung_on_edge = True  # skip its other inf / NaN / near-overflow cases
+                        continue
+                    fc.timeouts += len(fc.cases) - k - 1  # it hangs on ordinary inputs: stop
+                    break
+                kept.append(c)
+            fc.cases = kept
             checks[module].append(fc)
 
     # compile one driver for everything
@@ -1097,6 +1455,7 @@ def verify_project(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fa
                            f"(exit code {run.returncode}): {run.stderr[-500:]}")
     nudge_rng = np.random.default_rng(seed + 1)
     normwise = lapack_functions(project.paths[targets[0]]) if single else project_lapack_functions(project)
+    linalg = linalg_functions(project.paths.values())
     for (fc, c), outline in zip(index, outputs):
         sig = project.modules[fc.module].signatures[fc.name]
         c.cpp = _parse_cpp_line(outline, output_type(sig))
@@ -1106,6 +1465,11 @@ def verify_project(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=Fa
                                                nudge_rng, normwise_too=fc.name in normwise)
             if c.rel_err <= 100 * c.sensitivity:
                 c.outcome = "illcond"
+        if c.outcome == "mismatch" and fc.name in linalg and edge_inputs(c.args):
+            # matrix products / LAPACK on inf, NaN, subnormals or values near overflow: NumPy's
+            # BLAS and Eigen add in different orders, so inf - inf -> NaN, or an intermediate
+            # overflow, can happen on one side only. Both are correct; listed, never hidden.
+            c.outcome = "edge"
 
     if bench:
         for module in targets:

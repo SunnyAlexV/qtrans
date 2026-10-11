@@ -31,7 +31,8 @@ def test_true_division_of_ints_is_float():
 
 def test_floor_division_and_mod_use_python_semantics():
     h = cpp("def f(a: int, b: int) -> int:\n    return a // b + a % b\n")
-    assert "qt::floordiv(a, b) + qt::mod(a, b)" in h
+    # the sum of two unknown ints could leave 64 bits: checked
+    assert "qt::iadd(qt::floordiv(a, b), qt::mod(a, b))" in h
 
 
 def test_int_literals_promoted_where_overflow_possible():

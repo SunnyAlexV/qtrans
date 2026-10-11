@@ -23,6 +23,7 @@ from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType,
                     TupleType, assignable, is_array, join)
 
 from .core import cpp_string
+from .core import SIZE_IV, iv_clip, iv_fits, iv_of, iv_op
 from .core import (CPP_RESERVED, P_ADD, P_AND, P_ATOM, P_COND, P_EQ, P_MUL, P_OR, P_REL,  # noqa: F401
                    P_UNARY, Expr, cpp_ident, float_literal, wrap)
 
@@ -210,13 +211,13 @@ class ExprTranslator(ArrayOps, StructOps):
     def e_Constant(self, node):
         v = node.value
         if isinstance(v, bool):
-            return Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True)
+            return Expr("true" if v else "false", P_ATOM, BOOL, value=v, simple=True, iv=(int(v), int(v)))
         if isinstance(v, int):
             if abs(v) >= 2 ** 63:
                 raise Unsupported(node, "integer literal does not fit in 64 bits")
             if v >= 2 ** 31:
-                return Expr(f"{v}LL", P_ATOM, INT, value=v, simple=True)
-            return Expr(str(v), P_ATOM, INT, int_lit=True, value=v, simple=True)
+                return Expr(f"{v}LL", P_ATOM, INT, value=v, simple=True, iv=(v, v))
+            return Expr(str(v), P_ATOM, INT, int_lit=True, value=v, simple=True, iv=(v, v))
         if isinstance(v, float):
             code, prec = float_literal(v)
             return Expr(code, prec, FLOAT, value=v, simple=True)
@@ -297,11 +298,8 @@ class ExprTranslator(ArrayOps, StructOps):
             if both_int:
                 # Python semantics: ints never overflow. `100000 * 100000` with two C++
                 # int literals would overflow 32 bits, so promote one side to long long.
-                if L.int_lit and R.int_lit:
-                    L = self.as_type(L, INT)
-                self.note("int64", "int arithmetic uses 64-bit long long; Python ints are "
-                                   "unbounded, so results beyond ±9.2e18 would differ")
-            return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, INT if both_int else FLOAT)
+                return self.int_arith(sym, p, L, R)
+            return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, FLOAT)
 
         if isinstance(op, ast.Div):
             # Python semantics: `/` is always true division. In C++ `7 / 2` is 3.
@@ -318,7 +316,12 @@ class ExprTranslator(ArrayOps, StructOps):
             fn = "floordiv" if isinstance(op, ast.FloorDiv) else "mod"
             if both_int:
                 a, b = self.as_type(L, INT), self.as_type(R, INT)
-                return Expr(f"qt::{fn}({a.code}, {b.code})", P_ATOM, INT)
+                # |a // b| <= |a| (b an int, not 0), |a % b| < |b|; both checked at run time
+                if fn == "floordiv":
+                    m = max(abs(x) for x in iv_of(L))
+                else:
+                    m = max(abs(x) for x in iv_of(R)) - 1
+                return Expr(f"qt::{fn}({a.code}, {b.code})", P_ATOM, INT, iv=iv_clip((-m, m)))
             a, b = self.as_double(L), self.as_double(R)
             return Expr(f"qt::{fn}({a.code}, {b.code})", P_ATOM, FLOAT)
 
@@ -326,6 +329,23 @@ class ExprTranslator(ArrayOps, StructOps):
             return self.power(node, L, R)
 
         raise Unsupported(node, f"the {type(op).__name__} operator is not supported in stage 1")
+
+    def int_arith(self, sym, p, L: Expr, R: Expr) -> Expr:
+        """a + b, a - b, a * b on ints. Plain C++ when the result provably fits in 64 bits, from
+        the intervals the operands are known to lie in (literals, array sizes, range() loop
+        indices: `i + 1` for i in range(n) can't overflow, since i < n); otherwise checked
+        (qt::iadd, ...): the exact result, or OverflowError where Python's unbounded int would
+        leave 64 bits."""
+        r = iv_op(sym, iv_of(L), iv_of(R))
+        if L.int_lit and R.int_lit:
+            L = Expr(self.as_type(L, INT).code, P_ATOM, INT, iv=L.iv)
+        if iv_fits(r):
+            return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, INT, iv=r)
+        self.note("int64", "int arithmetic that could leave 64 bits is checked: where Python's unbounded "
+                           "int would exceed ±9.2e18, C++ raises OverflowError")
+        fn = {"+": "iadd", "-": "isub", "*": "imul"}[sym]
+        return Expr(f"qt::{fn}({self.as_type(L, INT).code}, {self.as_type(R, INT).code})", P_ATOM, INT,
+                    iv=iv_clip(r))
 
     def power(self, node, L: Expr, R: Expr) -> Expr:
         node = node or self.current
@@ -340,11 +360,16 @@ class ExprTranslator(ArrayOps, StructOps):
                 if n < 0:
                     return Expr(f"std::pow({self.as_double(L).code}, {n}.0)", P_ATOM, FLOAT)
                 a = self.as_type(L, INT)
-                self.note("int64", "int arithmetic uses 64-bit long long; Python ints are "
-                                   "unbounded, so results beyond ±9.2e18 would differ")
-                if n == 2 and L.simple and not str(L.value or "").startswith("-"):
-                    return Expr(f"{a.code} * {a.code}", P_MUL, INT)
-                return Expr(f"qt::ipow({a.code}, {n})", P_ATOM, INT)
+                lo, hi = iv_of(L)
+                ends = [lo ** n, hi ** n]
+                r = (0 if n % 2 == 0 and lo <= 0 <= hi else min(ends), max(ends)) if n else (1, 1)
+                if iv_fits(r):
+                    if n == 2 and L.simple and not str(L.value or "").startswith("-"):
+                        return Expr(f"{a.code} * {a.code}", P_MUL, INT, iv=r)
+                    return Expr(f"qt::ipow({a.code}, {n})", P_ATOM, INT, iv=r)
+                self.note("int64", "int arithmetic that could leave 64 bits is checked: where Python's unbounded "
+                                   "int would exceed ±9.2e18, C++ raises OverflowError")
+                return Expr(f"qt::ipow({a.code}, {n})", P_ATOM, INT)  # checked inside
             raise Unsupported(node, "int ** int with a non-constant exponent: Python returns an "
                                     "int or a float depending on the exponent's sign at run time",
                               "convert one side with float(...)")
@@ -387,7 +412,10 @@ class ExprTranslator(ArrayOps, StructOps):
             if inner.startswith("-"):
                 inner = f"({inner})"  # `- -x` must not become the decrement operator `--x`
             value = -e.value if isinstance(e.value, (int, float)) else None
-            return Expr("-" + inner, P_UNARY, t, e.int_lit, value, e.simple and value is not None)
+            r = (-iv_of(e)[1], -iv_of(e)[0]) if t == INT else None
+            if t == INT and not iv_fits(r):
+                return Expr(f"qt::ineg({e.code})", P_ATOM, INT, iv=iv_clip(r))  # -(-2**63) is 2**63
+            return Expr("-" + inner, P_UNARY, t, e.int_lit, value, e.simple and value is not None, iv=r)
         raise Unsupported(node, f"the {type(node.op).__name__} operator is not supported in stage 1")
 
     def e_BoolOp(self, node):
@@ -567,7 +595,8 @@ class ExprTranslator(ArrayOps, StructOps):
             if name == "len" and len(node.args) == 1 and not node.keywords:
                 a = self.expr(node.args[0])
                 if is_array(a.type):
-                    return Expr(f"{wrap(a, P_ATOM)}.{'size' if a.type.rank == 1 else 'rows'}()", P_ATOM, INT)
+                    return Expr(f"{wrap(a, P_ATOM)}.{'size' if a.type.rank == 1 else 'rows'}()", P_ATOM, INT,
+                                iv=SIZE_IV)
             if name in ("sum", "max", "min") and node.args:
                 a = self.expr(node.args[0])
                 if is_array(a.type):
@@ -673,7 +702,11 @@ class ExprTranslator(ArrayOps, StructOps):
     def absolute(self, e: Expr) -> Expr:
         if e.type == FLOAT:
             return Expr(f"std::fabs({e.code})", P_ATOM, FLOAT)
-        return Expr(f"std::abs({self.as_type(e, INT).code})", P_ATOM, INT)
+        lo, hi = iv_of(e)
+        r = (0 if lo <= 0 <= hi else min(abs(lo), abs(hi)), max(abs(lo), abs(hi)))
+        if iv_fits(r):
+            return Expr(f"std::abs({self.as_type(e, INT).code})", P_ATOM, INT, iv=r)
+        return Expr(f"qt::iabs({self.as_type(e, INT).code})", P_ATOM, INT, iv=iv_clip(r))  # abs(-2**63)
 
     def call_builtin(self, node, name):
         if node.keywords:
@@ -845,7 +878,10 @@ class ExprTranslator(ArrayOps, StructOps):
             a, b = args
             if a.type != FLOAT and b.type != FLOAT:
                 fn = "max" if qual.endswith("maximum") else "min"
-                return Expr(f"std::{fn}({self.as_type(a, INT).code}, {self.as_type(b, INT).code})", P_ATOM, INT)
+                (a0, a1), (b0, b1) = iv_of(a), iv_of(b)
+                r = (max(a0, b0), max(a1, b1)) if fn == "max" else (min(a0, b0), min(a1, b1))
+                return Expr(f"std::{fn}({self.as_type(a, INT).code}, {self.as_type(b, INT).code})", P_ATOM, INT,
+                            iv=r)
             # numpy.maximum propagates NaN from either side; std::max does not.
             fn = "np_maximum" if qual.endswith("maximum") else "np_minimum"
             return Expr(f"qt::{fn}({self.as_double(a).code}, {self.as_double(b).code})", P_ATOM, FLOAT)

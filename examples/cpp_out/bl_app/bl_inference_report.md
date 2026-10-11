@@ -24,7 +24,7 @@ These only matter on inputs where Python would raise an exception or overflow.
 
 - float ** raises OverflowError in Python when the result overflows; C++ returns inf (applies to: default_block_length, newey_west_lag)
 - division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: _ann_sharpe, hac_cov, hit_rate_pvalue)
-- int arithmetic uses 64-bit long long; Python ints are unbounded, so results beyond ±9.2e18 would differ (applies to: hac_cov)
+- int arithmetic that could leave 64 bits is checked: where Python's unbounded int would exceed ±9.2e18, C++ raises OverflowError (applies to: hac_cov)
 
 ## Not translated
 

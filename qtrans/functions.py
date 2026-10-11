@@ -16,6 +16,7 @@ import inspect
 
 from . import library as lib
 from .errors import Unsupported
+from .core import iv_of
 from .core import cpp_string
 from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown, cpp_ident, wrap)
 from .structs import THIS
@@ -186,6 +187,7 @@ class FunctionTranslator(ExprTranslator):
         self.loop_vars: set[str] = set()
         self.loop_types: dict = {}      # loop variable -> INT (range) or FLOAT (iterating a Vec)
         self.loop_lb: dict = {}         # loop variable -> proven lower bound (for index emission)
+        self.loop_iv: dict = {}         # range() loop variable -> the interval it stays in
         self.events: list[_Event] = []
         self.annotated: dict = {}
         self.local_types: dict = {}
@@ -228,6 +230,8 @@ class FunctionTranslator(ExprTranslator):
             return Expr(THIS, P_ATOM, self.owner.type, simple=True)
         if n in self.loop_vars:
             t = self.loop_types.get(n, INT)
+            if t == INT:  # a range() loop index lies between start and stop
+                return Expr(self.ident(n), P_ATOM, t, simple=True, iv=self.loop_iv.get(n))
         elif n in self.params:
             t = self.params[n]
         else:
@@ -1351,7 +1355,9 @@ class FunctionTranslator(ExprTranslator):
         b = self.aug_binops[id(s)]
         result = self.expr(b)
         self.check_assignable(vt, result, s, f"'{name}'")
-        if isinstance(s.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)) and result.type == vt:
+        if result.type == INT and result.code.startswith("qt::i"):
+            self.emit(f"{self.ident(name)} = {result.code};")  # checked: may leave 64 bits
+        elif isinstance(s.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)) and result.type == vt:
             rhs = self.promote(self.expr(s.value), vt)
             sym = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}[type(s.op)]
             if isinstance(s.op, ast.Div) and vt != FLOAT:
@@ -1387,7 +1393,9 @@ class FunctionTranslator(ExprTranslator):
         cur = Expr(code, P_ATOM, f.type, simple=True)
         result = self.binop(s, s.op, cur, rhs)
         self.check_assignable(f.type, result, s, f"field '{f.name}'")
-        if result.type == f.type and isinstance(s.op, (ast.Add, ast.Sub, ast.Mult)) or \
+        if result.type == INT and result.code.startswith("qt::i"):
+            self.emit(f"{code} = {result.code};")  # checked: may leave 64 bits
+        elif result.type == f.type and isinstance(s.op, (ast.Add, ast.Sub, ast.Mult)) or \
                 (isinstance(s.op, ast.Div) and f.type == FLOAT):
             self.emit(f"{code} {syms[type(s.op)]} {self.promote(rhs, f.type).code};")
         else:
@@ -1472,6 +1480,10 @@ class FunctionTranslator(ExprTranslator):
         start = args[0] if len(args) >= 2 else Expr("0", P_ATOM, INT, int_lit=True, value=0, simple=True)
         stop, stop_node = (args[1], it.args[1]) if len(args) >= 2 else (args[0], it.args[0])
         var = self.ident(s.target.id)
+        # i lies in [start, stop - 1] (step > 0) or [stop + 1, start] (step < 0); unknown ends
+        # are the int64 limits, so i + 1 (or i - 1 going down) can never overflow
+        (s0, s1), (e0, e1) = iv_of(start), iv_of(stop)
+        self.loop_iv[s.target.id] = (s0, e1 - 1) if step > 0 else (e0 + 1, s1)
         # Python evaluates range() once. If the bound could change during the loop (it calls
         # a function, or reads a variable the body assigns), evaluate it once up front.
         body_stores = {n.id for b in s.body for n in ast.walk(b) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}

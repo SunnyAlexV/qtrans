@@ -1022,6 +1022,8 @@ def _outcome(py, cpp, t, rtol, atol, sens_fn=None):
             if eq[1] <= 100 * s:
                 return "illcond"
         return "mismatch"
+    if cpp[0] == "exc" and isinstance(cpp[1], OverflowError) and "beyond 64 bits" in str(cpp[1]):
+        return "known"  # Python's int grew past 64 bits; C++ raises OverflowError (documented)
     if py[0] == "exc" and cpp[0] == "exc":
         case.cpp = ("exc", "unrelated", str(cpp[1]))  # so classify only accepts a known float error
     V.classify(case, t, rtol, atol)
@@ -1100,10 +1102,10 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
         for args in given.get(name, []):
             args = list(args) + [defaults[i] for i in range(len(args), len(sig.params))]
             cases.append(tuple(V._py_value(a, p.type) for a, p in zip(args, sig.params)))
+        plans = V.shape_plans(fn, sig, rng)
         for _ in range(n_random):
-            n = 0 if rng.random() < 0.05 else int(rng.integers(1, 7))
             try:
-                cases.append(tuple(V.random_value(rng, t, n) for t in types))
+                cases.append(V.random_args(rng, sig, plans))
             except V._CantBuild:
                 continue
         has_obj = any(isinstance(t, StructType) or (isinstance(t, OptionalType) and isinstance(t.inner, StructType))

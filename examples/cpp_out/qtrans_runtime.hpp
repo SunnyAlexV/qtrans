@@ -5,6 +5,7 @@
 // depends only on the standard library, and is written to be read.
 #pragma once
 
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -44,8 +45,66 @@ bool truthy(const std::optional<T>& x) {
 // C++ truncates toward zero:          -7 / 2  == -3,  -7 % 2 == -1.
 // Division by zero raises ZeroDivisionError in Python; std::domain_error here.
 // ---------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------
+// int arithmetic that could leave 64 bits. Python ints are unbounded; a long long is not,
+// and signed overflow is undefined behaviour in C++. Where the translator can't show a
+// result stays small (loop indices, array sizes and small literals stay plain + - *), it
+// emits these: the exact result, or OverflowError where Python would return a big int.
+// ---------------------------------------------------------------------------------
+struct int_overflow : std::overflow_error {  // Python: a big int; here: OverflowError
+    int_overflow() : std::overflow_error("integer result beyond 64 bits: Python ints are unbounded, a C++ long long "
+                                         "is not") {}
+};
+
+inline long long iadd(long long a, long long b) {
+#if defined(__GNUC__) || defined(__clang__)
+    long long r;
+    if (__builtin_add_overflow(a, b, &r)) throw int_overflow();
+    return r;
+#else
+    if ((b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b)) throw int_overflow();
+    return a + b;
+#endif
+}
+
+inline long long isub(long long a, long long b) {
+#if defined(__GNUC__) || defined(__clang__)
+    long long r;
+    if (__builtin_sub_overflow(a, b, &r)) throw int_overflow();
+    return r;
+#else
+    if ((b < 0 && a > LLONG_MAX + b) || (b > 0 && a < LLONG_MIN + b)) throw int_overflow();
+    return a - b;
+#endif
+}
+
+inline long long imul(long long a, long long b) {
+#if defined(__GNUC__) || defined(__clang__)
+    long long r;
+    if (__builtin_mul_overflow(a, b, &r)) throw int_overflow();
+    return r;
+#else
+    if (a == 0 || b == 0) return 0;
+    if (a > 0 ? (b > 0 ? a > LLONG_MAX / b : b < LLONG_MIN / a)
+              : (b > 0 ? a < LLONG_MIN / b : a < LLONG_MAX / b))
+        throw int_overflow();
+    return a * b;
+#endif
+}
+
+inline long long ineg(long long a) {
+    if (a == LLONG_MIN) throw int_overflow();
+    return -a;
+}
+
+inline long long iabs(long long a) {
+    if (a == LLONG_MIN) throw int_overflow();
+    return a < 0 ? -a : a;
+}
+
 inline long long floordiv(long long a, long long b) {
     if (b == 0) throw std::domain_error("integer division or modulo by zero");
+    if (a == LLONG_MIN && b == -1) throw int_overflow();  // -(-2**63) is 2**63
     long long q = a / b;
     long long r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) --q;
@@ -54,6 +113,7 @@ inline long long floordiv(long long a, long long b) {
 
 inline long long mod(long long a, long long b) {
     if (b == 0) throw std::domain_error("integer division or modulo by zero");
+    if (b == -1) return 0;  // LLONG_MIN % -1 is undefined in C++; Python gives 0
     long long r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) r += b;
     return r;
@@ -102,8 +162,9 @@ inline double floordiv(double vx, double wx) {
 // ---------------------------------------------------------------------------------
 inline long long to_int(double x) {
     if (std::isnan(x)) throw std::invalid_argument("cannot convert float NaN to integer");
+    if (std::isinf(x)) throw std::overflow_error("cannot convert float infinity to integer");  // as Python
     if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0))
-        throw std::overflow_error("float too large for a 64-bit integer");
+        throw int_overflow();  // Python returns a big int
     return static_cast<long long>(x);
 }
 
@@ -111,11 +172,13 @@ inline long long to_int(double x) {
 // int ** int for a non-negative constant exponent, by repeated squaring.
 // ---------------------------------------------------------------------------------
 inline long long ipow(long long base, long long exp) {
+    // checked: base is squared only while higher exponent bits remain, so an overflowing square
+    // means the result itself overflows (for |base| >= 2)
     long long result = 1;
     while (exp > 0) {
-        if (exp & 1) result *= base;
+        if (exp & 1) result = imul(result, base);
         exp >>= 1;
-        if (exp) base *= base;
+        if (exp) base = imul(base, base);
     }
     return result;
 }

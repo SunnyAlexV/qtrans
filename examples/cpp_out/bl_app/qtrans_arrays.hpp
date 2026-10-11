@@ -809,6 +809,9 @@ Eigen::PartialPivLU<Eigen::MatrixXd> lu_checked(const Eigen::ArrayBase<D>& a) {
 
 template <class DA, class DB>
 plain_t<DB> solve(const Eigen::ArrayBase<DA>& a, const Eigen::ArrayBase<DB>& b) {
+    // NumPy checks that A is square first (LinAlgError, which `except LinAlgError` catches),
+    // then that b fits (ValueError)
+    if (a.rows() != a.cols()) throw linalg_error("Last 2 dimensions of the array must be square");
     if (b.rows() != a.rows()) throw shape_error("solve: right-hand side has the wrong number of rows");
     const auto lu = lu_checked(a);
     const Eigen::MatrixXd x = lu.solve(b.matrix().eval());

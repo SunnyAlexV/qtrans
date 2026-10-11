@@ -33,6 +33,37 @@ class Expr:
     int_lit: bool = False  # a bare C++ int literal such as `5` (type int, not long long)
     value: object = None   # the Python value, when the expression is a numeric literal
     simple: bool = False   # a name or literal: cheap and safe to write twice (x * x)
+    iv: tuple | None = None  # for an int: (lo, hi) with lo <= value <= hi known (None: any int64)
+
+
+I64 = (-2 ** 63, 2 ** 63 - 1)
+SIZE_IV = (0, 2 ** 45)  # an array's length, shape or count: user address space is at most 2**48 bytes
+
+
+def iv_of(e: "Expr") -> tuple:
+    """The interval an int expression is known to lie in (the whole int64 range if unknown)."""
+    if e.iv is not None:
+        return e.iv
+    if isinstance(e.value, bool) or isinstance(e.value, int):
+        return (int(e.value), int(e.value))
+    return I64
+
+
+def iv_fits(iv) -> bool:
+    return iv[0] >= I64[0] and iv[1] <= I64[1]
+
+
+def iv_clip(iv) -> tuple:
+    return (max(iv[0], I64[0]), min(iv[1], I64[1]))
+
+
+def iv_op(sym, a, b) -> tuple:
+    if sym == "+":
+        return (a[0] + b[0], a[1] + b[1])
+    if sym == "-":
+        return (a[0] - b[1], a[1] - b[0])
+    c = [x * y for x in a for y in b]
+    return (min(c), max(c))
 
 
 def wrap(e: Expr, max_prec: int) -> str:

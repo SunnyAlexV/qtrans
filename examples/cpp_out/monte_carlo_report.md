@@ -33,7 +33,7 @@
 These only matter on inputs where Python would raise an exception or overflow.
 
 - division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: european_mc, gbm_paths, geometric_asian_call, asian_call_mc, down_and_out_call_mc, heston_call_mc, portfolio_var_mc)
-- int arithmetic uses 64-bit long long; Python ints are unbounded, so results beyond ±9.2e18 would differ (applies to: gbm_paths, geometric_asian_call)
+- int arithmetic that could leave 64 bits is checked: where Python's unbounded int would exceed ±9.2e18, C++ raises OverflowError (applies to: gbm_paths, geometric_asian_call)
 
 ## Module-level notes
 

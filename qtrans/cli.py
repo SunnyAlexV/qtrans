@@ -2,6 +2,7 @@
 
     python -m qtrans translate FILE.py [FILE.py ...| FOLDER] [-o OUT_DIR]
     python -m qtrans verify FILE.py [...] [--cases N] [--seed S] [--bench] [--rtol X] [--atol X] [--all]
+                                        [--profile strict|stress]
     python -m qtrans bind FILE.py [...] [-o OUT_DIR] [--check] [--cases N] [--bench] [--all]
 
 A file that imports other modules next to it (`from bl_core import nearest_psd`) is translated
@@ -37,6 +38,8 @@ def main(argv=None) -> int:
     v.add_argument("--atol", type=float, default=1e-13)
     v.add_argument("--bench", action="store_true", help="also time Python vs C++ per call")
     v.add_argument("--all", action="store_true", help="also check the modules the files import")
+    v.add_argument("--profile", choices=["strict", "stress"], default="strict",
+                   help="stress: also inf, NaN, subnormals, the largest doubles and longer arrays")
     v.add_argument("--cxx", default=None, help="C++ compiler to use")
     v.add_argument("--build", default=None, help="folder for the generated driver and binary")
 
@@ -79,7 +82,8 @@ def main(argv=None) -> int:
             print(f"wrote {out / (m + '.hpp')}")
         return 0 if not any(project.modules[m].report.rejected for m in project.requested) else 1
     report = verify_project(inputs, n_random=args.cases, seed=args.seed, rtol=args.rtol, atol=args.atol,
-                            bench=args.bench, compiler=args.cxx, build_dir=args.build, all_modules=args.all)
+                            bench=args.bench, compiler=args.cxx, build_dir=args.build, all_modules=args.all,
+                            profile=args.profile)
     print(report.to_text())
     return 0 if report.ok else 1
 

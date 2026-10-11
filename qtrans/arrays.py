@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 
+from .core import SIZE_IV
 from .core import P_ADD, P_ATOM, P_EQ, P_MUL, P_REL, P_UNARY, Expr, wrap
 from .errors import Unsupported
 from .types import BOOL, FLOAT, INT, MAT, RNG, VEC, ArrayType, MaskType, Scalar, StructType, TupleType, is_array
@@ -317,14 +318,14 @@ class ArrayOps:
         dims = [f"{a}.size()"] if A.type == VEC else [f"{a}.rows()", f"{a}.cols()"]
         if not isinstance(k, int) or not -len(dims) <= k < len(dims):
             raise Unsupported(node, f".shape of a {A.type} has {len(dims)} entries; index it with a constant")
-        return Expr(dims[k], P_ATOM, INT)
+        return Expr(dims[k], P_ATOM, INT, iv=SIZE_IV)
 
     def array_attribute(self, node, B: Expr) -> Expr:
         b = wrap(B, P_ATOM)
         if node.attr == "T":
             return Expr(f"{b}.transpose()", P_ATOM, MAT) if B.type == MAT else B
         if node.attr == "size":
-            return Expr(f"{b}.size()", P_ATOM, INT)
+            return Expr(f"{b}.size()", P_ATOM, INT, iv=SIZE_IV)
         if node.attr == "ndim":
             return Expr(str(B.type.rank), P_ATOM, INT, int_lit=True, value=B.type.rank, simple=True)
         if node.attr == "shape":
@@ -345,7 +346,7 @@ class ArrayOps:
             if name in ("any", "all") and not args and not kws:
                 return Expr(f"{wrap(B, P_ATOM)}.{name}()", P_ATOM, BOOL)
             if name == "sum" and not args and not kws:
-                return Expr(f"{wrap(B, P_ATOM)}.count()", P_ATOM, INT)
+                return Expr(f"{wrap(B, P_ATOM)}.count()", P_ATOM, INT, iv=SIZE_IV)
             raise Unsupported(node, f"boolean-array method .{name}() is not supported")
         if name == "copy" and not args:
             return Expr(B.code, B.prec, B.type)
@@ -544,7 +545,7 @@ class ArrayOps:
         if qual in _REDUCE:
             name = _REDUCE[qual]
             if isinstance(A.type, MaskType) and name == "sum" and len(args) == 1 and not kws:
-                return Expr(f"{wrap(A, P_ATOM)}.count()", P_ATOM, INT)
+                return Expr(f"{wrap(A, P_ATOM)}.count()", P_ATOM, INT, iv=SIZE_IV)
             if name in ("sort", "median"):
                 self._need_array(A, node, src)
                 if len(args) > 1 or kws:
