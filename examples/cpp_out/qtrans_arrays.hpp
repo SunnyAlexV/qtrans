@@ -230,6 +230,150 @@ auto norm_pdf(const Eigen::ArrayBase<D>& a, double loc, double scale) {
     return a.unaryExpr([loc, scale](double x) { return ::qt::norm_pdf(x, loc, scale); });
 }
 
+// =====================================================================================
+// NumPy broadcasting. Two shapes combine when each dimension is equal or 1 in one of them;
+// the 1 is stretched (a length-1 Vec against a length-n one, a (1, m) row against an (n, m)
+// matrix, ...). The translator writes plain Eigen (`a - b`) where it can show the sizes are
+// equal, and these helpers otherwise. Equal sizes take Eigen's own operation, which rounds
+// exactly as the scalar one does, so the results are the same bits either way.
+// =====================================================================================
+struct add_op { double operator()(double x, double y) const { return x + y; } };
+struct sub_op { double operator()(double x, double y) const { return x - y; } };
+struct mul_op { double operator()(double x, double y) const { return x * y; } };
+struct div_op { double operator()(double x, double y) const { return x / y; } };
+struct pow_op { double operator()(double x, double y) const { return std::pow(x, y); } };
+struct lt_op { bool operator()(double x, double y) const { return x < y; } };
+struct le_op { bool operator()(double x, double y) const { return x <= y; } };
+struct gt_op { bool operator()(double x, double y) const { return x > y; } };
+struct ge_op { bool operator()(double x, double y) const { return x >= y; } };
+struct eq_op { bool operator()(double x, double y) const { return x == y; } };
+struct ne_op { bool operator()(double x, double y) const { return x != y; } };
+struct and_op { bool operator()(bool x, bool y) const { return x && y; } };
+struct or_op { bool operator()(bool x, bool y) const { return x || y; } };
+
+inline Index broadcast_dim(Index a, Index b) {
+    if (a == b || b == 1) return a;
+    if (a == 1) return b;
+    throw shape_error("operands could not be broadcast together");
+}
+
+template <class F, class D1, class D2>
+auto broadcast(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b, F f) {
+    using S = decltype(f(std::declval<typename D1::Scalar>(), std::declval<typename D2::Scalar>()));
+    if constexpr (D1::ColsAtCompileTime == 1 && D2::ColsAtCompileTime == 1) {
+        // two 1-D arrays
+        using Out = Eigen::Array<S, Eigen::Dynamic, 1>;
+        if (a.size() == b.size()) {
+            if constexpr (std::is_same_v<F, add_op>) return Out(a + b);
+            else if constexpr (std::is_same_v<F, sub_op>) return Out(a - b);
+            else if constexpr (std::is_same_v<F, mul_op>) return Out(a * b);
+            else if constexpr (std::is_same_v<F, div_op>) return Out(a / b);
+            else return Out(a.binaryExpr(b, f));
+        }
+        if (b.size() == 1) {
+            const auto y = b(0);
+            return Out(a.unaryExpr([&](typename D1::Scalar x) { return f(x, y); }));
+        }
+        if (a.size() == 1) {
+            const auto x = a(0);
+            return Out(b.unaryExpr([&](typename D2::Scalar y) { return f(x, y); }));
+        }
+        throw shape_error("operands could not be broadcast together");
+    } else {
+        // 2-D (a Vec on either side has been turned into a (1, n) row by the caller)
+        using Out = Eigen::Array<S, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        if (a.rows() == b.rows() && a.cols() == b.cols()) {
+            if constexpr (std::is_same_v<F, add_op>) return Out(a + b);
+            else if constexpr (std::is_same_v<F, sub_op>) return Out(a - b);
+            else if constexpr (std::is_same_v<F, mul_op>) return Out(a * b);
+            else if constexpr (std::is_same_v<F, div_op>) return Out(a / b);
+            else return Out(a.binaryExpr(b, f));
+        }
+        using P1 = Eigen::Array<typename D1::Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        using P2 = Eigen::Array<typename D2::Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        const P1 x = a;
+        const P2 y = b;
+        const Index r = broadcast_dim(x.rows(), y.rows()), c = broadcast_dim(x.cols(), y.cols());
+        Out out(r, c);
+        for (Index i = 0; i < r; ++i)
+            for (Index j = 0; j < c; ++j)
+                out(i, j) = f(x(x.rows() == 1 ? 0 : i, x.cols() == 1 ? 0 : j),
+                              y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
+        return out;
+    }
+}
+
+// A op= B: B is broadcast to A's shape; A's shape never changes (NumPy raises
+// "non-broadcastable output operand" otherwise).
+// (The caller evaluates b first when it reads a itself, as in S += S.T.)
+template <class F, class D>
+void broadcast_into(Vec& a, const Eigen::ArrayBase<D>& b, F f) {
+    static_assert(D::ColsAtCompileTime == 1, "a 1-D array gets a 1-D right side");
+    if (b.size() == a.size()) {
+        if constexpr (std::is_same_v<F, add_op>) a += b;
+        else if constexpr (std::is_same_v<F, sub_op>) a -= b;
+        else if constexpr (std::is_same_v<F, mul_op>) a *= b;
+        else if constexpr (std::is_same_v<F, div_op>) a /= b;
+        else a = a.binaryExpr(b, f);
+        return;
+    }
+    if (b.size() != 1)
+        throw shape_error(a.size() == 1 ? "non-broadcastable output operand"
+                                        : "operands could not be broadcast together");
+    const double y = b(0);
+    for (Index i = 0; i < a.size(); ++i) a(i) = f(a(i), y);
+}
+
+template <class F, class D>
+void broadcast_into(Mat& a, const Eigen::ArrayBase<D>& b, F f) {
+    if (b.rows() == a.rows() && b.cols() == a.cols()) {
+        if constexpr (std::is_same_v<F, add_op>) a += b;
+        else if constexpr (std::is_same_v<F, sub_op>) a -= b;
+        else if constexpr (std::is_same_v<F, mul_op>) a *= b;
+        else if constexpr (std::is_same_v<F, div_op>) a /= b;
+        else a = a.binaryExpr(b, f);
+        return;
+    }
+    const Mat y = b;
+    if ((y.rows() != a.rows() && y.rows() != 1) || (y.cols() != a.cols() && y.cols() != 1))
+        throw shape_error("non-broadcastable output operand");
+    for (Index i = 0; i < a.rows(); ++i)
+        for (Index j = 0; j < a.cols(); ++j)
+            a(i, j) = f(a(i, j), y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
+}
+
+// v[i:j] = w, A[i] = w, A[:, j] = w, A[r0:r1, c0:c1] = B (and +=, ...): the right side is
+// broadcast to the part's shape, which never changes. dst is an Eigen block (a view).
+struct set_op { double operator()(double, double y) const { return y; } };
+template <class Dst, class Src, class F = set_op>
+void store(Dst&& dst, const Eigen::ArrayBase<Src>& src, F f = {}) {
+    if (src.rows() == dst.rows() && src.cols() == dst.cols()) {
+        if constexpr (std::is_same_v<F, set_op>) dst = src;
+        else if constexpr (std::is_same_v<F, add_op>) dst += src;
+        else if constexpr (std::is_same_v<F, sub_op>) dst -= src;
+        else if constexpr (std::is_same_v<F, mul_op>) dst *= src;
+        else if constexpr (std::is_same_v<F, div_op>) dst /= src;
+        else dst = dst.binaryExpr(src, f);
+        return;
+    }
+    if (src.size() == 1) {  // 1 element (any shape of 1s) fills the part
+        const double y = src(0, 0);
+        for (Index i = 0; i < dst.rows(); ++i)
+            for (Index j = 0; j < dst.cols(); ++j) dst(i, j) = f(dst(i, j), y);
+        return;
+    }
+    // a (1, m) row into each row of an (n, m) part, an (n, 1) column into each column
+    const Mat y = src;
+    const bool rows_ok = y.rows() == dst.rows() || y.rows() == 1, cols_ok = y.cols() == dst.cols() || y.cols() == 1;
+    if (!rows_ok || !cols_ok) {
+        // a 1-D part (a row or column view) against a 1-D right side of another length
+        throw shape_error("could not broadcast input array into the shape of the destination");
+    }
+    for (Index i = 0; i < dst.rows(); ++i)
+        for (Index j = 0; j < dst.cols(); ++j)
+            dst(i, j) = f(dst(i, j), y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
+}
+
 template <class D>
 auto pow(const Eigen::ArrayBase<D>& a, double p) {
     return a.unaryExpr([p](double x) { return std::pow(x, p); });
@@ -240,13 +384,15 @@ auto pow(double b, const Eigen::ArrayBase<D>& a) {
 }
 template <class D1, class D2>
 auto pow(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {
-    return a.binaryExpr(b, [](double x, double y) { return std::pow(x, y); });
+    return broadcast(a, b, pow_op{});
 }
 
 // np.maximum / np.minimum propagate NaN from either side (Eigen's max/min don't).
+struct max_op { double operator()(double x, double y) const { return np_maximum(x, y); } };
+struct min_op { double operator()(double x, double y) const { return np_minimum(x, y); } };
 template <class D1, class D2>
 auto maximum(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {
-    return a.binaryExpr(b, [](double x, double y) { return np_maximum(x, y); });
+    return broadcast(a, b, max_op{});
 }
 template <class D>
 auto maximum(const Eigen::ArrayBase<D>& a, double b) {
@@ -258,7 +404,7 @@ auto maximum(double a, const Eigen::ArrayBase<D>& b) {  // not maximum(b, a): ti
 }
 template <class D1, class D2>
 auto minimum(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {
-    return a.binaryExpr(b, [](double x, double y) { return np_minimum(x, y); });
+    return broadcast(a, b, min_op{});
 }
 template <class D>
 auto minimum(const Eigen::ArrayBase<D>& a, double b) {
@@ -275,27 +421,25 @@ auto clip(const Eigen::ArrayBase<D>& a, double lo, double hi) {
     return a.unaryExpr([lo, hi](double x) { return np_clip(x, lo, hi); });
 }
 
-// np.where(cond, x, y) with arrays or scalars on either branch.
+// np.where(cond, x, y) with arrays or scalars on either branch, broadcast together.
 inline double at(double v, Index, Index) { return v; }
 template <class D>
-double at(const Eigen::ArrayBase<D>& a, Index i, Index j) { return a(i, j); }
-
-template <class X, class C>
-void check_same_shape(const X& x, const C& c) {
-    if constexpr (!std::is_arithmetic_v<X>) {
-        if (x.rows() != c.rows() || x.cols() != c.cols())
-            throw shape_error("operands could not be broadcast together");
-    }
+auto at(const Eigen::ArrayBase<D>& a, Index i, Index j) {
+    return a(a.rows() == 1 ? 0 : i, a.cols() == 1 ? 0 : j);
 }
+inline Index rows_of(double) { return 1; }
+inline Index cols_of(double) { return 1; }
+template <class D> Index rows_of(const Eigen::ArrayBase<D>& a) { return a.rows(); }
+template <class D> Index cols_of(const Eigen::ArrayBase<D>& a) { return a.cols(); }
 
 template <class C, class X, class Y>
 auto where(const Eigen::ArrayBase<C>& cond, const X& x, const Y& y) {
-    check_same_shape(x, cond);
-    check_same_shape(y, cond);
-    plain_t<C> out(cond.rows(), cond.cols());
-    for (Index i = 0; i < cond.rows(); ++i)
-        for (Index j = 0; j < cond.cols(); ++j)
-            out(i, j) = cond(i, j) ? at(x, i, j) : at(y, i, j);
+    const Index r = broadcast_dim(broadcast_dim(cond.rows(), rows_of(x)), rows_of(y));
+    const Index c = broadcast_dim(broadcast_dim(cond.cols(), cols_of(x)), cols_of(y));
+    plain_t<C> out(r, c);
+    for (Index i = 0; i < r; ++i)
+        for (Index j = 0; j < c; ++j)
+            out(i, j) = at(cond, i, j) ? at(x, i, j) : at(y, i, j);
     return out;
 }
 
@@ -682,75 +826,6 @@ inline Mat hcat(std::initializer_list<Mat> parts) {
     return out;
 }
 
-// NumPy broadcasting between two 2-D arrays: each dimension must be equal, or 1 in one of
-// them (a (n, 1) column against an (n, m) matrix, a (1, m) row against it, ...).
-inline Index broadcast_dim(Index a, Index b) {
-    if (a == b || b == 1) return a;
-    if (a == 1) return b;
-    throw shape_error("operands could not be broadcast together");
-}
-
-struct add_op { double operator()(double x, double y) const { return x + y; } };
-struct sub_op { double operator()(double x, double y) const { return x - y; } };
-struct mul_op { double operator()(double x, double y) const { return x * y; } };
-struct div_op { double operator()(double x, double y) const { return x / y; } };
-struct pow_op { double operator()(double x, double y) const { return std::pow(x, y); } };
-
-// Same shapes (the usual case): Eigen's own vectorised + - * /, which round exactly as the
-// scalar operations do, straight into the result. Otherwise NumPy's broadcasting rule.
-template <class F, class D1, class D2>
-Mat broadcast(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b, F f) {
-    if (a.rows() == b.rows() && a.cols() == b.cols()) {
-        if constexpr (std::is_same_v<F, add_op>) return a + b;
-        else if constexpr (std::is_same_v<F, sub_op>) return a - b;
-        else if constexpr (std::is_same_v<F, mul_op>) return a * b;
-        else if constexpr (std::is_same_v<F, div_op>) return a / b;
-        else return a.binaryExpr(b, f);
-    }
-    const Mat x = a, y = b;
-    const Index r = broadcast_dim(x.rows(), y.rows()), c = broadcast_dim(x.cols(), y.cols());
-    if constexpr (!std::is_same_v<F, pow_op>) {
-        // the common shapes: a (1, m) row or an (n, 1) column against an (n, m) matrix
-        if (x.rows() == r && x.cols() == c && y.rows() == 1 && y.cols() == c) {
-            Mat out = x;
-            const auto row = y.row(0);
-            for (Index i = 0; i < r; ++i) out.row(i) = out.row(i).binaryExpr(row, f);
-            return out;
-        }
-        if (x.rows() == r && x.cols() == c && y.cols() == 1 && y.rows() == r) {
-            Mat out(r, c);
-            for (Index i = 0; i < r; ++i) out.row(i) = x.row(i).unaryExpr([&](double v) { return f(v, y(i, 0)); });
-            return out;
-        }
-    }
-    Mat out(r, c);
-    for (Index i = 0; i < r; ++i)
-        for (Index j = 0; j < c; ++j)
-            out(i, j) = f(x(x.rows() == 1 ? 0 : i, x.cols() == 1 ? 0 : j),
-                          y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
-    return out;
-}
-
-// A += B for 2-D arrays: B is broadcast to A's shape; A's shape never changes (NumPy raises
-// "non-broadcastable output operand" otherwise).
-// (The caller evaluates b first when it reads a itself, as in S += S.T.)
-template <class F, class D>
-void broadcast_into(Mat& a, const Eigen::ArrayBase<D>& b, F f) {
-    if (b.rows() == a.rows() && b.cols() == a.cols()) {
-        if constexpr (std::is_same_v<F, add_op>) a += b;
-        else if constexpr (std::is_same_v<F, sub_op>) a -= b;
-        else if constexpr (std::is_same_v<F, mul_op>) a *= b;
-        else if constexpr (std::is_same_v<F, div_op>) a /= b;
-        else a = a.binaryExpr(b, f);
-        return;
-    }
-    const Mat y = b;
-    if ((y.rows() != a.rows() && y.rows() != 1) || (y.cols() != a.cols() && y.cols() != 1))
-        throw shape_error("non-broadcastable output operand");
-    for (Index i = 0; i < a.rows(); ++i)
-        for (Index j = 0; j < a.cols(); ++j)
-            a(i, j) = f(a(i, j), y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
-}
 
 // =====================================================================================
 // Boolean-mask indexing: a[mask] picks the elements where mask is true, in row-major order
@@ -791,7 +866,6 @@ void masked_update(A& a, const Eigen::ArrayBase<M>& mask, double v, F f) {
         for (Index j = 0; j < a.cols(); ++j)
             if (m(i, j)) a(i, j) = f(a(i, j), v);
 }
-struct set_op { double operator()(double, double y) const { return y; } };
 
 // =====================================================================================
 // numpy.linalg. LU with partial pivoting is the algorithm LAPACK's gesv uses; like LAPACK,

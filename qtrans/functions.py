@@ -16,7 +16,9 @@ import inspect
 
 from . import library as lib
 from .errors import Unsupported
-from .core import iv_of
+import collections
+
+from .core import dims_of, int_token, iv_of, same_dim
 from .core import cpp_string
 from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown, cpp_ident, wrap)
 from .structs import THIS
@@ -207,6 +209,182 @@ class FunctionTranslator(ExprTranslator):
         self.py_names = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)} | {a.arg for a in fdef.args.args}
         self.has_self = sig.kind in ("instance", "property", "post_init", "init")
         self.all_names.discard("self")
+        # size tokens (for NumPy broadcasting): see _dim_analysis
+        self.dims_h: dict = {}
+        self._now_ok = False
+        self._dim_analysis()
+
+    # --- sizes -------------------------------------------------------------------------
+    def _dim_analysis(self):
+        """Which names are never rebound, so that a size token built from them means the same
+        size wherever it is used. A parameter that is never assigned, and a local assigned
+        exactly once, qualify (in-place `x += y` on an array keeps its shape, so it doesn't
+        count). A token only ever names such values, so it stays true inside loops too; a
+        fresh token for an otherwise unknown size is only made outside loops, where the one
+        assignment runs at most once per call."""
+        stores, aug, in_loop = collections.Counter(), collections.Counter(), set()
+
+        def visit(node, loop):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                stores[node.id] += 1
+                if loop:
+                    in_loop.add(node.id)
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                aug[node.target.id] += 1
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                stores[node.name] += 2
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                for n in node.names:
+                    stores[n] += 2
+            loop = loop or isinstance(node, (ast.For, ast.While, ast.comprehension, ast.Lambda))
+            for c in ast.iter_child_nodes(node):
+                visit(c, loop)
+        for st in self.body:
+            visit(st, False)
+        self._stores, self._aug, self._in_loop = stores, aug, in_loop
+
+    def _rebinds(self, name, t) -> int:
+        return self._stores[name] - (self._aug[name] if is_array(t) else 0)
+
+    @staticmethod
+    def _clean(tok):
+        """A token that may name a value of the current statement only ("now") is no proof
+        across statements."""
+        if isinstance(tok, tuple):
+            if tok and tok[0] == "now":
+                return None
+            return None if any(isinstance(x, tuple) and FunctionTranslator._clean(x) is None for x in tok) else tok
+        return tok
+
+    def _event_dims(self, ev):
+        """The size tokens of the value one assignment stores (None where unknown)."""
+        t = self.var_type(ev.name)
+        self.current = ev.stmt
+        try:
+            if ev.kind == "elt":
+                i, _ = ev.index
+                v = ev.payload
+                if isinstance(v, ast.Attribute) and v.attr == "shape":
+                    A = self.expr(v.value)
+                    if is_array(A.type):
+                        return self._clean(dims_of(A)[i])  # n, m = A.shape
+                return None if t == INT else (None,) * t.rank
+            e = self.expr(ev.payload)
+        except (Unsupported, _Unknown, KeyError):
+            return None if t == INT else (None,) * t.rank
+        if t == INT:
+            return self._clean(int_token(e)) if e.type in (INT, BOOL) else None
+        d = dims_of(e) if e.type == t else (None,) * t.rank
+        return tuple(self._clean(x) for x in d)
+
+    def infer_dims(self):
+        """Size tokens for every array and int variable: a fixpoint like type inference. The
+        guess for a variable is what its assignments agree on (for a parameter, also its
+        argument's own sizes); then every assignment is evaluated again under the guesses, and a
+        dimension is dropped wherever one disagrees, until none does. At the fixpoint every
+        assignment stores a value of the guessed sizes, given that every variable it reads has
+        its guessed sizes, so by induction over the run, each variable always has them."""
+        tracked = {}
+        for name in list(self.params) + self.locals_order:
+            t = self.params.get(name) or self.local_types.get(name)
+            if is_array(t) or t == INT:
+                tracked[name] = t
+        evs = {}
+        for ev in self.events:
+            if ev.name not in tracked:
+                continue
+            if isinstance(ev.stmt, ast.AugAssign) and is_array(tracked[ev.name]):
+                continue  # in place: the array keeps its shape
+            evs.setdefault(ev.name, []).append(ev)
+
+        def base(name):  # what the variable holds before any assignment
+            t = tracked[name]
+            if name not in self.params:
+                return None
+            return ("p", name) if t == INT else tuple(("p", name, k) for k in range(t.rank))
+
+        def once(name):  # a local assigned once, outside loops: its value's sizes are fixed per call
+            return (name not in self.params and self._rebinds(name, tracked[name]) == 1
+                    and name not in self._in_loop and len(evs.get(name, [])) == 1)
+
+        def fresh(name, d):
+            t = tracked[name]
+            if not once(name):
+                return d
+            if t == INT:
+                return d if d is not None else ("v", name)
+            return tuple(x if x is not None else ("v", name, k) for k, x in enumerate(d))
+
+        def rank(name):
+            t = tracked[name]
+            return 0 if t == INT else t.rank
+
+        saved = (list(self.notes), set(self._noted), self.inferring)
+        self.inferring = True
+        self.dims_h = {}
+        try:
+            # guess (any guess will do: the check below is what proves): what the assignments
+            # agree on, ignoring the ones not known yet; repeated, as one guess feeds the next
+            self.dims_h = {n: base(n) for n in tracked if base(n) is not None}
+            for _ in range(len(tracked) + 2):
+                grown = False
+                for n in tracked:
+                    vals = [self._event_dims(ev) for ev in evs.get(n, [])]
+                    vals += [base(n)] if base(n) is not None else []
+                    r = rank(n)
+                    if r == 0:
+                        known = {v for v in vals if v is not None}
+                        g = known.pop() if len(known) == 1 else None
+                    else:
+                        g = tuple((lambda ks: ks.pop() if len(ks) == 1 else None)(
+                            {v[k] for v in vals if v[k] is not None}) for k in range(r))
+                    g = fresh(n, g)
+                    if g != self.dims_h.get(n):
+                        self.dims_h[n] = g
+                        grown = True
+                if not grown:
+                    break
+            for n in tracked:
+                self.dims_h.setdefault(n, None if rank(n) == 0 else (None,) * rank(n))
+            # then check, dropping what isn't confirmed
+            changed = True
+            for _ in range(2 * len(tracked) + 3):
+                changed = False
+                for n in tracked:
+                    vals = [self._event_dims(ev) for ev in evs.get(n, [])]
+                    g = self.dims_h[n]
+                    if once(n):
+                        new = fresh(n, vals[0])  # its one value: proven sizes, else its own
+                    else:
+                        vals += [base(n)] if base(n) is not None else []
+                        if rank(n) == 0:
+                            new = g if g is not None and all(v == g for v in vals) else None
+                        else:
+                            new = tuple(x if x is not None and all(v[k] == x for v in vals) else None
+                                        for k, x in enumerate(g))
+                    if new != g:
+                        self.dims_h[n] = new
+                        changed = True
+                if not changed:
+                    break
+            if changed:
+                self.dims_h = {}  # no fixpoint within the bound: prove nothing
+        finally:
+            self.notes, self._noted, self.inferring = saved
+        self._now_ok = not any(isinstance(x, ast.NamedExpr) for x in ast.walk(self.fdef))
+
+    def _var_dims(self, name, t):
+        """Size tokens for a read of a variable: proven ones, else ones that hold within the
+        current statement only (a local can't be rebound in the middle of an expression)."""
+        h = getattr(self, "dims_h", {}).get(name)
+        now_ok = getattr(self, "_now_ok", False) and self.current is not None
+        if t == INT:
+            return None, h if h is not None else (("now", name, id(self.current)) if now_ok else None)
+        if not is_array(t):
+            return None, None
+        h = h or (None,) * t.rank
+        return tuple(x if x is not None else (("now", name, k, id(self.current)) if now_ok else None)
+                     for k, x in enumerate(h)), None
 
     def ident(self, name: str) -> str:
         """The C++ name of a local or parameter. Inside a method, one that would hide a field
@@ -234,12 +412,16 @@ class FunctionTranslator(ExprTranslator):
                 return Expr(self.ident(n), P_ATOM, t, simple=True, iv=self.loop_iv.get(n))
         elif n in self.params:
             t = self.params[n]
+            dims, tok = self._var_dims(n, t)
+            return Expr(self.ident(n), P_ATOM, t, simple=True, dims=dims, dimtok=tok)
         else:
             t = self.local_types.get(n)
             if t is None:
                 if self.inferring:
                     raise _Unknown(n)
                 raise Unsupported(node, f"could not infer a type for '{n}'")
+            dims, tok = self._var_dims(n, t)
+            return Expr(self.ident(n), P_ATOM, t, simple=True, dims=dims, dimtok=tok)
         return Expr(self.ident(n), P_ATOM, t, simple=True)
 
     # --- driver ----------------------------------------------------------------------
@@ -249,6 +431,7 @@ class FunctionTranslator(ExprTranslator):
         self.check_loop_vars()
         self.finish_scan()
         self.infer_types()
+        self.infer_dims()
         if self.fdef.name in self.mod.errstate_funcs:
             self.note("errstate", "np.errstate(...) blocks are translated as their contents: they only "
                                   "change which floating-point warnings NumPy prints, never the values")
@@ -1236,6 +1419,7 @@ class FunctionTranslator(ExprTranslator):
         elts = self.unpack_types(e.type)
         if elts is None or len(elts) != len(names):
             raise Unsupported(s, f"cannot unpack a {e.type} value into {len(names)} names")
+
         for n, et in zip(names, elts):
             if n not in self.ignored and not assignable(self.var_type(n), et):
                 raise Unsupported(s, f"'{n}' is declared {self.var_type(n)} but gets a {et} value")
@@ -1262,6 +1446,7 @@ class FunctionTranslator(ExprTranslator):
             raise Unsupported(s, f"'{root}' may be None, and storing into it is not supported",
                               f"after the None check, work on a new name: {root}_ = {root}.copy()")
         code, kind = self.array_subscript(t, target=True)
+        part = self._last_target_dims  # (reading the right side may index other arrays)
         v = self.expr(value_node)
         if kind == "mask":
             base, mask = code
@@ -1281,6 +1466,12 @@ class FunctionTranslator(ExprTranslator):
             rhs = f"{wrap(v, P_ATOM)}.transpose()" if kind == "row" else v.code
             if self._needs_eval(value_node, root, whole_array=False):
                 rhs = f"({rhs}).eval()"  # NumPy computes the whole right side before storing
+            if not all(same_dim(a, b) for a, b in zip(part, dims_of(v))):
+                # NumPy broadcasts the right side into the part (a length-1 Vec fills it)
+                op = {"=": "", "+=": ", qt::add_op{}", "-=": ", qt::sub_op{}", "*=": ", qt::mul_op{}",
+                      "/=": ", qt::div_op{}"}[sym]
+                self.emit(f"qt::store({code}, {rhs}{op});")
+                return
         self.emit(f"{code} {sym} {rhs};")
 
     def _field_target(self, t, s):
@@ -1336,16 +1527,7 @@ class FunctionTranslator(ExprTranslator):
                 code = rhs.code
                 if self._needs_eval(s.value, name, whole_array=True):
                     code = f"({code}).eval()"
-                if rhs.type == vt == MAT:
-                    # NumPy broadcasts a (1, m) or (n, 1) right side into the target's shape
-                    op = {ast.Add: "add_op", ast.Sub: "sub_op", ast.Mult: "mul_op", ast.Div: "div_op"}[type(s.op)]
-                    self.emit(f"qt::broadcast_into({target}, {code}, qt::{op}{{}});")
-                elif rhs.type == vt:
-                    self.emit(f"{target} {syms[type(s.op)]} {code};")
-                elif vt == MAT:
-                    self.emit(f"{target}.rowwise() {syms[type(s.op)]} {wrap(rhs, P_ATOM)}.transpose();")
-                else:
-                    raise Unsupported(s, f"{type(s.op).__name__}= of a Mat into a Vec can't broadcast")
+                self._emit_inplace(s, target, vt, dims_of(self.variable(s.target)), rhs, code, syms)
             else:
                 self.need_scalar(rhs, s.value, "array arithmetic")
                 self.emit(f"{target} {syms[type(s.op)]} {self.as_double(rhs).code};")
@@ -1366,6 +1548,26 @@ class FunctionTranslator(ExprTranslator):
         else:
             self.emit(f"{self.ident(name)} = {result.code};")
 
+    def _emit_inplace(self, s, target, tt, tdims, rhs, code, syms):
+        """target op= rhs for arrays. NumPy broadcasts the right side into the target's shape
+        (a length-1 Vec, a (1, m) row, ...) and never changes the target's shape. Where the
+        sizes provably match, Eigen's own operator; otherwise qt::broadcast_into."""
+        sym = syms[type(s.op)]
+        op = {ast.Add: "add_op", ast.Sub: "sub_op", ast.Mult: "mul_op", ast.Div: "div_op"}[type(s.op)]
+        rd = dims_of(rhs)
+        if rhs.type == tt:
+            if all(same_dim(a, b) for a, b in zip(tdims, rd)):
+                self.emit(f"{target} {sym} {code};")
+            else:
+                self.emit(f"qt::broadcast_into({target}, {code}, qt::{op}{{}});")
+        elif tt == MAT:  # a Vec across the rows
+            if same_dim(tdims[1], rd[0]):
+                self.emit(f"{target}.rowwise() {sym} {wrap(rhs, P_ATOM)}.transpose();")
+            else:
+                self.emit(f"qt::broadcast_into({target}, {wrap(rhs, P_ATOM)}.transpose(), qt::{op}{{}});")
+        else:
+            raise Unsupported(s, f"{type(s.op).__name__}= of a Mat into a Vec can't broadcast")
+
     def aug_attribute(self, s, syms):
         """obj.x += v, self.w *= 2.0: the field updated in place (numbers and arrays)."""
         code, f = self._field_target(s.target, s)
@@ -1377,15 +1579,7 @@ class FunctionTranslator(ExprTranslator):
                 rc = rhs.code
                 if self._needs_eval(s.value, subscript_root(s.target), whole_array=False):
                     rc = f"({rc}).eval()"
-                if f.type == MAT and rhs.type == MAT:
-                    op = {ast.Add: "add_op", ast.Sub: "sub_op", ast.Mult: "mul_op", ast.Div: "div_op"}[type(s.op)]
-                    self.emit(f"qt::broadcast_into({code}, {rc}, qt::{op}{{}});")
-                elif rhs.type == f.type:
-                    self.emit(f"{code} {syms[type(s.op)]} {rc};")
-                elif f.type == MAT:
-                    self.emit(f"{code}.rowwise() {syms[type(s.op)]} {wrap(rhs, P_ATOM)}.transpose();")
-                else:
-                    raise Unsupported(s, "a Mat can't be added into a Vec field")
+                self._emit_inplace(s, code, f.type, (None,) * f.type.rank, rhs, rc, syms)
             else:
                 self.need_scalar(rhs, s.value, "array arithmetic")
                 self.emit(f"{code} {syms[type(s.op)]} {self.as_double(rhs).code};")

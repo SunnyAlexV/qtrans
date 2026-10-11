@@ -311,7 +311,8 @@ def random_value(rng, t, n=3, shape=None):
 
 
 # --- rectangular and empty arrays ---------------------------------------------------------------------
-_SLOT_CHOICES = {1: ("n", "m"), 2: ("nn", "nm", "mn", "mm")}
+# "1": a dimension of length 1, which NumPy stretches against any other (broadcasting)
+_SLOT_CHOICES = {1: ("n", "m", "1"), 2: ("nn", "nm", "mn", "mm", "1m", "n1")}
 
 
 def _rank_of(t):
@@ -322,18 +323,17 @@ def _rank_of(t):
 def shape_plans(fn, sig, rng, limit=12, max_combos=243):
     """Which non-square shapes the function accepts. Square cases (every Vec of n, every Mat
     n x n) can't catch a transposed dimension, so each array parameter is also tried as length
-    n or m (a Vec) and n x n, n x m or m x n (a Mat), with n = 3, m = 4; an assignment is kept
-    when Python runs the function on it. Python is the judge of which shapes make sense.
+    n, m or 1 (a Vec) and n x n, n x m, m x n, m x m, 1 x m or n x 1 (a Mat), with n = 3, m = 4;
+    an assignment is kept when Python runs the function on it. Python is the judge of which
+    shapes make sense; the 1s are where NumPy broadcasts.
     -> [plan], each plan a tuple with an entry per parameter ("n", "nm", ... or None)"""
     import itertools
     slots = [i for i, p in enumerate(sig.params) if _rank_of(p.type)]
     if not slots:
         return []
     combos = list(itertools.product(*[_SLOT_CHOICES[_rank_of(sig.params[i].type)] for i in slots]))
-    combos = [c for c in combos if any(x in ("m", "nm", "mn") for x in c)]  # not square (all n, or all m)
-    if len(combos) > max_combos:
-        idx = rng.choice(len(combos), size=max_combos, replace=False)
-        combos = [combos[i] for i in sorted(idx)]
+    combos = [c for c in combos if not (set(c) <= {"n", "nn"} or set(c) <= {"m", "mm"})]  # not all square
+    combos = [combos[i] for i in rng.permutation(len(combos))[:max_combos]]  # a spread, not the first few
     plans = []
     for combo in combos:
         plan = [None] * len(sig.params)
@@ -356,7 +356,7 @@ def shape_plans(fn, sig, rng, limit=12, max_combos=243):
 
 
 def plan_args(rng, sig, plan, n, m, optional_none=True):
-    dims = {"n": n, "m": m}
+    dims = {"n": n, "m": m, "1": 1}
     out = []
     for p, c in zip(sig.params, plan):
         if c is None:
@@ -1213,6 +1213,22 @@ def python_sensitivity(fn, case, sig, out_t, rng, trials=3, normwise_too=False):
     return worst
 
 
+def python_flips(fn, case, sig, rng, trials=3, normwise_too=False) -> bool:
+    """Does a rounding-sized nudge of the inputs change whether Python raises? For linear
+    algebra on a numerically singular matrix (condition number near 1/eps), whether LU meets an
+    exactly-zero pivot is decided by rounding, so "Singular matrix" on one side and a result on
+    the other is a knife edge, not a wrong translation."""
+    has_array = any(isinstance(a, np.ndarray) for a in case.args)
+    for normwise in ((False, True) if has_array and normwise_too else (False,)):
+        for _ in range(trials):
+            nudged = run_python(fn, tuple(_nudge(a, rng, normwise) for a in case.args), sig)
+            if is_timeout(nudged):
+                return False
+            if nudged[0] != case.py[0]:
+                return True
+    return False
+
+
 # --- main entry point ----------------------------------------------------------------------------
 def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
                 compiler=None, build_dir=None, eigen=None, profile="strict") -> VerifyReport:
@@ -1464,6 +1480,13 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
             c.sensitivity = python_sensitivity(getattr(pymods[fc.module], fc.name), c, sig, output_type(sig),
                                                nudge_rng, normwise_too=fc.name in normwise)
             if c.rel_err <= 100 * c.sensitivity:
+                c.outcome = "illcond"
+        elif c.outcome == "mismatch" and fc.name in linalg and (c.py[0] == "ok") != (c.cpp[0] == "ok") \
+                and "ValueError" in (c.py[1] if c.py[0] == "exc" else c.cpp[1]):
+            # one side found the matrix singular (LinAlgError is a ValueError): ill-conditioned
+            # when Python's own verdict changes under a rounding-sized nudge
+            if python_flips(getattr(pymods[fc.module], fc.name), c, sig, nudge_rng, normwise_too=fc.name in normwise):
+                c.sensitivity = math.inf
                 c.outcome = "illcond"
         if c.outcome == "mismatch" and fc.name in linalg and edge_inputs(c.args):
             # matrix products / LAPACK on inf, NaN, subnormals or values near overflow: NumPy's

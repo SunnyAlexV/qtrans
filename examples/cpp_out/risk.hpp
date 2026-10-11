@@ -80,7 +80,7 @@ inline qt::Vec rolling_mean(const qt::Vec& x, long long window) {
     qt::Vec c = qt::cumsum(x);
     qt::Vec out = qt::zeros(qt::iadd(qt::isub(x.size(), window), 1LL));
     out(0) = c(qt::idx(qt::isub(window, 1LL), c.size())) / static_cast<double>(window);
-    qt::slice(out, 1, qt::none) = (qt::slice(c, window, qt::none) - qt::slice(c, qt::none, qt::ineg(window))) / static_cast<double>(window);
+    qt::store(qt::slice(out, 1, qt::none), qt::broadcast(qt::slice(c, window, qt::none), qt::slice(c, qt::none, qt::ineg(window)), qt::sub_op{}) / static_cast<double>(window));
     return out;
 }
 

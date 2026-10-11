@@ -75,7 +75,7 @@ inline qt::Vec bs_explicit_fd(double K, double r, double sigma, double T, double
     qt::Vec c = 0.5 * dt * (sigma * sigma * i.square() + r * i);
     for (long long k = 1; k < qt::iadd(n_t, 1LL); ++k) {
         double tau = static_cast<double>(k) * dt;
-        qt::slice(V, 1, -1) = (a * qt::slice(V, qt::none, -2) + b * qt::slice(V, 1, -1) + c * qt::slice(V, 2, qt::none)).eval();  // every interior node from the old values
+        qt::store(qt::slice(V, 1, -1), (qt::broadcast(qt::broadcast(qt::broadcast(a, qt::slice(V, qt::none, -2), qt::mul_op{}), qt::broadcast(b, qt::slice(V, 1, -1), qt::mul_op{}), qt::add_op{}), qt::broadcast(c, qt::slice(V, 2, qt::none), qt::mul_op{}), qt::add_op{})).eval());  // every interior node from the old values
         if (is_call) {
             V(0) = 0.0;
             V(V.size() - 1) = S_max - K * std::exp(-r * tau);

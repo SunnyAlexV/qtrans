@@ -49,7 +49,7 @@ inline qt::Mat ledoit_wolf_identity(const qt::Mat& X) {
     qt::Mat Xc = qt::broadcast(X, qt::as_row(qt::mean(X, 0)), qt::sub_op{});
     qt::Mat S = qt::matmul(Xc.transpose(), Xc) / static_cast<double>(t);
     double m = qt::trace(S) / static_cast<double>(n);
-    double d2 = qt::sum(qt::broadcast(S, m * qt::eye(n), qt::sub_op{}).square()) / static_cast<double>(n);
+    double d2 = qt::sum((S - m * qt::eye(n)).square()) / static_cast<double>(n);
     // The textbook form of b_bar2 loops over every observation, building an
     // n x n outer product each time. With 15 years of daily data that is ~3,800
     // Python iterations per call, and a walk-forward backtest calls this once
@@ -63,13 +63,13 @@ inline qt::Mat ledoit_wolf_identity(const qt::Mat& X) {
     // approximation — verified against the loop to machine precision by a test.
     qt::Vec sq = qt::einsum1("ij,ij->i", {Xc, Xc}, {2, 2});  // ||x_i||^2 for each i
     double term1 = qt::dot(sq, sq);  // sum_i (x_i'x_i)^2
-    double term2 = qt::sum(qt::broadcast(qt::matmul(Xc, S), Xc, qt::mul_op{}));  // sum_i x_i' S x_i
-    double term3 = static_cast<double>(t) * qt::sum(qt::broadcast(S, S, qt::mul_op{}));  // t ||S||_F^2
+    double term2 = qt::sum(qt::matmul(Xc, S) * Xc);  // sum_i x_i' S x_i
+    double term3 = static_cast<double>(t) * qt::sum(S * S);  // t ||S||_F^2
     double b_bar2 = (term1 - 2.0 * term2 + term3) / static_cast<double>(qt::ipow(t, 2)) / static_cast<double>(n);
     double b2 = std::min(b_bar2, d2);
     double a2 = d2 - b2;
     double shrink = d2 > 0 ? b2 / d2 : 1.0;
-    qt::Mat sigma = qt::broadcast(shrink * m * qt::eye(n), (d2 > 0 ? a2 / d2 : 0.0) * S, qt::add_op{});
+    qt::Mat sigma = shrink * m * qt::eye(n) + (d2 > 0 ? a2 / d2 : 0.0) * S;
     return sigma;
 }
 
@@ -124,7 +124,7 @@ inline qt::Vec variance_ratio(const qt::Mat& returns, long long h, double shrink
         return qt::ones(n);
     }
     qt::Vec varh = qt::var(Rh, 0, 1);
-    qt::Vec vr = qt::where(var1 > 1e-18, varh / (static_cast<double>(h) * var1), 1.0);
+    qt::Vec vr = qt::where(var1 > 1e-18, qt::broadcast(varh, static_cast<double>(h) * var1, qt::div_op{}), 1.0);
     vr = qt::where(vr.isFinite(), vr, 1.0);
     // Effective independent observations at this horizon, not the overlapping count.
     double n_eff = static_cast<double>(R.rows()) / static_cast<double>(h);
@@ -201,14 +201,14 @@ inline qt::Vec posterior_mu(const qt::Vec& pi, const qt::Mat& Sigma, const std::
     // Omega = np.asarray(Omega, dtype=float): already a float64 array, so NumPy returns it unchanged
     qt::Mat tauS = tau * Sigma;
     qt::Mat A = qt::broadcast(qt::matmul(qt::matmul(qt::value(P), tauS), qt::value(P).transpose()), Omega, qt::add_op{});
-    qt::Vec resid = Q - qt::matvec(qt::value(P), pi);
+    qt::Vec resid = qt::broadcast(Q, qt::matvec(qt::value(P), pi), qt::sub_op{});
     qt::Vec adj{};
     try {
         adj = qt::matvec(qt::matmul(tauS, qt::value(P).transpose()), qt::solve(A, resid));
     } catch (const qt::linalg_error&) {  // except np.linalg.LinAlgError
         adj = qt::matvec(qt::matmul(tauS, qt::value(P).transpose()), qt::matvec(qt::pinv(A), resid));
     }
-    return pi + adj;
+    return qt::broadcast(pi, adj, qt::add_op{});
 }
 
 /// Posterior covariance of returns: Sigma_p = Sigma + M, where M is the
@@ -221,17 +221,17 @@ inline qt::Mat posterior_sigma(const qt::Mat& Sigma, const std::optional<qt::Mat
     // Sigma = np.asarray(Sigma, dtype=float): already a float64 array, so NumPy returns it unchanged
     qt::Mat tauS = tau * Sigma;
     if (!P.has_value() || qt::value(P).size() == 0) {
-        return nearest_psd(qt::broadcast(Sigma, tauS, qt::add_op{}));
+        return nearest_psd(Sigma + tauS);
     }
     // P = np.asarray(P, dtype=float): already a float64 array, so NumPy returns it unchanged
     qt::Mat A = qt::broadcast(qt::matmul(qt::matmul(qt::value(P), tauS), qt::value(P).transpose()), Omega, qt::add_op{});
     qt::Mat M{};
     try {
-        M = qt::broadcast(tauS, qt::matmul(qt::matmul(tauS, qt::value(P).transpose()), qt::solve(A, qt::matmul(qt::value(P), tauS))), qt::sub_op{});
+        M = tauS - qt::matmul(qt::matmul(tauS, qt::value(P).transpose()), qt::solve(A, qt::matmul(qt::value(P), tauS)));
     } catch (const qt::linalg_error&) {  // except np.linalg.LinAlgError
-        M = qt::broadcast(tauS, qt::matmul(qt::matmul(qt::matmul(qt::matmul(tauS, qt::value(P).transpose()), qt::pinv(A)), qt::value(P)), tauS), qt::sub_op{});
+        M = tauS - qt::matmul(qt::matmul(qt::matmul(qt::matmul(tauS, qt::value(P).transpose()), qt::pinv(A)), qt::value(P)), tauS);
     }
-    return nearest_psd(qt::broadcast(Sigma, M, qt::add_op{}));
+    return nearest_psd(Sigma + M);
 }
 
 // =========================================================

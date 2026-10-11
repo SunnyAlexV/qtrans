@@ -48,6 +48,25 @@ def test_example_bindings_match_python(built, name):
     assert sum(c.cases for c in r.checks) > 500
 
 
+def test_partial_update_before_a_later_error_matches_python(built):
+    """The release smoke test's case: rebalance() broadcasts a length-1 weights array against
+    the target (NumPy stretches it), re-points weights and pays the cost, and only the second
+    call fails (weights @ prices, 4 against 1). The object must be left as Python leaves it."""
+    import importlib.util
+    ext = built(EXAMPLES / "instruments.py")
+    mod = ext.load()
+    spec = importlib.util.spec_from_file_location("instruments_py", EXAMPLES / "instruments.py")
+    py = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(py)
+    states = []
+    for fn in (py.run_rebalances, mod.run_rebalances):
+        p = py.Portfolio(np.array([0.5]), 44.5)
+        with pytest.raises(ValueError):
+            fn(p, np.array([1.0, 7.0, 0.8, 0.37]), np.array([-0.5]), 90)
+        states.append((p.weights.tolist(), p.cash, p.trades))
+    assert states[0] == states[1] and states[0][2] == 1
+
+
 def test_semantics_module_matches_python(built):
     r = _check(built, DATA / "bind_semantics.py", n=100)
     assert set(r.extension.binder.bound) >= {"scale_inplace", "draws", "solve2", "maybe", "add_into"}

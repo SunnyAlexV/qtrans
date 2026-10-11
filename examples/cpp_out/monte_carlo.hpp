@@ -135,7 +135,7 @@ inline std::tuple<double, double> portfolio_var_mc(const qt::Vec& w, const qt::V
     qt::Rng rng(seed);
     qt::Mat L = qt::cholesky(cov);
     qt::Mat Z = rng.standard_normal(n_sims, w.size());
-    qt::Mat returns = qt::matmul(Z, L.transpose()).rowwise() + mu.transpose();  // each row is one scenario of correlated asset returns
+    qt::Mat returns = qt::broadcast(qt::matmul(Z, L.transpose()), mu.transpose(), qt::add_op{});  // each row is one scenario of correlated asset returns
     qt::Vec pnl = qt::matvec(returns, w);
     double var = -qt::quantile(pnl, 1 - alpha);
     qt::Mask tail = pnl <= -var;

@@ -1003,10 +1003,13 @@ def _same_trace(a, b, rtol, atol) -> bool:
     return True
 
 
-def _outcome(py, cpp, t, rtol, atol, sens_fn=None):
+def _outcome(py, cpp, t, rtol, atol, sens_fn=None, flip_fn=None):
     """Compare ("ok", value) / ("exc", e) pairs the way verify does."""
     if py[0] == "exc" and cpp[0] == "exc" and _related(py[1], cpp[1]):
         return "match"
+    if flip_fn is not None and (py[0] == "ok") != (cpp[0] == "ok") \
+            and isinstance(py[1] if py[0] == "exc" else cpp[1], ValueError) and flip_fn():
+        return "illcond"  # a singular matrix on one side only, and Python's own verdict is a knife edge
     case = V.Case("", (), "")
     case.py = ("ok", py[1]) if py[0] == "ok" else ("exc", V._py_category(py[1]), str(py[1]))
     case.cpp = ("ok", cpp[1]) if cpp[0] == "ok" else ("exc", type(cpp[1]).__name__, str(cpp[1]))
@@ -1083,6 +1086,7 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
         tolerances = getattr(pymod, "QTRANS_TOLERANCE", {}) or {}
     bound = set(binder.bound)
     checks = []
+    linalg = V.linalg_functions(project.paths.values()) if project is not None else set()
 
     def tol_of(name):
         tol = tolerances.get(name, rtol)
@@ -1127,6 +1131,13 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
                     return math.inf
                 return V.python_sensitivity(fn, c, sig, V.output_type(sig), nudge_rng,
                                             normwise_too=name in normwise)
+
+            def flips(args=args):
+                if name not in linalg:
+                    return False
+                c = V.Case(name, tuple(args), "")
+                c.py = V.run_python(fn, c.args, sig)
+                return V.python_flips(fn, c, sig, nudge_rng, normwise_too=name in normwise)
             variants = [_fresh(args, types)]
             if has_obj:
                 variants.append([_to_compiled(a, t, compiled_classes) for a, t in zip(_fresh(args, types), types)])
@@ -1134,7 +1145,7 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
             for k, bargs in enumerate(variants):
                 bsnap = _snapshot(bargs, obj_refs) if k == 0 else []
                 cpp, _ = _result(bfn, bargs, sig.params, sig.ret, ref_idx)
-                o = _outcome(py, cpp, out_t or sig.ret, f_rtol, f_atol, sens)
+                o = _outcome(py, cpp, out_t or sig.ret, f_rtol, f_atol, sens, flips)
                 if k == 0 and o != "mismatch" and not _same_trace(ptrace, _trace(bargs, bsnap), f_rtol, f_atol):
                     o = "mismatch"  # changed in place where Python re-points, or the other way round
                     cpp = ("ok", ("arrays held by the objects passed in:", _trace(bargs, bsnap), "Python:", ptrace))

@@ -249,7 +249,7 @@ inline double Portfolio::value(const qt::Vec& prices) const {
 
 /// Move to the target weights, paying cost_bps on the turnover out of cash.
 inline double Portfolio::rebalance(const qt::Vec& target, const qt::Vec& prices, double cost_bps) {
-    double turnover = qt::sum((target - weights).abs());
+    double turnover = qt::sum(qt::broadcast(target, weights, qt::sub_op{}).abs());
     double cost = turnover * cost_bps * 0.0001 * value(prices);
     weights = target;
     cash -= cost;

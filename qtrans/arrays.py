@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import ast
 
-from .core import SIZE_IV
+from .core import SIZE_IV, dims_of, int_token, same_dim
 from .core import P_ADD, P_ATOM, P_EQ, P_MUL, P_REL, P_UNARY, Expr, wrap
 from .errors import Unsupported
 from .types import BOOL, FLOAT, INT, MAT, RNG, VEC, ArrayType, MaskType, Scalar, StructType, TupleType, is_array
@@ -50,6 +50,17 @@ ARRAY_FUNCS = set(_MEMBER) | set(_HELPER) | set(_MASK_FN) | set(_REDUCE) | {
 # functions taking a list of arrays: np.column_stack([a, b]) ...
 STACKERS = {"numpy.column_stack", "numpy.vstack", "numpy.row_stack", "numpy.hstack", "numpy.concatenate"}
 _BC_OPS = {"+": "qt::add_op{}", "-": "qt::sub_op{}", "*": "qt::mul_op{}", "/": "qt::div_op{}"}
+_CMP_OPS = {"<": "qt::lt_op{}", "<=": "qt::le_op{}", ">": "qt::gt_op{}", ">=": "qt::ge_op{}",
+            "==": "qt::eq_op{}", "!=": "qt::ne_op{}"}
+
+
+def _joined(a: tuple, b: tuple) -> tuple:
+    """The size tokens of a broadcast result: a dimension is known where both sides agree."""
+    return tuple(x if same_dim(x, y) else None for x, y in zip(a, b))
+
+
+def _equal(a: tuple, b: tuple) -> bool:
+    return len(a) == len(b) and all(same_dim(x, y) for x, y in zip(a, b))
 # functions that make arrays from scalars: always take the array path
 _CREATORS = {"numpy.zeros", "numpy.ones", "numpy.full", "numpy.eye", "numpy.identity", "numpy.linspace",
              "numpy.arange", "numpy.array", "numpy.asarray"}
@@ -93,15 +104,19 @@ class ArrayOps:
 
     def _plain(self, e: Expr) -> Expr:
         """An Eigen expression as a concrete array, where C++ needs both sides of ?: to match."""
-        return Expr(f"{e.type.cpp()}({e.code})", P_ATOM, e.type)
+        return Expr(f"{e.type.cpp()}({e.code})", P_ATOM, e.type, dims=e.dims)
 
     # --- arithmetic ------------------------------------------------------------------------
     def array_binop(self, node, op, L: Expr, R: Expr) -> Expr:
         node = node or self.current
         if isinstance(L.type, MaskType) or isinstance(R.type, MaskType):
             if isinstance(op, (ast.BitAnd, ast.BitOr)) and L.type == R.type:
+                dl, dr = dims_of(L), dims_of(R)
+                if not _equal(dl, dr):  # NumPy stretches a length-1 side; Eigen would refuse
+                    fn = "qt::and_op{}" if isinstance(op, ast.BitAnd) else "qt::or_op{}"
+                    return Expr(f"qt::broadcast({L.code}, {R.code}, {fn})", P_ATOM, L.type, dims=_joined(dl, dr))
                 sym = "&&" if isinstance(op, ast.BitAnd) else "||"
-                return Expr(f"{wrap(L, P_ATOM)} {sym} {wrap(R, P_ATOM)}", P_REL, L.type)
+                return Expr(f"{wrap(L, P_ATOM)} {sym} {wrap(R, P_ATOM)}", P_REL, L.type, dims=dl)
             raise Unsupported(node, "only & and | combine boolean arrays", "wrap each comparison in parentheses")
         if isinstance(op, ast.MatMult):
             return self.matmul(node, L, R)
@@ -116,19 +131,30 @@ class ArrayOps:
             L = self._scalar_operand(L, node)
         if not RA:
             R = self._scalar_operand(R, node)
-        if L.type == MAT and R.type == MAT:
-            # either side may be (n, 1) or (1, m): NumPy broadcasts, Eigen would refuse
-            return Expr(f"qt::broadcast({L.code}, {R.code}, {_BC_OPS[sym]})", P_ATOM, MAT)
-        if not (LA and RA) or L.type == R.type:
-            t = L.type if LA else R.type
-            return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, t)
+        if not (LA and RA):  # a scalar with an array
+            A = L if LA else R
+            return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, A.type, dims=dims_of(A))
+        dl, dr = dims_of(L), dims_of(R)
+        op_fn = _BC_OPS[sym]
+        if L.type == R.type:
+            if _equal(dl, dr):  # provably the same shape: Eigen's operator, no broadcasting needed
+                return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, L.type, dims=dl)
+            # a dimension may be 1 on one side ((n, 1) against (n, m), a length-1 Vec, ...):
+            # NumPy stretches it, Eigen would refuse
+            return Expr(f"qt::broadcast({L.code}, {R.code}, {op_fn})", P_ATOM, L.type, dims=_joined(dl, dr))
         # NumPy broadcasting of a Vec across the rows of a Mat (vector length = number of columns)
         if L.type == MAT and R.type == VEC:
-            return Expr(f"{wrap(L, P_ATOM)}.rowwise() {sym} {wrap(R, P_ATOM)}.transpose()", P_ADD, MAT)
+            if same_dim(dl[1], dr[0]):
+                return Expr(f"{wrap(L, P_ATOM)}.rowwise() {sym} {wrap(R, P_ATOM)}.transpose()", P_ADD, MAT, dims=dl)
+            return Expr(f"qt::broadcast({L.code}, {wrap(R, P_ATOM)}.transpose(), {op_fn})", P_ATOM, MAT,
+                        dims=(None, _joined(dl[1:], dr)[0]))
+        if not same_dim(dl[0], dr[1]):
+            return Expr(f"qt::broadcast({wrap(L, P_ATOM)}.transpose(), {R.code}, {op_fn})", P_ATOM, MAT,
+                        dims=(None, _joined(dl, dr[1:])[0]))
         if sym in ("+", "*"):  # Vec + Mat == Mat + Vec exactly (IEEE + and * commute)
-            return Expr(f"{wrap(R, P_ATOM)}.rowwise() {sym} {wrap(L, P_ATOM)}.transpose()", P_ADD, MAT)
+            return Expr(f"{wrap(R, P_ATOM)}.rowwise() {sym} {wrap(L, P_ATOM)}.transpose()", P_ADD, MAT, dims=dr)
         return Expr(f"{wrap(L, P_ATOM)}.transpose().replicate({wrap(R, P_ATOM)}.rows(), 1) {sym} "
-                    f"{wrap(R, p - 1)}", p, MAT)
+                    f"{wrap(R, p - 1)}", p, MAT, dims=dr)
 
     def array_power(self, node, L: Expr, R: Expr) -> Expr:
         if is_array(L.type) and not is_array(R.type):
@@ -138,27 +164,30 @@ class ArrayOps:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 # the fast paths NumPy itself takes for these exponents
                 if v == 2:
-                    return Expr(f"{X}.square()", P_ATOM, L.type)
+                    return Expr(f"{X}.square()", P_ATOM, L.type, dims=dims_of(L))
                 if v == 0.5:
-                    return Expr(f"{X}.sqrt()", P_ATOM, L.type)
+                    return Expr(f"{X}.sqrt()", P_ATOM, L.type, dims=dims_of(L))
                 if v == -1:
-                    return Expr(f"{X}.inverse()", P_ATOM, L.type)
-            return Expr(f"qt::pow({L.code}, {self.as_double(R).code})", P_ATOM, L.type)
+                    return Expr(f"{X}.inverse()", P_ATOM, L.type, dims=dims_of(L))
+            return Expr(f"qt::pow({L.code}, {self.as_double(R).code})", P_ATOM, L.type, dims=dims_of(L))
         if not is_array(L.type) and is_array(R.type):
             self.need_scalar(L, node, "**")
-            return Expr(f"qt::pow({self.as_double(L).code}, {R.code})", P_ATOM, R.type)
+            return Expr(f"qt::pow({self.as_double(L).code}, {R.code})", P_ATOM, R.type, dims=dims_of(R))
         if L.type != R.type:
             raise Unsupported(node, "** between a Vec and a Mat is not supported")
+        d = _joined(dims_of(L), dims_of(R))
         if L.type == MAT:
-            return Expr(f"qt::broadcast({L.code}, {R.code}, qt::pow_op{{}})", P_ATOM, MAT)
-        return Expr(f"qt::pow({L.code}, {R.code})", P_ATOM, L.type)
+            return Expr(f"qt::broadcast({L.code}, {R.code}, qt::pow_op{{}})", P_ATOM, MAT, dims=d)
+        return Expr(f"qt::pow({L.code}, {R.code})", P_ATOM, L.type, dims=d)  # broadcasts a length-1 side
 
     def matmul(self, node, L: Expr, R: Expr) -> Expr:
         if not (is_array(L.type) and is_array(R.type)):
             raise Unsupported(node, "@ needs an array on both sides")
         fn, t = {(1, 1): ("dot", FLOAT), (2, 1): ("matvec", VEC), (1, 2): ("vecmat", VEC),
                  (2, 2): ("matmul", MAT)}[(L.type.rank, R.type.rank)]
-        return Expr(f"qt::{fn}({L.code}, {R.code})", P_ATOM, t)
+        dl, dr = dims_of(L), dims_of(R)
+        dims = {"dot": None, "matvec": dl[:1], "vecmat": dr[1:], "matmul": (dl[0], dr[-1])}[fn]
+        return Expr(f"qt::{fn}({L.code}, {R.code})", P_ATOM, t, dims=dims)
 
     def array_compare(self, node, L: Expr, op, R: Expr) -> Expr:
         if type(op) not in _CMP:
@@ -168,11 +197,15 @@ class ArrayOps:
         if LA and RA:
             if L.type != R.type:
                 raise Unsupported(node, "comparing a Vec with a Mat is not supported")
-            return Expr(f"{wrap(L, P_ATOM)} {sym} {wrap(R, P_ATOM)}", p, MaskType(L.type.rank))
+            dl, dr = dims_of(L), dims_of(R)
+            if not _equal(dl, dr):  # NumPy stretches a dimension of 1; Eigen would refuse
+                return Expr(f"qt::broadcast({L.code}, {R.code}, {_CMP_OPS[sym]})", P_ATOM,
+                            MaskType(L.type.rank), dims=_joined(dl, dr))
+            return Expr(f"{wrap(L, P_ATOM)} {sym} {wrap(R, P_ATOM)}", p, MaskType(L.type.rank), dims=dl)
         if not LA:  # 0.0 < a  ->  a > 0.0
             L, R, sym = R, L, _FLIP[sym]
         R = self._scalar_operand(R, node)
-        return Expr(f"{wrap(L, P_ATOM)} {sym} {wrap(R, p - 1)}", p, MaskType(L.type.rank))
+        return Expr(f"{wrap(L, P_ATOM)} {sym} {wrap(R, p - 1)}", p, MaskType(L.type.rank), dims=dims_of(L))
 
     # --- indexing ------------------------------------------------------------------------------
     def _index(self, node, size_code: str, named: bool) -> str:
@@ -239,6 +272,7 @@ class ArrayOps:
             raise Unsupported(node, "indexing / subscripts are only supported on arrays",
                               "lists and dicts are not supported")
         named = _is_named(base_node)  # a variable or a field of one: safe to name twice
+        self._last_target_dims = (None, None)  # the size tokens of the part written (for stores)
         if target and not named:
             raise Unsupported(node, "assignment into an expression; assign into a variable")
         parts = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
@@ -254,7 +288,8 @@ class ArrayOps:
             if not self._full(other):
                 raise Unsupported(node, "a new axis is supported as v[:, None] or v[None, :]")
             fn = "as_row" if self._is_newaxis(parts[0]) else "as_col"
-            return Expr(f"qt::{fn}({B.code})", P_ATOM, MAT)
+            d = dims_of(B)[0]
+            return Expr(f"qt::{fn}({B.code})", P_ATOM, MAT, dims=(("lit", 1), d) if fn == "as_row" else (d, ("lit", 1)))
         slices = [isinstance(p, ast.Slice) for p in parts]
         if any(slices) and not named:
             raise Unsupported(node, "slicing an expression", "store the array in a variable, then slice it")
@@ -264,7 +299,9 @@ class ArrayOps:
                 raise Unsupported(node, "too many indices for a 1-D array")
             if slices[0]:
                 code = self._slice(B.code, parts[0])
-                return (code, "vec") if target else Expr(code, P_ATOM, VEC)
+                d = (self._slice_token(dims_of(B)[0], parts[0]),)
+                self._last_target_dims = d
+                return (code, "vec") if target else Expr(code, P_ATOM, VEC, dims=d)
             code = f"{b}({self._index(parts[0], f'{b}.size()', named)})"
             return (code, "scalar") if target else Expr(code, P_ATOM, FLOAT)
 
@@ -276,7 +313,8 @@ class ArrayOps:
                 code = self._slice2d(B.code, parts[0], ast.Slice(), node)
                 return (code, "mat") if target else Expr(code, P_ATOM, MAT)
             code = f"{b}.row({self._index(parts[0], f'{b}.rows()', named)})"
-            return (code, "row") if target else Expr(f"{code}.transpose()", P_ATOM, VEC)
+            self._last_target_dims = dims_of(B)[1:]
+            return (code, "row") if target else Expr(f"{code}.transpose()", P_ATOM, VEC, dims=dims_of(B)[1:])
         if len(parts) != 2:
             raise Unsupported(node, "too many indices for a 2-D array")
         r, c = parts
@@ -285,15 +323,46 @@ class ArrayOps:
             return (code, "scalar") if target else Expr(code, P_ATOM, FLOAT)
         if self._full(r) and not slices[1]:
             code = f"{b}.col({self._index(c, f'{b}.cols()', named)})"
-            return (code, "vec") if target else Expr(code, P_ATOM, VEC)
+            self._last_target_dims = dims_of(B)[:1]
+            return (code, "vec") if target else Expr(code, P_ATOM, VEC, dims=dims_of(B)[:1])
         if not slices[0] and self._full(c):
             code = f"{b}.row({self._index(r, f'{b}.rows()', named)})"
-            return (code, "row") if target else Expr(f"{code}.transpose()", P_ATOM, VEC)
+            self._last_target_dims = dims_of(B)[1:]
+            return (code, "row") if target else Expr(f"{code}.transpose()", P_ATOM, VEC, dims=dims_of(B)[1:])
         if slices[0] and slices[1]:
             code = self._slice2d(B.code, r, c, node)
             return (code, "mat") if target else Expr(code, P_ATOM, MAT)
         raise Unsupported(node, "mixing an index and a partial slice (A[i, 1:3]) is not supported",
                           "slice the row first: row = A[i]; row[1:3]")
+
+    def _slice_token(self, n_tok, s: ast.Slice):
+        """The length of v[s] as a size token, for constant bounds: v[c:], v[:-c] and v[c1:-c2]
+        all have length max(N - c, 0); v[:c] and v[-c:] have min(c, N). So `a[1:] - a[:-1]`
+        provably needs no broadcasting."""
+        if n_tok is None:
+            return None
+        if s.lower is None and s.upper is None and s.step is None:
+            return n_tok
+
+        def const(e):
+            if e is None:
+                return None, True
+            x = self.expr(e)
+            ok = isinstance(x.value, int) and not isinstance(x.value, bool)
+            return (x.value if ok else None), ok
+        lo, ok1 = const(s.lower)
+        hi, ok2 = const(s.upper)
+        st, ok3 = const(s.step)
+        if not (ok1 and ok2 and ok3):
+            return None
+        if st not in (None, 1):
+            return ("slice", n_tok, lo, hi, st)
+        lo_from_end, hi_from_end = lo is not None and lo < 0, hi is None or hi < 0
+        if not lo_from_end and hi_from_end:  # [a:], [a:-k], [:-k]
+            return ("drop", n_tok, (lo or 0) + (-hi if hi is not None else 0))
+        if (lo is None and hi is not None and hi >= 0) or (lo_from_end and hi is None):  # [:c], [-c:]
+            return ("take", n_tok, hi if lo is None else -lo)
+        return ("slice", n_tok, lo, hi, 1)
 
     def _is_newaxis(self, n) -> bool:
         return (isinstance(n, ast.Constant) and n.value is None) or self.qualify(n) == "numpy.newaxis"
@@ -318,14 +387,14 @@ class ArrayOps:
         dims = [f"{a}.size()"] if A.type == VEC else [f"{a}.rows()", f"{a}.cols()"]
         if not isinstance(k, int) or not -len(dims) <= k < len(dims):
             raise Unsupported(node, f".shape of a {A.type} has {len(dims)} entries; index it with a constant")
-        return Expr(dims[k], P_ATOM, INT, iv=SIZE_IV)
+        return Expr(dims[k], P_ATOM, INT, iv=SIZE_IV, dimtok=dims_of(A)[k])
 
     def array_attribute(self, node, B: Expr) -> Expr:
         b = wrap(B, P_ATOM)
         if node.attr == "T":
-            return Expr(f"{b}.transpose()", P_ATOM, MAT) if B.type == MAT else B
+            return Expr(f"{b}.transpose()", P_ATOM, MAT, dims=dims_of(B)[::-1]) if B.type == MAT else B
         if node.attr == "size":
-            return Expr(f"{b}.size()", P_ATOM, INT, iv=SIZE_IV)
+            return Expr(f"{b}.size()", P_ATOM, INT, iv=SIZE_IV, dimtok=dims_of(B)[0] if B.type == VEC else None)
         if node.attr == "ndim":
             return Expr(str(B.type.rank), P_ATOM, INT, int_lit=True, value=B.type.rank, simple=True)
         if node.attr == "shape":
@@ -349,14 +418,14 @@ class ArrayOps:
                 return Expr(f"{wrap(B, P_ATOM)}.count()", P_ATOM, INT, iv=SIZE_IV)
             raise Unsupported(node, f"boolean-array method .{name}() is not supported")
         if name == "copy" and not args:
-            return Expr(B.code, B.prec, B.type)
+            return Expr(B.code, B.prec, B.type, dims=B.dims)
         if name == "astype":
             if len(node.args) != 1 or node.keywords or ast.unparse(node.args[0]) not in (
                     "float", "np.float64", "numpy.float64", "'float64'", '"float64"'):
                 raise Unsupported(node, "only .astype(float) is supported (arrays are float64)")
-            return Expr(B.code, B.prec, B.type)  # a copy, as astype makes
+            return Expr(B.code, B.prec, B.type, dims=B.dims)  # a copy, as astype makes
         if name in ("ravel", "flatten") and not node.args and not node.keywords:
-            return Expr(f"qt::ravel({B.code})", P_ATOM, VEC) if B.type == MAT else Expr(B.code, B.prec, VEC)
+            return Expr(f"qt::ravel({B.code})", P_ATOM, VEC) if B.type == MAT else Expr(B.code, B.prec, VEC, dims=B.dims)
         if name == "clip":
             return self._clip(node, B, node.args, {k.arg: k.value for k in node.keywords})
         if name == "trace" and not args and not kws:
@@ -395,7 +464,8 @@ class ArrayOps:
         if A.type == VEC or axis is None:
             raise Unsupported(self.current, "keepdims=True is supported for reductions of a Mat over an axis")
         fn = "as_row" if axis in (0, -2) else "as_col"
-        return Expr(f"qt::{fn}({e.code})", P_ATOM, MAT)
+        d = dims_of(e)[0]
+        return Expr(f"qt::{fn}({e.code})", P_ATOM, MAT, dims=(("lit", 1), d) if fn == "as_row" else (d, ("lit", 1)))
 
     def _reduce(self, node, name, A: Expr, args, kws) -> Expr:
         self._need_array(A, node, f"{name}()")
@@ -415,7 +485,8 @@ class ArrayOps:
         if name in ("sum", "mean"):
             if axis is None:
                 return Expr(f"qt::{name}({A.code})", P_ATOM, FLOAT)
-            return self._kept(Expr(f"qt::{name}({A.code}, {axis})", P_ATOM, VEC), A, axis, keep)
+            return self._kept(Expr(f"qt::{name}({A.code}, {axis})", P_ATOM, VEC, dims=self._axis_dims(A, axis)),
+                              A, axis, keep)
         if name in ("std", "var"):
             if len(args) > 1:
                 raise Unsupported(node, f"pass ddof to {name}() by keyword")
@@ -426,7 +497,8 @@ class ArrayOps:
             if axis is None:
                 return Expr(f"qt::{fn}({A.code}{', ' + ddof.code if ddof is not None else ''})", P_ATOM, FLOAT)
             d = ddof.code if ddof is not None else "0"
-            return self._kept(Expr(f"qt::{fn}({A.code}, {axis}, {d})", P_ATOM, VEC), A, axis, keep)
+            return self._kept(Expr(f"qt::{fn}({A.code}, {axis}, {d})", P_ATOM, VEC, dims=self._axis_dims(A, axis)),
+                              A, axis, keep)
         if name in ("cumsum", "cumprod") and not kws.keys() - {"axis"}:
             axis = self._axis(node, args, kws, 0)
             if axis is not None and len(args) > 1:
@@ -434,14 +506,20 @@ class ArrayOps:
             if axis is not None and A.type == MAT:
                 if axis not in (0, 1, -1, -2):
                     raise Unsupported(node, f"axis={axis} is out of range for a Mat")
-                return Expr(f"qt::{name}({A.code}, {axis})", P_ATOM, MAT)
+                return Expr(f"qt::{name}({A.code}, {axis})", P_ATOM, MAT, dims=dims_of(A))
             if axis is not None and axis not in (0, -1):
                 raise Unsupported(node, f"axis={axis} is out of range for a Vec")
-            return Expr(f"qt::{name}({A.code})", P_ATOM, VEC)
+            return Expr(f"qt::{name}({A.code})", P_ATOM, VEC, dims=dims_of(A) if A.type == VEC else None)
         if args or kws:
             raise Unsupported(node, f"arguments to {name}() are not supported in stage 2")
         t = {"max": FLOAT, "min": FLOAT, "argmax": INT, "argmin": INT, "cumsum": VEC, "cumprod": VEC}[name]
-        return Expr(f"qt::{name}({A.code})", P_ATOM, t)
+        return Expr(f"qt::{name}({A.code})", P_ATOM, t, dims=dims_of(A) if t == VEC and A.type == VEC else None)
+
+    @staticmethod
+    def _axis_dims(A: Expr, axis) -> tuple:
+        """A reduction of a Mat over axis 0 has its columns' length; over axis 1, its rows'."""
+        d = dims_of(A)
+        return d[1:] if axis in (0, -2) else d[:1]
 
     # --- numpy functions -------------------------------------------------------------------
     def wants_array_call(self, qual, args) -> bool:
@@ -449,13 +527,20 @@ class ArrayOps:
             is_array(a.type) or isinstance(a.type, MaskType) for a in args))
 
     def _shape_args(self, node, shape_node):
-        """np.zeros(n) / np.zeros((r, c)) -> ("n",) or ("r", "c")."""
-        if isinstance(shape_node, (ast.Tuple, ast.List)):
-            dims = [self._int_code(e) for e in shape_node.elts]
-            if len(dims) not in (1, 2):
-                raise Unsupported(node, "only 1-D and 2-D arrays are supported")
-            return dims
-        return [self._int_code(shape_node)]
+        """np.zeros(n) / np.zeros((r, c)) -> ("n",) or ("r", "c"); the size tokens of the
+        dimensions are left in self._last_shape_tokens."""
+        elts = shape_node.elts if isinstance(shape_node, (ast.Tuple, ast.List)) else [shape_node]
+        if len(elts) not in (1, 2):
+            raise Unsupported(node, "only 1-D and 2-D arrays are supported")
+        dims, toks = [], []
+        for e in elts:
+            x = self.expr(e)
+            if x.type not in (INT, BOOL):
+                raise Unsupported(e, "array indices and slice bounds must be integers")
+            dims.append(x.code)
+            toks.append(int_token(x))
+        self._last_shape_tokens = tuple(toks)
+        return dims
 
     def _check_dtype(self, node):
         for k in node.keywords:
@@ -476,12 +561,14 @@ class ArrayOps:
                 rows = []
                 for row in a.elts:
                     rows.append("{" + ", ".join(self._scalar_operand(self.expr(e), e).code for e in row.elts) + "}")
-                return Expr(f"qt::mat({{{', '.join(rows)}}})", P_ATOM, MAT)
+                widths = {len(r.elts) for r in a.elts}
+                cols = ("lit", widths.pop()) if len(widths) == 1 else None
+                return Expr(f"qt::mat({{{', '.join(rows)}}})", P_ATOM, MAT, dims=(("lit", len(a.elts)), cols))
             vals = [self._scalar_operand(self.expr(e), e).code for e in a.elts]
-            return Expr(f"qt::vec({{{', '.join(vals)}}})", P_ATOM, VEC)
+            return Expr(f"qt::vec({{{', '.join(vals)}}})", P_ATOM, VEC, dims=(("lit", len(vals)),))
         e = self.expr(a)
         self._need_array(e, node, f"{src}()")
-        return Expr(e.code, e.prec, e.type)  # a copy, as np.array(x) makes
+        return Expr(e.code, e.prec, e.type, dims=e.dims)  # a copy, as np.array(x) makes
 
     def array_call(self, node, qual, args, kws) -> Expr:
         src = ast.unparse(node.func)
@@ -489,17 +576,22 @@ class ArrayOps:
             self._check_dtype(node)
             dims = self._shape_args(node, node.args[0])
             fn = qual.split(".")[1]
-            return Expr(f"qt::{fn}({', '.join(dims)})", P_ATOM, VEC if len(dims) == 1 else MAT)
+            return Expr(f"qt::{fn}({', '.join(dims)})", P_ATOM, VEC if len(dims) == 1 else MAT,
+                        dims=self._last_shape_tokens)
         if qual == "numpy.full":
             self._check_dtype(node)
             dims = self._shape_args(node, node.args[0])
+            toks = self._last_shape_tokens
             v = self._scalar_operand(args[1], node.args[1])
-            return Expr(f"qt::full({', '.join(dims)}, {v.code})", P_ATOM, VEC if len(dims) == 1 else MAT)
+            return Expr(f"qt::full({', '.join(dims)}, {v.code})", P_ATOM, VEC if len(dims) == 1 else MAT, dims=toks)
         if qual in ("numpy.eye", "numpy.identity"):
             self._check_dtype(node)
             if len(node.args) != 1:
                 raise Unsupported(node, f"{src}() with more than one argument is not supported")
-            return Expr(f"qt::eye({self._int_code(node.args[0])})", P_ATOM, MAT)
+            n = self.expr(node.args[0])
+            if n.type not in (INT, BOOL):
+                raise Unsupported(node, "array indices and slice bounds must be integers")
+            return Expr(f"qt::eye({n.code})", P_ATOM, MAT, dims=(int_token(n), int_token(n)))
         if qual == "numpy.linspace":
             if set(kws) - {"num"} or not 2 <= len(args) <= 3:
                 raise Unsupported(node, "linspace(start, stop[, num]) only (no endpoint=, retstep=)")
@@ -509,7 +601,8 @@ class ArrayOps:
                 if num.type not in (INT, BOOL):
                     raise Unsupported(node, "linspace num must be an integer")
                 parts.append(num.code)
-            return Expr(f"qt::linspace({', '.join(parts)})", P_ATOM, VEC)
+            return Expr(f"qt::linspace({', '.join(parts)})", P_ATOM, VEC,
+                        dims=(int_token(num) if num is not None else ("lit", 50),))
         if qual == "numpy.arange":
             self._check_dtype(node)
             if not 1 <= len(args) <= 3:
@@ -528,20 +621,21 @@ class ArrayOps:
             a = wrap(A, P_ATOM)
             dims = f"{a}.size()" if A.type == VEC else f"{a}.rows(), {a}.cols()"
             if qual.endswith("full_like"):
-                return Expr(f"qt::full({dims}, {self._scalar_operand(args[1], node).code})", P_ATOM, A.type)
-            return Expr(f"qt::{qual.split('.')[1][:-5]}({dims})", P_ATOM, A.type)
+                return Expr(f"qt::full({dims}, {self._scalar_operand(args[1], node).code})", P_ATOM, A.type,
+                            dims=dims_of(A))
+            return Expr(f"qt::{qual.split('.')[1][:-5]}({dims})", P_ATOM, A.type, dims=dims_of(A))
         if qual == "numpy.copy":
             self._need_array(A, node, src)
-            return Expr(A.code, A.prec, A.type)
+            return Expr(A.code, A.prec, A.type, dims=A.dims)
         if qual in _MEMBER:
             self._need_array(A, node, src)
-            return Expr(f"{wrap(A, P_ATOM)}.{_MEMBER[qual]}()", P_ATOM, A.type)
+            return Expr(f"{wrap(A, P_ATOM)}.{_MEMBER[qual]}()", P_ATOM, A.type, dims=dims_of(A))
         if qual in _HELPER:
             self._need_array(A, node, src)
-            return Expr(f"{_HELPER[qual]}({A.code})", P_ATOM, A.type)
+            return Expr(f"{_HELPER[qual]}({A.code})", P_ATOM, A.type, dims=dims_of(A))
         if qual in _MASK_FN:
             self._need_array(A, node, src)
-            return Expr(f"{wrap(A, P_ATOM)}.{_MASK_FN[qual]}()", P_ATOM, MaskType(A.type.rank))
+            return Expr(f"{wrap(A, P_ATOM)}.{_MASK_FN[qual]}()", P_ATOM, MaskType(A.type.rank), dims=dims_of(A))
         if qual in _REDUCE:
             name = _REDUCE[qual]
             if isinstance(A.type, MaskType) and name == "sum" and len(args) == 1 and not kws:
@@ -552,7 +646,8 @@ class ArrayOps:
                     raise Unsupported(node, f"{src}() with extra arguments is not supported")
                 if A.type == MAT:
                     raise Unsupported(node, f"{src}() of a 2-D array is not supported in stage 2")
-                return Expr(f"qt::{name}({A.code})", P_ATOM, VEC if name == "sort" else FLOAT)
+                return Expr(f"qt::{name}({A.code})", P_ATOM, VEC if name == "sort" else FLOAT,
+                            dims=dims_of(A) if name == "sort" else None)
             if name in ("quantile", "percentile"):
                 self._need_array(A, node, src)
                 if len(args) != 2 or kws or A.type == MAT:
@@ -569,7 +664,8 @@ class ArrayOps:
             for a in args:
                 if a.type != VEC:
                     raise Unsupported(node, "np.outer takes two Vecs")
-            return Expr(f"qt::outer({args[0].code}, {args[1].code})", P_ATOM, MAT)
+            return Expr(f"qt::outer({args[0].code}, {args[1].code})", P_ATOM, MAT,
+                        dims=(dims_of(args[0])[0], dims_of(args[1])[0]))
         if qual == "numpy.transpose":
             self._need_array(A, node, src)
             return self.array_attribute(ast.Attribute(attr="T"), A)
@@ -577,21 +673,23 @@ class ArrayOps:
             self._need_array(A, node, src)
             if len(args) != 1 or kws:
                 raise Unsupported(node, "np.diag with an offset is not supported")
-            return Expr(f"qt::diag({A.code})", P_ATOM, MAT) if A.type == VEC else \
+            return Expr(f"qt::diag({A.code})", P_ATOM, MAT, dims=dims_of(A) * 2) if A.type == VEC else \
                 Expr(f"qt::diagonal({A.code})", P_ATOM, VEC)
         if qual == "numpy.where":
             if len(args) != 3 or not isinstance(A.type, MaskType):
                 raise Unsupported(node, "np.where(condition, x, y) with an array condition is supported")
             branches = []
+            d = dims_of(A)
             for b in args[1:]:
                 if is_array(b.type):
                     if b.type.rank != A.type.rank:
                         raise Unsupported(node, "np.where branches must have the condition's shape")
                     branches.append(b.code)
+                    d = _joined(d, dims_of(b))
                 else:
                     branches.append(self._scalar_operand(b, node).code)
             return Expr(f"qt::where({A.code}, {branches[0]}, {branches[1]})", P_ATOM,
-                        VEC if A.type.rank == 1 else MAT)
+                        VEC if A.type.rank == 1 else MAT, dims=d)
         if qual in ("numpy.all", "numpy.any", "numpy.count_nonzero"):
             if not isinstance(A.type, MaskType) or len(args) != 1 or kws:
                 raise Unsupported(node, f"{src}() of a boolean array (a comparison) is supported")
@@ -606,7 +704,9 @@ class ArrayOps:
             t = a.type if is_array(a.type) else b.type
             ca = a.code if is_array(a.type) else self._scalar_operand(a, node).code
             cb = b.code if is_array(b.type) else self._scalar_operand(b, node).code
-            return Expr(f"qt::{qual.split('.')[1]}({ca}, {cb})", P_ATOM, t)
+            arrs = [dims_of(x) for x in (a, b) if is_array(x.type)]
+            d = arrs[0] if len(arrs) == 1 else _joined(*arrs)
+            return Expr(f"qt::{qual.split('.')[1]}({ca}, {cb})", P_ATOM, t, dims=d)  # broadcasts a length-1 side
         if qual == "numpy.power":
             return self.array_power(node, args[0], args[1])
         if qual == "numpy.clip":
@@ -617,7 +717,7 @@ class ArrayOps:
             return Expr(f"qt::trace({A.code})", P_ATOM, FLOAT)
         if qual == "numpy.ravel":
             self._need_array(A, node, src)
-            return Expr(f"qt::ravel({A.code})", P_ATOM, VEC) if A.type == MAT else Expr(A.code, A.prec, VEC)
+            return Expr(f"qt::ravel({A.code})", P_ATOM, VEC) if A.type == MAT else Expr(A.code, A.prec, VEC, dims=A.dims)
         if qual.startswith("numpy.linalg."):
             return self._linalg(node, qual, args)
         raise Unsupported(node, f"{src}() is not supported on arrays in stage 2")
@@ -654,10 +754,10 @@ class ArrayOps:
             return Expr(f"qt::np_clip({x}, {lo_e.code}, {hi_e.code})", P_ATOM, FLOAT)
         # NumPy: clip(a, lo, None) is np.maximum(a, lo) and clip(a, None, hi) is np.minimum(a, hi)
         if hi_e is None:
-            return Expr(f"qt::maximum({A.code}, {lo_e.code})", P_ATOM, A.type)
+            return Expr(f"qt::maximum({A.code}, {lo_e.code})", P_ATOM, A.type, dims=dims_of(A))
         if lo_e is None:
-            return Expr(f"qt::minimum({A.code}, {hi_e.code})", P_ATOM, A.type)
-        return Expr(f"qt::clip({A.code}, {lo_e.code}, {hi_e.code})", P_ATOM, A.type)
+            return Expr(f"qt::minimum({A.code}, {hi_e.code})", P_ATOM, A.type, dims=dims_of(A))
+        return Expr(f"qt::clip({A.code}, {lo_e.code}, {hi_e.code})", P_ATOM, A.type, dims=dims_of(A))
 
     def stack_call(self, node, qual) -> Expr:
         """np.column_stack / vstack / hstack / concatenate of a literal list of arrays."""
@@ -739,7 +839,7 @@ class ArrayOps:
                               "to sign (and rotation within a repeated eigenvalue), which LAPACK and Eigen may "
                               "choose differently. Results like V @ diag(f(w)) @ V.T agree.")
             if fn == "eigvalsh":
-                return Expr(f"qt::eigvalsh({A.code})", P_ATOM, VEC)
+                return Expr(f"qt::eigvalsh({A.code})", P_ATOM, VEC, dims=dims_of(A)[:1])
             return Expr(f"qt::eigh({A.code})", P_ATOM, TupleType((VEC, MAT)))
         if fn == "pinv":
             rc = [k for k in node.keywords if k.arg in ("rcond", "rtol")]
@@ -751,15 +851,17 @@ class ArrayOps:
             self.note("pinv", "np.linalg.pinv agrees with NumPy to rounding; singular values within rounding "
                               "of the rcond cutoff can be kept by one and dropped by the other")
             extra = f", {self._scalar_operand(r, node).code}" if r is not None else ""
-            return Expr(f"qt::pinv({A.code}{extra})", P_ATOM, MAT)
+            return Expr(f"qt::pinv({A.code}{extra})", P_ATOM, MAT, dims=dims_of(A)[::-1])
         if fn == "solve":
             if len(args) != 2 or not is_array(args[1].type):
                 raise Unsupported(node, "np.linalg.solve(A, b) with b a Vec or Mat")
-            return Expr(f"qt::solve({A.code}, {args[1].code})", P_ATOM, args[1].type)
+            return Expr(f"qt::solve({A.code}, {args[1].code})", P_ATOM, args[1].type, dims=dims_of(args[1]))
         if len(args) != 1:
             raise Unsupported(node, f"np.linalg.{fn} takes one argument")
         t = FLOAT if fn == "det" else MAT
-        return Expr(f"qt::{fn}({A.code})", P_ATOM, t)
+        # inv: the transpose's shape (a square matrix: the same); cholesky: A's shape
+        return Expr(f"qt::{fn}({A.code})", P_ATOM, t,
+                    dims=None if t == FLOAT else dims_of(A)[::-1] if fn == "inv" else dims_of(A))
 
     # --- random numbers (stage 3) ---------------------------------------------------------
     def default_rng(self, node) -> Expr:
@@ -803,21 +905,22 @@ class ArrayOps:
             else:
                 parts.append(default)
         size = bound.get("size")
-        dims = []
+        dims, toks = [], None
         if size is not None and not (isinstance(size, ast.Constant) and size.value is None):
             dims = self._shape_args(node, size)
+            toks = self._last_shape_tokens
         t = FLOAT if not dims else VEC if len(dims) == 1 else MAT
-        return Expr(f"{wrap(R, P_ATOM)}.{name}({', '.join(parts + dims)})", P_ATOM, t)
+        return Expr(f"{wrap(R, P_ATOM)}.{name}({', '.join(parts + dims)})", P_ATOM, t, dims=toks)
 
     def norm_array(self, node, fn, x: Expr, loc, scale) -> Expr:
         """scipy.stats.norm.<fn> applied elementwise to an array."""
         if fn in ("ppf", "sf") and (loc is not None or scale is not None):
             raise Unsupported(node, f"norm.{fn} of an array with loc/scale is not supported")
         if loc is None and scale is None:
-            return Expr(f"qt::norm_{fn}({x.code})", P_ATOM, x.type)
+            return Expr(f"qt::norm_{fn}({x.code})", P_ATOM, x.type, dims=dims_of(x))
         for e in (loc, scale):
             if e is not None:
                 self.need_scalar(e, node, f"norm.{fn} loc/scale")
         lc = self.as_double(loc).code if loc is not None else "0.0"
         sc = self.as_double(scale).code if scale is not None else "1.0"
-        return Expr(f"qt::norm_{fn}({x.code}, {lc}, {sc})", P_ATOM, x.type)
+        return Expr(f"qt::norm_{fn}({x.code}, {lc}, {sc})", P_ATOM, x.type, dims=dims_of(x))

@@ -35,7 +35,7 @@ strong evidence, but no finite set of cases can rule out a difference elsewhere.
 - **0.7, back to Python:** `python -m qtrans bind` compiles the translation into a Python
   module (pybind11) that keeps Python's semantics at the boundary: in-place changes reach your
   arrays, your generator advances exactly as far, your dataclasses go in and come back
-  updated, and the exceptions are Python's. Checked like the C++ itself: 19,557 cases over the
+  updated, and the exceptions are Python's. Checked like the C++ itself: 19,585 cases over the
   examples, 0 mismatches. See [Calling the C++ from Python](#calling-the-c-from-python).
 - **0.8, projects:** files that import from each other (`from bl_core import nearest_psd`,
   `from bl_config import *`, `import rates as R`) are translated together, one header and C++
@@ -45,7 +45,8 @@ strong evidence, but no finite set of cases can rule out a difference elsewhere.
 - **0.8.1, stricter checks:** the verifier also tries non-square and empty matrices, vectors
   of different lengths and (`--profile stress`) inf, NaN, subnormals and the largest doubles;
   int arithmetic that could overflow is checked and raises `OverflowError` instead of wrapping;
-  a Python call that hangs is stopped after 10 seconds. See [Verification](#verification).
+  a Python call that hangs is stopped after 10 seconds. Length-1 arrays now broadcast as in
+  NumPy (`a - b` with `len(a) == 1`), which the new shapes caught. See [Verification](#verification).
 
 ```python
 def black_litterman(cov: Mat, w_mkt: Vec, P: Mat, Q: Vec, omega_diag: Vec,
@@ -93,22 +94,22 @@ warnings** under the strict flags above. The full table is in
   identical; the only differences come from NumPy's own `exp`. Antithetic European, Asian with
   a control variate, barrier, Heston, and portfolio VaR are all covered.
 - **Functions using SciPy's `norm` or NumPy's `exp`/`pow` agree to a relative error of at most
-  7.6e-11** (`geometric_asian_call`). They can't be bit-identical, because SciPy and NumPy use their own versions of
+  3.8e-11** (`book_value` in the classes example). They can't be bit-identical, because SciPy and NumPy use their own versions of
   `erf` and `exp`. Even inside Python, SciPy's `norm.cdf` and the same formula on `math.erf`
   agree to the bit only 63.9% of the time (max 45 ULP), and `numpy.exp` differs from
   `math.exp` on 4.4% of inputs (`tools/measure_library_ulps.py`).
 - **Linear algebra goes through LAPACK in NumPy and Eigen in C++.** They agree to a relative
-  error of at most 9.1e-11 in every case compared, random matrices included. 41 random cases
+  error of at most 7.3e-11 in every case compared, random matrices included. 49 random cases
   (out of 12,544 for the array modules) were ill-conditioned, so the verifier reports them
   separately; see [Verification](#verification).
 - **Speed, in the recorded run.** One call on one input each time; timings vary between runs.
 
   | Kind of code | Speed-up | Why |
   |---|---|---|
-  | Scalar arithmetic | 7x to 30x | Python call overhead removed, code compiled |
-  | Calls to `scipy.stats.norm` | 1,178x to 5,163x | Mostly SciPy's ~25-30 µs per-call overhead, against ~100-150 ns for `scipy.special.ndtr` |
-  | Array code | 5x to 229x | Small where NumPy already runs in C (`cumprod`: 6x); large where Python loops over elements (drawdown: 226x, EWMA: 229x) |
-  | Large vectorised Monte Carlo | about 1x to 4x | The time goes in `exp` over millions of elements, where NumPy uses run-time AVX code; portable `-O2` C++ calls the C library once per element (5.5x slower per `exp` in isolation). The C++ is still the same speed with no Python needed; `gbm_paths`, which loops over time steps, is 42x |
+  | Scalar arithmetic | 7x to 39x | Python call overhead removed, code compiled |
+  | Calls to `scipy.stats.norm` | 1,198x to 5,705x | Mostly SciPy's ~25-30 µs per-call overhead, against ~100-150 ns for `scipy.special.ndtr` |
+  | Array code | 4x to 132x | Small where NumPy already runs in C (`cumprod`: 5x); large where Python loops over elements (drawdown: 127x, EWMA: 132x) |
+  | Large vectorised Monte Carlo | about 1x to 4x | The time goes in `exp` over millions of elements, where NumPy uses run-time AVX code; portable `-O2` C++ calls the C library once per element (5.5x slower per `exp` in isolation). The C++ is still the same speed with no Python needed; `gbm_paths`, which loops over time steps, is 48x |
 
 Three C++ programs in [`examples/use_from_cpp/`](https://github.com/SunnyAlexV/qtrans/tree/main/examples/use_from_cpp) use the generated
 headers directly and print exactly what the Python prints:
@@ -139,7 +140,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (366 tests).
+`python -m pytest` (371 tests).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -207,7 +208,8 @@ memory order and flat reductions match NumPy's.
 | `a[-1]`, `a[i]` with `i` possibly negative | out of bounds | `a(a.size() - 1)`, `a(qt::idx(i, a.size()))`; plain `a(t)` when `t` is provably ≥ 0 (e.g. a `range(1, n)` loop variable, or `t - 1` inside it) |
 | `a[2:100]` on a short array clips; `a[::-1]` reverses | assertion | `qt::slice`: CPython's slice-adjustment algorithm, line for line |
 | `np.sum` uses pairwise summation | Eigen's `.sum()` adds in a different order | NumPy's algorithm ported (also `mean`, `var`/`std`, `quantile`, `linspace`, `arange`, `cumsum`): bit-identical |
-| `A - v` broadcasts `v` across rows | size mismatch | `A.rowwise() - v.transpose()` |
+| `A - v` broadcasts `v` across rows | size mismatch | `A.rowwise() - v.transpose()` when `v`'s length provably equals `A`'s columns (`mu = A.mean(axis=0)`); otherwise `qt::broadcast` |
+| `a - b` with `a` of length 1 stretches it to `b`'s length (also `A + v`, `a < b`, `c += b`, `v[1:3] = w`, `np.maximum`, `np.where`) | size mismatch | Plain Eigen (`a - b`) where the translator can prove the sizes equal; otherwise `qt::broadcast`, `qt::broadcast_into`, `qt::store`, which follow NumPy's rule (equal sizes take Eigen's own operator: the same bits). The proof tracks a size token per dimension: parameters, `len(x)`, `np.zeros(n)`, `x[1:]` and `x[:-1]` (both `len(x) - 1`), results of elementwise operations, and variables that are rebound (`S = S * np.exp(z)`) when every assignment keeps the size (a fixpoint, like type inference) |
 | `x ** 2`, `x ** 0.5`, `x ** -1` take fast paths in NumPy | `pow` rounds differently | `.square()`, `.sqrt()`, `.inverse()` |
 | `np.maximum` propagates NaN; `np.max` of `[]` raises | Eigen doesn't | `qt::maximum`, `qt::max` follow NumPy |
 | Shape and index errors raise `ValueError`/`IndexError` | Eigen asserts (abort) or undefined behaviour | Eigen's assertions become exceptions, caught as the matching Python error |
@@ -379,10 +381,10 @@ uses pandas; some helpers return strings or dicts; the bootstrap uses integer ar
   classification).
 - **Now: 21 of 21 translate**, and over 4,233 cases (random, plus realistic ones: 500 days of
   returns on 10 assets, three views) there are **0 mismatches**. 7 functions are bit-identical
-  to NumPy; the others use LAPACK, `pow` or BLAS and agree to rounding. Per call, 1x to 38x
+  to NumPy; the others use LAPACK, `pow` or BLAS and agree to rounding. Per call, 1x to 55x
   faster at the realistic sizes: near 1x where NumPy already spends its time in optimised C
-  (`_ewma_weights`; `ledoit_wolf_identity`'s matrix products, 4x), 14x to 38x where Python
-  overhead dominates (`posterior_mu` 14x, `_cvar` 16x, `portfolio_stats` 38x).
+  (`_ewma_weights`; `ledoit_wolf_identity`'s matrix products, 2x), 12x to 55x where Python
+  overhead dominates (`posterior_mu` 12x, `_cvar` 20x, `portfolio_stats` 55x).
 
 What it turned up, beyond the missing features:
 
@@ -521,7 +523,7 @@ dataclass `repr`, `copy.copy`/`deepcopy`, tuple unpacking for a NamedTuple, and
 the compiled module and through Python on the same random and hand-picked inputs, with your
 Python objects and again with compiled ones. It compares return values, in-place changes,
 which arrays were changed in place and which re-pointed, generator states, and exceptions.
-Over the eleven examples: **87 functions and 7 classes, 19,557 cases, 0 mismatches**
+Over the eleven examples: **87 functions and 7 classes, 19,585 cases, 0 mismatches**
 ([`examples/BINDINGS.md`](https://github.com/SunnyAlexV/qtrans/blob/main/examples/BINDINGS.md), regenerated by `tools/bind_examples.py`).
 Breaking the generator and array write-backs on purpose turns 92 cases of `instruments` and
 30 of `monte_carlo` into mismatches, so the check sees what it is meant to see.
@@ -531,11 +533,11 @@ about 100 ns of overhead with number arguments and about 0.5 µs with two small 
 
 | Kind of code | Speed-up from Python | Examples |
 |---|---|---|
-| Calls to `scipy.stats.norm` | 200x to 1,600x | `bs_price` 356x, `implied_vol` 1,595x |
-| Python loops over elements or objects | 20x to 150x | `max_drawdown` 148x, `leveraged_nav` 63x, `american_binomial` 30x |
-| Array code at the examples' sizes | 2x to 16x | `black_litterman` 14x, `posterior_mu` 8x, `nearest_psd` 4x |
-| Scalar arithmetic only | about 1x to 8x | `d2` 1.2x: the work is as small as the call overhead |
-| Tiny functions, exp-bound Monte Carlo | 0.6x to 2x | `weight_bounds` 0.6x (a string compare); `european_from_draws` 0.9x, as for the standalone C++ |
+| Calls to `scipy.stats.norm` | 200x to 1,700x | `bs_price` 626x, `implied_vol` 1,669x |
+| Python loops over elements or objects | 20x to 125x | `max_drawdown` 122x, `leveraged_nav` 66x, `american_binomial` 30x |
+| Array code at the examples' sizes | 2x to 16x | `black_litterman` 14x, `posterior_mu` 9x, `nearest_psd` 3x |
+| Scalar arithmetic only | about 1x to 8x | `d1` 1.7x: the work is as small as the call overhead |
+| Tiny functions, exp-bound Monte Carlo | 0.4x to 2x | `weight_bounds` 0.4x (a string compare); `european_from_draws` 0.9x, as for the standalone C++ |
 
 **Not quite Python, by design:** a function returning its argument returns a copy, not the
 same array; reading an array field of a compiled object gives a read-only copy (writing to it
@@ -556,9 +558,11 @@ an array field to an array *equal* to the old one, the compiled side keeps the o
 2. **Builds inputs.** Your hand-picked cases from `QTRANS_CASES` in the module are used, plus
    200 seeded random ones per function. Random arrays share a size per call (Vec of n, Mat of
    n×n, with n from 0 to 6), and, since square inputs can't show a transposed dimension, the
-   verifier also finds which non-square shapes the function accepts (each Vec of length n or
-   m, each Mat n×n, n×m, m×n or m×m, kept when Python runs it) and uses them in 40% of calls,
-   with n ≠ m and either possibly 0 (an empty 0×m matrix) or 1. Two deliberately planted shape
+   verifier also finds which non-square shapes the function accepts (each Vec of length n, m
+   or 1, each Mat n×n, n×m, m×n, m×m, 1×m or n×1, kept when Python runs it) and uses them in
+   40% of calls, with n ≠ m and either possibly 0 (an empty 0×m matrix) or 1. The 1s are where
+   NumPy broadcasts: they found that a length-1 array met a longer one in plain Eigen code,
+   which raised where NumPy stretches it (fixed: see the arrays table). Two deliberately planted shape
    bugs (a transposed `np.zeros_like`, `np.mean(axis=...)` dividing by the wrong dimension) are
    invisible to square inputs and give 69 and 72 mismatches with them
    (`tools/shape_mutants.py`). They also found a real bug: for a non-square matrix, NumPy's
@@ -585,7 +589,10 @@ an array field to an array *equal* to the old one, the compiled side keeps the o
      of a matrix's largest element, the size of error LAPACK itself is allowed). There the
      inputs, known only to rounding, don't pin the answer down further: two backward-stable
      implementations (as LAPACK and Eigen are) can differ by that much. It does not mean no
-     implementation could do better, e.g. one in higher precision. These cases are listed
+     implementation could do better, e.g. one in higher precision. Also ill-cond: for functions
+     using matrix products or `np.linalg`, one side raising `LinAlgError` ("Singular matrix")
+     where the other returns, when the nudge itself flips Python between raising and
+     returning (an exactly-zero pivot is then a matter of rounding). These cases are listed
      separately, never hidden.
    - **known**: Python raised a float error that IEEE-754 arithmetic doesn't raise
      (`ZeroDivisionError`, `OverflowError`, math domain error), or a Python float went complex
@@ -713,7 +720,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               366 tests: generated text, refusals, compiled semantics, every example,
+tests/               371 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
 tools/               scripts that back the numbers in this README
 run_examples.py      press-Run entry point

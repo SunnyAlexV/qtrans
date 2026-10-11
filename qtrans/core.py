@@ -34,6 +34,11 @@ class Expr:
     value: object = None   # the Python value, when the expression is a numeric literal
     simple: bool = False   # a name or literal: cheap and safe to write twice (x * x)
     iv: tuple | None = None  # for an int: (lo, hi) with lo <= value <= hi known (None: any int64)
+    # Sizes, for NumPy broadcasting. For an array: one token per dimension (None: unknown);
+    # two arrays whose tokens are equal provably have that dimension equal, so `a - b` needs no
+    # broadcasting. For an int: the token of the size it equals (len(x) -> x's length).
+    dims: tuple | None = None
+    dimtok: object = None
 
 
 I64 = (-2 ** 63, 2 ** 63 - 1)
@@ -64,6 +69,28 @@ def iv_op(sym, a, b) -> tuple:
         return (a[0] - b[1], a[1] - b[0])
     c = [x * y for x in a for y in b]
     return (min(c), max(c))
+
+
+def dims_of(e: "Expr") -> tuple:
+    """The size tokens of an array expression, one per dimension (None where unknown)."""
+    rank = getattr(e.type, "rank", 0)
+    if e.dims is not None and len(e.dims) == rank:
+        return e.dims
+    return (None,) * rank
+
+
+def same_dim(a, b) -> bool:
+    """Two dimensions provably equal: the same known token."""
+    return a is not None and a == b
+
+
+def int_token(e: "Expr"):
+    """The size token an int expression stands for: a literal is its value, len(x) x's length."""
+    if e.dimtok is not None:
+        return e.dimtok
+    if isinstance(e.value, int) and not isinstance(e.value, bool):
+        return ("lit", e.value)
+    return None
 
 
 def wrap(e: Expr, max_prec: int) -> str:

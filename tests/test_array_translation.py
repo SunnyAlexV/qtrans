@@ -81,7 +81,12 @@ def test_shape_entries():
 
 # --- broadcasting and products --------------------------------------------------------------
 def test_matrix_minus_vector_broadcasts_over_rows():
-    assert "A.rowwise() - v.transpose()" in cpp("def f(A: Mat, v: Vec) -> Mat:\n    return A - v\n")
+    # mu has A's number of columns, provably: Eigen's rowwise operation
+    h = cpp("def f(A: Mat) -> Mat:\n    mu = A.mean(axis=0)\n    return A - mu\n")
+    assert "A.rowwise() - mu.transpose()" in h
+    # an unrelated v may have length 1 (or A one column): NumPy broadcasting, done by the helper
+    h = cpp("def f(A: Mat, v: Vec) -> Mat:\n    return A - v\n")
+    assert "qt::broadcast(A, v.transpose(), qt::sub_op{})" in h
 
 
 def test_matmul_dispatch_by_rank():

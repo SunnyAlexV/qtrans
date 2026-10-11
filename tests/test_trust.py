@@ -147,3 +147,145 @@ def test_a_hanging_python_call_times_out(tmp_path, monkeypatch):
     f = r.functions[0]
     assert f.timeouts == 2 and [c.args for c in f.cases] == [(1.0,)]  # ordinary input hung: the rest left out
     assert r.ok and "left out" in r.to_text()
+
+
+# --- NumPy broadcasting of length-1 dimensions --------------------------------------------------------
+def test_plain_eigen_where_sizes_are_provably_equal():
+    h = cpp('''
+        import numpy as np
+        from qtrans.typing import Mat, Vec
+
+        def diffs(p: Vec) -> Vec:
+            return p[1:] / p[:-1] - 1.0          # both slices have len(p) - 1 elements
+
+        def demean(A: Mat) -> Mat:
+            mu = A.mean(axis=0)
+            return A - mu                        # mu has A's number of columns
+
+        def gbm(S0: float, n_paths: int, n_steps: int, seed: int) -> Vec:
+            rng = np.random.default_rng(seed)
+            S = np.full(n_paths, S0)
+            for _ in range(n_steps):
+                z = rng.standard_normal(n_paths)
+                S = S * np.exp(0.1 * z)          # every value of S has n_paths elements
+            return S
+
+        def lattice(V: Vec, p: float, n: int) -> Vec:
+            for _ in range(n):
+                V = p * V[1:] + (1 - p) * V[:-1]  # V shrinks, but both slices are of this V
+            return V
+
+        def normalise(w: Vec) -> Vec:
+            w = w / w.sum()
+            return w - 0.5 * w
+        ''')
+    assert "qt::broadcast" not in h and "qt::store" not in h, h
+    assert "qt::slice(p, 1, qt::none) / qt::slice(p, qt::none, -1)" in h
+    assert "A.rowwise() - mu.transpose()" in h
+    assert "S = S * qt::exp(0.1 * z);" in h
+
+
+def test_broadcasting_helper_where_a_side_may_have_length_1():
+    h = cpp('''
+        import numpy as np
+        from qtrans.typing import Mat, Vec
+
+        def sub(a: Vec, b: Vec) -> Vec:
+            return a - b
+
+        def rebound(x: Vec, y: Vec, n: int) -> Vec:
+            s = x.copy()
+            for _ in range(n):
+                s = s + x
+                s = y * 2.0                      # s takes y's size: no proof that s and x agree
+            return s - x
+
+        def fill(v: Vec, w: Vec) -> Vec:
+            out = v.copy()
+            out[1:3] = w
+            out += w
+            return out
+        ''')
+    assert "return qt::broadcast(a, b, qt::sub_op{});" in h
+    assert "return qt::broadcast(s, x, qt::sub_op{});" in h
+    assert "qt::store(qt::slice(out, 1, 3), w);" in h and "qt::broadcast_into(out, w, qt::add_op{});" in h
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_length_1_arrays_broadcast_like_numpy(tmp_path):
+    p = write(tmp_path, "bc", '''
+        import numpy as np
+        from qtrans.typing import Mat, Vec
+
+        def sub(a: Vec, b: Vec) -> Vec:
+            return a - b
+
+        def add_rows(A: Mat, b: Vec) -> Mat:
+            return A + b
+
+        def acc(a: Vec, b: Vec) -> Vec:
+            c = a.copy()
+            c += b
+            return c
+
+        def count_below(a: Vec, b: Vec) -> float:
+            return float(np.sum(a < b))
+
+        def floor_at(a: Vec, b: Vec) -> Vec:
+            return np.maximum(a, b)
+
+        def pick(a: Vec, b: Vec) -> Vec:
+            return np.where(a > 1.0, a, b)
+
+        def fill(v: Vec, w: Vec) -> Vec:
+            out = v.copy()
+            out[1:3] = w
+            return out
+
+        def set_row(A: Mat, v: Vec) -> Mat:
+            B = A.copy()
+            B[0] = v
+            return B
+
+        one, three = np.array([2.0]), np.array([1.0, 2.0, 3.0])
+        QTRANS_CASES = {"sub": [(one, three), (three, one)], "add_rows": [(np.ones((2, 3)), one), (np.ones((2, 1)), three)],
+                        "acc": [(three, one), (one, three)], "count_below": [(one, three)],
+                        "floor_at": [(three, one)], "pick": [(three, one), (one, three)],
+                        "fill": [(np.zeros(5), one), (np.zeros(5), three)], "set_row": [(np.ones((2, 3)), one)]}
+        ''')
+    r = verify_file(p, n_random=60, build_dir=tmp_path / "b")
+    assert r.ok, r.to_text()
+    given = {f.name: [(c.py[0], c.cpp[0]) for c in f.cases if c.source == "given"] for f in r.functions}
+    assert given["sub"] == [("ok", "ok")] * 2 and given["add_rows"] == [("ok", "ok")] * 2
+    assert given["acc"] == [("ok", "ok"), ("exc", "exc")]   # c (length 1) += length 3: NumPy refuses
+    assert given["fill"] == [("ok", "ok"), ("exc", "exc")]  # 3 values into a slice of 2: refused
+    for f in r.functions:  # the verifier's own shape probe tries length 1 too
+        assert any(any(a.ndim and 1 in a.shape for a in c.args if hasattr(a, "ndim")) for c in f.cases
+                   if c.source != "given"), f.name
+
+
+def test_singular_matrix_is_a_knife_edge_when_a_nudge_flips_it():
+    import sys
+    import numpy as np
+    import qtrans.verify as V
+    from qtrans.project import translate_project
+    ex = Path(__file__).resolve().parent.parent / "examples"
+    sys.path.insert(0, str(ex))
+    try:
+        import portfolio
+    finally:
+        sys.path.remove(str(ex))
+    sig = translate_project([ex / "portfolio.py"]).modules["portfolio"].signatures["black_litterman"]
+    # a 1 x 1 omega stretched over a rank-1 5 x 5 matrix: exactly singular, cond ~1e18
+    args = (np.array([[1.77650635]]), np.array([0.07687194]), np.array([[0.97940554], [1.0], [0.10371793],
+            [2.67377371], [0.02512121]]), np.array([0.36947283, 0.07374591, 2.0, 31.6024018, 1.81425788]),
+            np.array([0.25885975]), -0.0, 1.5090684060311994)
+    c = V.Case("black_litterman", args, "given")
+    c.py = V.run_python(portfolio.black_litterman, args, sig)
+    assert c.py[0] == "exc" and "Singular" in c.py[2]
+    assert V.python_flips(portfolio.black_litterman, c, sig, np.random.default_rng(1), trials=6)
+    # a matrix that is singular whatever the rounding is no knife edge
+    z = (np.zeros((2, 2)), np.zeros(2), np.zeros((1, 2)), np.zeros(1), np.ones(1), 2.5, 0.05)
+    c = V.Case("black_litterman", z, "given")
+    c.py = V.run_python(portfolio.black_litterman, z, sig)
+    assert not V.python_flips(portfolio.black_litterman, c, sig, np.random.default_rng(1), trials=6)

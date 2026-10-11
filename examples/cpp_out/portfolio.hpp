@@ -61,7 +61,7 @@ inline qt::Vec frontier_weights(const qt::Vec& mu, const qt::Mat& cov, double ta
 /// Each asset's share of portfolio volatility; they sum to the volatility.
 inline qt::Vec risk_contributions(const qt::Vec& w, const qt::Mat& cov) {
     qt::Vec marginal = qt::matvec(cov, w);
-    return w * marginal / std::sqrt(qt::dot(w, marginal));
+    return qt::broadcast(w, marginal, qt::mul_op{}) / std::sqrt(qt::dot(w, marginal));
 }
 
 /// Posterior mean and covariance of returns given k views P @ mu = Q with independent
@@ -79,8 +79,8 @@ inline std::tuple<qt::Vec, qt::Mat> black_litterman(const qt::Mat& cov, const qt
     qt::Vec pi = qt::matvec(delta * cov, w_mkt);  // equilibrium returns implied by market weights
     qt::Mat tau_cov = tau * cov;
     qt::Mat M = qt::broadcast(qt::matmul(qt::matmul(P, tau_cov), P.transpose()), qt::diag(omega_diag), qt::add_op{});
-    qt::Vec post_mu = pi + qt::matvec(qt::matmul(tau_cov, P.transpose()), qt::solve(M, Q - qt::matvec(P, pi)));
-    qt::Mat post_cov = qt::broadcast(qt::broadcast(cov, tau_cov, qt::add_op{}), qt::matmul(qt::matmul(tau_cov, P.transpose()), qt::solve(M, qt::matmul(P, tau_cov))), qt::sub_op{});
+    qt::Vec post_mu = pi + qt::matvec(qt::matmul(tau_cov, P.transpose()), qt::solve(M, qt::broadcast(Q, qt::matvec(P, pi), qt::sub_op{})));
+    qt::Mat post_cov = cov + tau_cov - qt::matmul(qt::matmul(tau_cov, P.transpose()), qt::solve(M, qt::matmul(P, tau_cov)));
     return {post_mu, post_cov};
 }
 

@@ -23,7 +23,7 @@ from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType,
                     TupleType, assignable, is_array, join)
 
 from .core import cpp_string
-from .core import SIZE_IV, iv_clip, iv_fits, iv_of, iv_op
+from .core import SIZE_IV, dims_of, int_token, iv_clip, iv_fits, iv_of, iv_op, same_dim
 from .core import (CPP_RESERVED, P_ADD, P_AND, P_ATOM, P_COND, P_EQ, P_MUL, P_OR, P_REL,  # noqa: F401
                    P_UNARY, Expr, cpp_ident, float_literal, wrap)
 
@@ -393,11 +393,11 @@ class ExprTranslator(ArrayOps, StructOps):
             return Expr(f"!{wrap(self.truth(raw, node.operand), P_ATOM)}", P_UNARY, BOOL)
         e = self.expr(node.operand)
         if isinstance(e.type, MaskType) and isinstance(node.op, ast.Invert):
-            return Expr(f"!{wrap(e, P_ATOM)}", P_UNARY, e.type)
+            return Expr(f"!{wrap(e, P_ATOM)}", P_UNARY, e.type, dims=e.dims)
         if is_array(e.type):
             if isinstance(node.op, ast.USub):
                 inner = wrap(e, P_UNARY)
-                return Expr("-" + (f"({inner})" if inner.startswith("-") else inner), P_UNARY, e.type)
+                return Expr("-" + (f"({inner})" if inner.startswith("-") else inner), P_UNARY, e.type, dims=e.dims)
             if isinstance(node.op, ast.UAdd):
                 return e
         return self._unary(node, e)
@@ -561,9 +561,14 @@ class ExprTranslator(ArrayOps, StructOps):
             b, o = self.as_type(b, t), self.as_type(o, t)
         if isinstance(t, MaskType):
             raise Unsupported(node, "a conditional choosing between boolean arrays is not supported")
+        dims = iv = tok = None
         if is_array(t):  # two different Eigen expression types: make both concrete arrays
             b, o = self._plain(b), self._plain(o)
-        return Expr(f"{wrap(c, P_COND - 1)} ? {wrap(b, P_COND - 1)} : {wrap(o, P_COND)}", P_COND, t)
+            dims = tuple(x if same_dim(x, y) else None for x, y in zip(dims_of(b), dims_of(o)))
+        elif t == INT and same_dim(int_token(b), int_token(o)):
+            tok = int_token(b)
+        return Expr(f"{wrap(c, P_COND - 1)} ? {wrap(b, P_COND - 1)} : {wrap(o, P_COND)}", P_COND, t,
+                    dims=dims, iv=iv, dimtok=tok)
 
     def e_Tuple(self, node):
         parts = [self.expr(e) for e in node.elts]
@@ -596,7 +601,7 @@ class ExprTranslator(ArrayOps, StructOps):
                 a = self.expr(node.args[0])
                 if is_array(a.type):
                     return Expr(f"{wrap(a, P_ATOM)}.{'size' if a.type.rank == 1 else 'rows'}()", P_ATOM, INT,
-                                iv=SIZE_IV)
+                                iv=SIZE_IV, dimtok=dims_of(a)[0])
             if name in ("sum", "max", "min") and node.args:
                 a = self.expr(node.args[0])
                 if is_array(a.type):
