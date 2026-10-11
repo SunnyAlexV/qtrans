@@ -177,11 +177,17 @@ inline Span span(Index n, std::optional<long long> start, std::optional<long lon
     return {static_cast<Index>(len ? lo : 0), static_cast<Index>(len), static_cast<Index>(step)};
 }
 
-// A view into a (readable and assignable), like a NumPy slice.
+// A view into a (readable and assignable), like a NumPy slice: a strided Map over a's own
+// memory (a negative step is a negative stride), so Eigen can read it in place anywhere,
+// products included. (Eigen's own a(seqN(...)) view claims direct access but has no .data().)
 template <class A>
 auto slice(A& a, std::optional<long long> start, std::optional<long long> stop, long long step = 1) {
+    using P = typename std::remove_const_t<A>::PlainObject;
+    using View = std::conditional_t<std::is_const_v<A>, Eigen::Map<const P, 0, Eigen::InnerStride<>>,
+                                    Eigen::Map<P, 0, Eigen::InnerStride<>>>;
     const Span s = span(a.size(), start, stop, step);
-    return a(Eigen::seqN(s.first, s.size, s.step));
+    const Index inner = a.innerStride();
+    return View(a.data() + s.first * inner, s.size, Eigen::InnerStride<>(s.step * inner));
 }
 
 // A[r0:r1, c0:c1]: a 2-D view.
@@ -722,33 +728,49 @@ double median(const Eigen::ArrayBase<D>& a) {
 // =====================================================================================
 // Products. NumPy hands these to BLAS; results agree with Eigen's to rounding.
 // =====================================================================================
+// A product operand Eigen can read in place (a stored array, a contiguous block) is used where
+// it is; anything else is evaluated first. Eigen 3.4 can't multiply a strided view
+// (qt::slice with a step, v[::2]) directly: its product kernels ask for the view's memory.
+// (Eigen 3.4 flags such a view as directly accessible yet gives it no .data(), so it is
+// recognised by type as well.)
+template <class D> struct is_indexed_view : std::false_type {};
+template <class X, class R, class C> struct is_indexed_view<Eigen::IndexedView<X, R, C>> : std::true_type {};
+
+template <class D>
+decltype(auto) operand(const Eigen::ArrayBase<D>& a) {
+    if constexpr (bool(Eigen::internal::traits<D>::Flags & Eigen::DirectAccessBit) && !is_indexed_view<D>::value)
+        return a.derived();
+    else
+        return plain_t<D>(a);
+}
+
 template <class D1, class D2>
 double dot(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {  // Vec @ Vec
     if (a.size() != b.size()) throw shape_error("matmul: mismatch in core dimension");
-    return a.matrix().dot(b.matrix());
+    return operand(a).matrix().dot(operand(b).matrix());
 }
 
 template <class D1, class D2>
 Vec matvec(const Eigen::ArrayBase<D1>& m, const Eigen::ArrayBase<D2>& v) {  // Mat @ Vec
     if (m.cols() != v.size()) throw shape_error("matmul: mismatch in core dimension");
-    return (m.matrix() * v.matrix()).array();
+    return (operand(m).matrix() * operand(v).matrix()).array();
 }
 
 template <class D1, class D2>
 Vec vecmat(const Eigen::ArrayBase<D1>& v, const Eigen::ArrayBase<D2>& m) {  // Vec @ Mat
     if (v.size() != m.rows()) throw shape_error("matmul: mismatch in core dimension");
-    return (v.matrix().transpose() * m.matrix()).transpose().array();
+    return (operand(v).matrix().transpose() * operand(m).matrix()).transpose().array();
 }
 
 template <class D1, class D2>
 Mat matmul(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {  // Mat @ Mat
     if (a.cols() != b.rows()) throw shape_error("matmul: mismatch in core dimension");
-    return (a.matrix() * b.matrix()).array();
+    return (operand(a).matrix() * operand(b).matrix()).array();
 }
 
 template <class D1, class D2>
 Mat outer(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {
-    return (a.matrix() * b.matrix().transpose()).array();
+    return (operand(a).matrix() * operand(b).matrix().transpose()).array();
 }
 
 template <class D>
@@ -843,6 +865,7 @@ template <class D, class M>
 Vec select(const Eigen::ArrayBase<D>& a, const Eigen::ArrayBase<M>& mask) {
     const plain_t<D> p = a;
     const Eigen::Array<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> m = mask;
+    if (m.size() == 0) return Vec(0);  // NumPy: an empty boolean index is an empty index, whatever a's shape
     if (p.rows() != m.rows() || p.cols() != m.cols())
         throw index_error("boolean index did not match indexed array");
     Vec out(m.count());
@@ -856,6 +879,7 @@ template <class D, class M>
 Mat select_rows(const Eigen::ArrayBase<D>& a, const Eigen::ArrayBase<M>& mask) {
     const Mat p = a;
     const Mask m = mask;
+    if (m.size() == 0) return Mat(0, p.cols());  // an empty boolean index selects no rows
     if (p.rows() != m.size()) throw index_error("boolean index did not match indexed array");
     Mat out(m.count(), p.cols());
     Index k = 0;
@@ -868,6 +892,7 @@ Mat select_rows(const Eigen::ArrayBase<D>& a, const Eigen::ArrayBase<M>& mask) {
 template <class A, class M, class F>
 void masked_update(A& a, const Eigen::ArrayBase<M>& mask, double v, F f) {
     const Eigen::Array<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> m = mask;
+    if (m.size() == 0) return;  // an empty boolean index selects nothing to change
     if (a.rows() != m.rows() || a.cols() != m.cols())
         throw index_error("boolean index did not match indexed array");
     for (Index i = 0; i < a.rows(); ++i)

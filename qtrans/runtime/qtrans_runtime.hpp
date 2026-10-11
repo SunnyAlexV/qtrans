@@ -56,6 +56,12 @@ struct int_overflow : std::overflow_error {  // Python: a big int; here: Overflo
                                          "is not") {}
 };
 
+// f(x + 1) where f changes its argument in place: Python changes the temporary and drops it.
+// lvalue() hands C++ that temporary as something a reference can bind to; it lives to the end
+// of the full expression, like Python's.
+template <class T>
+T& lvalue(T&& t) { return t; }
+
 inline long long iadd(long long a, long long b) {
 #if defined(__GNUC__) || defined(__clang__)
     long long r;

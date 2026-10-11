@@ -84,12 +84,31 @@ def _is_num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+# calls whose result is a long long whatever their arguments (so no cast is needed around them)
+_LONG_LONG_CALLS = {"static_cast<long long>", "std::min", "std::max", "qt::iadd", "qt::isub", "qt::imul",
+                    "qt::ineg", "qt::iabs", "qt::ipow", "qt::floordiv", "qt::mod", "qt::to_int", "std::abs"}
+
+
+def _outer_call(code: str):
+    """The function name if `code` is exactly one call, `f(...)`, else None."""
+    i = code.find("(")
+    if i <= 0 or not code.endswith(")"):
+        return None
+    depth = 0
+    for k in range(i, len(code)):
+        depth += {"(": 1, ")": -1}.get(code[k], 0)
+        if depth == 0:
+            return code[:i] if k == len(code) - 1 else None
+    return None
+
+
 class ExprTranslator(ArrayOps, StructOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
         self._noted: set = set()
         self.current = None  # statement being translated, for error line numbers
+        self.used_arrays = False  # any array value at all, even a temporary: needs qtrans_arrays.hpp
 
     # --- hooks overridden by FunctionTranslator --------------------------------------
     def is_variable(self, name: str) -> bool:
@@ -119,7 +138,7 @@ class ExprTranslator(ArrayOps, StructOps):
             return Expr(code, prec, FLOAT, value=float(e.value), simple=True)
         return Expr(f"static_cast<double>({e.code})", P_ATOM, FLOAT)
 
-    def as_type(self, e: Expr, t) -> Expr:
+    def as_type(self, e: Expr, t, index_cast: bool = True) -> Expr:
         """Convert so the C++ type is exactly t. Needed where C++ won't convert for us:
         std::max(x, 0) with x a long long fails to compile, and qt::mod(x, 7) would be
         ambiguous between the long long and double overloads."""
@@ -130,6 +149,11 @@ class ExprTranslator(ArrayOps, StructOps):
                 return Expr(e.code + "LL", e.prec, INT, value=e.value, simple=e.simple)
             if e.type == BOOL:
                 return Expr(f"static_cast<long long>({e.code})", P_ATOM, INT)
+            if index_cast and e.type == INT and any(m in e.code for m in (".size()", ".rows()", ".cols()", ".count()")) \
+                    and _outer_call(e.code) not in _LONG_LONG_CALLS:
+                # an array's size is Eigen's Index (long on Linux and macOS, a different type
+                # from long long): std::min(n, v.size()) wouldn't compile
+                return Expr(f"static_cast<long long>({e.code})", P_ATOM, INT, iv=e.iv, dimtok=e.dimtok)
         return e
 
     def as_string(self, e: Expr) -> Expr:
@@ -191,7 +215,11 @@ class ExprTranslator(ArrayOps, StructOps):
         if method is None:
             what, hint = _UNSUPPORTED_EXPR.get(type(node).__name__, (type(node).__name__, None))
             raise Unsupported(node, f"{what} are not supported in stage 1", hint)
-        return method(node)
+        e = method(node)
+        t = e.type.inner if isinstance(e.type, OptionalType) else e.type
+        if is_array(t) or isinstance(t, MaskType):
+            self.used_arrays = True
+        return e
 
     def unwrap(self, e: Expr) -> Expr:
         return Expr(f"qt::value({e.code})", P_ATOM, e.type.inner)
@@ -338,13 +366,14 @@ class ExprTranslator(ArrayOps, StructOps):
         leave 64 bits."""
         r = iv_op(sym, iv_of(L), iv_of(R))
         if L.int_lit and R.int_lit:
-            L = Expr(self.as_type(L, INT).code, P_ATOM, INT, iv=L.iv)
+            L = Expr(self.as_type(L, INT, False).code, P_ATOM, INT, iv=L.iv)
         if iv_fits(r):
             return Expr(f"{wrap(L, p)} {sym} {wrap(R, p - 1)}", p, INT, iv=r)
         self.note("int64", "int arithmetic that could leave 64 bits is checked: where Python's unbounded "
                            "int would exceed ±9.2e18, C++ raises OverflowError")
         fn = {"+": "iadd", "-": "isub", "*": "imul"}[sym]
-        return Expr(f"qt::{fn}({self.as_type(L, INT).code}, {self.as_type(R, INT).code})", P_ATOM, INT,
+        # (qt::iadd takes long long: an Index converts, no cast needed)
+        return Expr(f"qt::{fn}({self.as_type(L, INT, False).code}, {self.as_type(R, INT, False).code})", P_ATOM, INT,
                     iv=iv_clip(r))
 
     def power(self, node, L: Expr, R: Expr) -> Expr:
@@ -685,9 +714,15 @@ class ExprTranslator(ArrayOps, StructOps):
             if e.type != p.type:
                 raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
             if getattr(p, "mode", "") == "ref":
+                if self._is_view(a):
+                    raise Unsupported(a, f"{display}() modifies its argument '{p.name}' in place, and "
+                                         f"`{ast.unparse(a)}` is a view: in Python the change goes through it "
+                                         "into the original array, which the C++ doesn't do",
+                                      "pass a variable, or a copy if the change shouldn't reach the original")
                 if not _is_lvalue(a):
-                    raise Unsupported(a, f"{display}() modifies its argument '{p.name}' in place, so it must be "
-                                         "given a variable", "store the value in a variable first")
+                    # a fresh value (x + 1, np.zeros(n), f(x), x.copy()): Python changes the
+                    # temporary and drops it; qt::lvalue gives C++ the same temporary to change
+                    return f"qt::lvalue({p.type.cpp()}({e.code}))"
             if isinstance(a, ast.Name) and p.type != STR:
                 passed.append(a.id)
             return e.code
@@ -697,6 +732,21 @@ class ExprTranslator(ArrayOps, StructOps):
             raise Unsupported(a, f"argument '{p.name}' of {display}() is declared {p.type} but a {e.type} is passed",
                               f"annotate '{p.name}' as float, or convert with int(...)")
         return self.promote(e, p.type).code
+
+    def _is_view(self, a) -> bool:
+        """An array expression NumPy returns as a view of another array: a slice or row
+        (v[1:], A[i], A[:, j]), a transpose (A.T), np.asarray(x) (x itself), x.ravel()."""
+        if isinstance(a, ast.Subscript):
+            return True
+        if isinstance(a, ast.Attribute) and a.attr == "T":
+            return True
+        if isinstance(a, ast.Call):
+            q = self.qualify(a.func)
+            if q in ("numpy.asarray", "numpy.ravel", "numpy.transpose", "numpy.reshape"):
+                return True
+            if isinstance(a.func, ast.Attribute) and a.func.attr in ("ravel", "reshape", "transpose", "view"):
+                return True
+        return False
 
     def _arity(self, node, args, lo, hi=None):
         hi = lo if hi is None else hi

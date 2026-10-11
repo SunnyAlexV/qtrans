@@ -8,52 +8,52 @@ Compared with the app's repository (function bodies, by syntax tree): bl_config:
 
 | module | function | cases | match | ill-cond | known | mismatch | max rel err | Python ns | C++ ns |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| bl_core | `nearest_psd` | 202 | 202 | 0 | 0 | 0 | 5.6e-15 | 51,655 | 17,071.6 |
-| bl_core | `ledoit_wolf_identity` | 201 | 181 | 0 | 20 | 0 | 1.4e-15 | 156,986 | 103,658.0 |
-| bl_core | `_ewma_weights` | 202 | 202 | 0 | 0 | 0 | 2.0e-16 | 16,476 | 15,074.8 |
-| bl_core | `horizon_returns` | 202 | 202 | 0 | 0 | 0 | 0.0e+00 | 34,768 | 13,462.0 |
-| bl_core | `variance_ratio` | 203 | 203 | 0 | 0 | 0 | 0.0e+00 | 184,128 | 44,245.5 |
-| bl_core | `apply_variance_ratio` | 201 | 201 | 0 | 0 | 0 | 4.5e-15 | 78,452 | 12,272.8 |
-| bl_core | `equilibrium_returns` | 201 | 201 | 0 | 0 | 0 | 2.9e-16 | 3,623 | 139.0 |
-| bl_core | `implied_confidence_weights` | 201 | 201 | 0 | 0 | 0 | 3.6e-12 | 10,976 | 1,368.3 |
-| bl_core | `omega_he_litterman` | 201 | 201 | 0 | 0 | 0 | 1.7e-15 | 30,611 | 893.0 |
-| bl_core | `posterior_mu` | 202 | 179 | 23 | 0 | 0 | 7.0e-11 | 27,215 | 1,846.7 |
-| bl_core | `posterior_sigma` | 202 | 201 | 1 | 0 | 0 | 5.3e-13 | 85,737 | 14,334.1 |
-| bl_core | `portfolio_stats` | 201 | 201 | 0 | 0 | 0 | 1.3e-15 | 6,172 | 117.8 |
-| bl_core | `_downside_dev` | 201 | 185 | 0 | 16 | 0 | 9.3e-15 | 17,427 | 3,080.4 |
-| bl_core | `_cvar` | 201 | 201 | 0 | 0 | 0 | 2.9e-16 | 119,604 | 5,515.6 |
-| bl_backtest | `vol_target_scale` | 203 | 202 | 0 | 1 | 0 | 0.0e+00 | 29,760 | 2,456.8 |
-| bl_backtest | `buy_and_hold_returns` | 201 | 201 | 0 | 0 | 0 | 7.8e-15 | 33,660 | 1,621.9 |
-| bl_inference | `default_block_length` | 202 | 182 | 0 | 20 | 0 | 0.0e+00 | 340 | 29.5 |
-| bl_inference | `_ann_mean` | 201 | 201 | 0 | 0 | 0 | 0.0e+00 | 4,671 | 248.0 |
-| bl_inference | `_ann_sharpe` | 201 | 183 | 0 | 18 | 0 | 0.0e+00 | 50,567 | 2,136.2 |
-| bl_inference | `newey_west_lag` | 202 | 177 | 0 | 25 | 0 | 0.0e+00 | 236 | 31.7 |
-| bl_inference | `hac_cov` | 202 | 202 | 0 | 0 | 0 | 3.0e-16 | 64,120 | 18,615.1 |
-| bl_inference | `hit_rate_pvalue` | 203 | 193 | 0 | 10 | 0 | 0.0e+00 | 373 | 19.1 |
+| bl_core | `nearest_psd` | 202 | 202 | 0 | 0 | 0 | 5.6e-15 | 61,210 | 13,071.5 |
+| bl_core | `ledoit_wolf_identity` | 201 | 181 | 0 | 20 | 0 | 1.4e-15 | 142,467 | 81,647.1 |
+| bl_core | `_ewma_weights` | 202 | 202 | 0 | 0 | 0 | 2.0e-16 | 10,345 | 12,713.5 |
+| bl_core | `horizon_returns` | 202 | 202 | 0 | 0 | 0 | 0.0e+00 | 44,494 | 25,822.4 |
+| bl_core | `variance_ratio` | 203 | 203 | 0 | 0 | 0 | 0.0e+00 | 212,931 | 41,895.7 |
+| bl_core | `apply_variance_ratio` | 201 | 201 | 0 | 0 | 0 | 4.5e-15 | 75,167 | 14,159.2 |
+| bl_core | `equilibrium_returns` | 201 | 201 | 0 | 0 | 0 | 2.9e-16 | 3,365 | 198.8 |
+| bl_core | `implied_confidence_weights` | 201 | 201 | 0 | 0 | 0 | 3.6e-12 | 11,899 | 1,869.7 |
+| bl_core | `omega_he_litterman` | 201 | 201 | 0 | 0 | 0 | 1.7e-15 | 27,046 | 750.4 |
+| bl_core | `posterior_mu` | 202 | 179 | 23 | 0 | 0 | 7.0e-11 | 25,011 | 1,858.0 |
+| bl_core | `posterior_sigma` | 202 | 201 | 1 | 0 | 0 | 5.3e-13 | 94,623 | 25,876.7 |
+| bl_core | `portfolio_stats` | 201 | 201 | 0 | 0 | 0 | 1.3e-15 | 7,315 | 130.9 |
+| bl_core | `_downside_dev` | 201 | 185 | 0 | 16 | 0 | 9.3e-15 | 32,863 | 3,312.4 |
+| bl_core | `_cvar` | 201 | 201 | 0 | 0 | 0 | 2.9e-16 | 112,182 | 4,682.4 |
+| bl_backtest | `vol_target_scale` | 203 | 202 | 0 | 1 | 0 | 0.0e+00 | 31,210 | 2,422.9 |
+| bl_backtest | `buy_and_hold_returns` | 201 | 201 | 0 | 0 | 0 | 7.8e-15 | 39,240 | 1,872.4 |
+| bl_inference | `default_block_length` | 202 | 182 | 0 | 20 | 0 | 0.0e+00 | 286 | 26.9 |
+| bl_inference | `_ann_mean` | 201 | 201 | 0 | 0 | 0 | 0.0e+00 | 4,015 | 227.9 |
+| bl_inference | `_ann_sharpe` | 201 | 183 | 0 | 18 | 0 | 0.0e+00 | 29,804 | 1,473.3 |
+| bl_inference | `newey_west_lag` | 202 | 177 | 0 | 25 | 0 | 0.0e+00 | 312 | 30.9 |
+| bl_inference | `hac_cov` | 202 | 202 | 0 | 0 | 0 | 3.0e-16 | 74,526 | 20,162.1 |
+| bl_inference | `hit_rate_pvalue` | 203 | 193 | 0 | 10 | 0 | 0.0e+00 | 723 | 45.0 |
 
 **Python bindings** (`qtrans bind examples/bl_app`: one extension, `bl_app_cpp`, a submodule per module): 22 functions, 4,436 cases, 0 mismatches.
 
 | function | cases | match | known | ill-cond | mismatch | Python | compiled |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `bl_core.nearest_psd` | 202 | 202 | 0 | 0 | 0 | 56.0 us | 14.8 us |
-| `bl_core.ledoit_wolf_identity` | 201 | 181 | 20 | 0 | 0 | 162.6 us | 121.5 us |
-| `bl_core._ewma_weights` | 202 | 202 | 0 | 0 | 0 | 11.1 us | 12.5 us |
-| `bl_core.horizon_returns` | 202 | 202 | 0 | 0 | 0 | 36.3 us | 15.7 us |
-| `bl_core.variance_ratio` | 203 | 203 | 0 | 0 | 0 | 177.4 us | 54.0 us |
-| `bl_core.apply_variance_ratio` | 201 | 201 | 0 | 0 | 0 | 80.6 us | 14.9 us |
-| `bl_core.equilibrium_returns` | 201 | 201 | 0 | 0 | 0 | 3.5 us | 1.3 us |
-| `bl_core.implied_confidence_weights` | 201 | 201 | 0 | 0 | 0 | 12.9 us | 2.2 us |
-| `bl_core.omega_he_litterman` | 201 | 201 | 0 | 0 | 0 | 16.3 us | 1.5 us |
-| `bl_core.posterior_mu` | 202 | 179 | 0 | 23 | 0 | 43.1 us | 3.9 us |
-| `bl_core.posterior_sigma` | 202 | 201 | 0 | 1 | 0 | 91.1 us | 18.5 us |
-| `bl_core.portfolio_stats` | 201 | 201 | 0 | 0 | 0 | 6.8 us | 647 ns |
-| `bl_core._downside_dev` | 201 | 185 | 16 | 0 | 0 | 26.1 us | 8.0 us |
-| `bl_core._cvar` | 201 | 201 | 0 | 0 | 0 | 117.3 us | 6.8 us |
-| `bl_backtest.vol_target_scale` | 203 | 202 | 1 | 0 | 0 | 33.6 us | 3.3 us |
-| `bl_backtest.buy_and_hold_returns` | 201 | 201 | 0 | 0 | 0 | 39.7 us | 3.8 us |
-| `bl_inference.default_block_length` | 202 | 182 | 20 | 0 | 0 | 444 ns | 148 ns |
-| `bl_inference._ann_mean` | 201 | 201 | 0 | 0 | 0 | 3.8 us | 669 ns |
-| `bl_inference._ann_sharpe` | 201 | 183 | 18 | 0 | 0 | 51.5 us | 1.7 us |
-| `bl_inference.newey_west_lag` | 202 | 177 | 25 | 0 | 0 | 230 ns | 154 ns |
-| `bl_inference.hac_cov` | 202 | 202 | 0 | 0 | 0 | 68.6 us | 21.5 us |
-| `bl_inference.hit_rate_pvalue` | 203 | 193 | 10 | 0 | 0 | 355 ns | 172 ns |
+| `bl_core.nearest_psd` | 202 | 202 | 0 | 0 | 0 | 53.8 us | 13.5 us |
+| `bl_core.ledoit_wolf_identity` | 201 | 181 | 20 | 0 | 0 | 129.4 us | 86.0 us |
+| `bl_core._ewma_weights` | 202 | 202 | 0 | 0 | 0 | 10.5 us | 11.9 us |
+| `bl_core.horizon_returns` | 202 | 202 | 0 | 0 | 0 | 34.1 us | 15.8 us |
+| `bl_core.variance_ratio` | 203 | 203 | 0 | 0 | 0 | 185.1 us | 41.0 us |
+| `bl_core.apply_variance_ratio` | 201 | 201 | 0 | 0 | 0 | 65.3 us | 14.4 us |
+| `bl_core.equilibrium_returns` | 201 | 201 | 0 | 0 | 0 | 3.1 us | 1.0 us |
+| `bl_core.implied_confidence_weights` | 201 | 201 | 0 | 0 | 0 | 11.1 us | 2.4 us |
+| `bl_core.omega_he_litterman` | 201 | 201 | 0 | 0 | 0 | 15.1 us | 1.5 us |
+| `bl_core.posterior_mu` | 202 | 179 | 0 | 23 | 0 | 27.7 us | 3.3 us |
+| `bl_core.posterior_sigma` | 202 | 201 | 0 | 1 | 0 | 105.5 us | 17.2 us |
+| `bl_core.portfolio_stats` | 201 | 201 | 0 | 0 | 0 | 4.8 us | 586 ns |
+| `bl_core._downside_dev` | 201 | 185 | 16 | 0 | 0 | 16.8 us | 6.1 us |
+| `bl_core._cvar` | 201 | 201 | 0 | 0 | 0 | 83.5 us | 6.5 us |
+| `bl_backtest.vol_target_scale` | 203 | 202 | 1 | 0 | 0 | 33.5 us | 3.6 us |
+| `bl_backtest.buy_and_hold_returns` | 201 | 201 | 0 | 0 | 0 | 37.8 us | 3.8 us |
+| `bl_inference.default_block_length` | 202 | 182 | 20 | 0 | 0 | 274 ns | 147 ns |
+| `bl_inference._ann_mean` | 201 | 201 | 0 | 0 | 0 | 4.1 us | 672 ns |
+| `bl_inference._ann_sharpe` | 201 | 183 | 18 | 0 | 0 | 30.6 us | 1.8 us |
+| `bl_inference.newey_west_lag` | 202 | 177 | 25 | 0 | 0 | 346 ns | 151 ns |
+| `bl_inference.hac_cov` | 202 | 202 | 0 | 0 | 0 | 63.5 us | 23.8 us |
+| `bl_inference.hit_rate_pvalue` | 203 | 193 | 10 | 0 | 0 | 342 ns | 208 ns |

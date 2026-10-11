@@ -140,7 +140,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (371 tests).
+`python -m pytest` (378 tests).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -618,6 +618,58 @@ Module-level settings the verifier reads (the translator ignores names starting 
 arrays) and `QTRANS_TOLERANCE = {"f": 1e-8}` for an algorithm that guarantees less than 1e-10.
 No example needs `QTRANS_TOLERANCE`, and every hand-picked case is an outright match.
 
+## Fuzzing
+
+The examples, the app and the tests are code someone wrote on purpose, so they only reach the
+combinations of features someone thought of. `python -m tools.fuzz` writes random functions in
+the subset qtrans translates (scalars, ints, control flow, arrays, slicing, broadcasting, masks,
+`np.where`, reductions, linear algebra, and calls between the functions, arrays changed in place
+through them included), type by type, so each is valid Python; translates them, compiles them,
+and checks them against Python on the verifier's inputs (non-square, empty and length-1 arrays,
+and every other batch the stress profile's inf, NaN and extreme values). A crash, a compile
+error, a warning or a mismatch is isolated to its function and shrunk automatically, by
+deleting and simplifying the program while it still fails the same way, to a minimal
+reproducer. CI runs it on every push with a fixed seed for 3 minutes, and nightly with a new
+seed for 30 minutes ([`fuzz.yml`](https://github.com/SunnyAlexV/qtrans/blob/main/.github/workflows/fuzz.yml));
+a nightly failure uploads the reproducer with the run.
+
+On this release, `python -m tools.fuzz --seed 9 --minutes 20` (on the reference platform)
+generated 1,140 functions: 780 translated and checked on 31,200 inputs with no failure, and 360
+refused with a reason. Most refusals are calls to a function that was itself refused, or two
+calls in one statement that both change an argument (Python runs them left to right; C++ leaves
+the order unspecified). The finished development runs before it (seeds 1, 2, 3, 6 and 8: 1,780 functions, 1,445
+translated, 57,762 inputs) found 12 failures, which come down to the 8 below.
+
+What it found, each fixed and kept as a test
+([`tests/data/fuzz_regressions.py`](https://github.com/SunnyAlexV/qtrans/blob/main/tests/data/fuzz_regressions.py)):
+
+- **Array sizes are Eigen's `Index`** (`long`), not `long long`: `min(n, len(v))` and
+  `len(v) // 2` didn't compile.
+- **Arrays used only as temporaries** (`float(np.array([...]) @ w)` in a function with scalar
+  parameters) left the header without the array runtime: it didn't compile.
+- **A slice in a product or a broadcast** (`v[:2] @ A`, `A / v[1:]`, `np.diag(v[::-1])`):
+  Eigen's own slice view claims direct memory access but has none, which didn't compile.
+  Slices are now strided maps over the array's memory (a negative step a negative stride).
+- **Unused locals and parameters** (assigned and never read, or read only in a branch the
+  translation drops, like the `else` of `if True:`) drew warnings; they are now
+  `[[maybe_unused]]`.
+- **A fresh value passed to a function that changes its argument in place** (`f(v + 1)`) was
+  refused; it now goes through `qt::lvalue`, which gives C++ the temporary to change, as Python
+  does. A *view* passed to it (`f(v[1:])`, `f(A.T)`) didn't compile: in Python the change goes
+  through the view into the original, which the C++ doesn't do, so it is refused with that reason.
+- **NumPy treats a boolean index with no elements as an empty index**, whatever the array's
+  shape: `v[np.array([], dtype=bool)]` is `[]` and assigning through it changes nothing. The
+  C++ raised `IndexError`.
+- **`A[1] = A[:, j]`**, a column copied into a row of the same matrix: NumPy copies the two
+  overlapping views element by element without a temporary and reads an element it has just
+  overwritten (on `np.arange(25.).reshape(5, 5)`, row 1 becomes `[3, 18, 13, 18, 23]`, not
+  column 3). The C++ gave column 3. Refused, with `.copy()` as the hint; every other
+  overlapping assignment NumPy gets right (`v[1:] = v[:-1]`, `A[0:2] = A[1:3]`, `A[:] = A.T`)
+  and the C++ agrees.
+- **Which of two errors is raised** when one expression breaks two checks: documented under
+  [Differences kept by design](#differences-kept-by-design), and counted as `known` only when
+  both sides raise.
+
 ## Platforms
 
 CI ([`.github/workflows/tests.yml`](https://github.com/SunnyAlexV/qtrans/blob/main/.github/workflows/tests.yml))
@@ -673,6 +725,14 @@ Each is listed in the per-module report next to the functions it affects.
   (`n_steps + 1`, `2 * n`); loop and index
   arithmetic stays plain C++. `LLONG_MIN % -1` (undefined in C++) gives 0, as in Python.
 - **Last-bit differences** where NumPy or SciPy use their own `exp`, `pow`, `erf` or BLAS/LAPACK.
+- **Which of two errors is raised.** When one expression breaks two checks at once (shapes that
+  don't broadcast, and an index out of range: `np.ones(3) / np.zeros(2) * A[64]`), Python
+  raises the first, left to right. C++ leaves the order in which a call's arguments are
+  evaluated unspecified (GCC and MSVC usually go right to left, Clang left to right), so it may
+  raise the other. Both reject the input; matching Python's order would mean splitting every
+  expression that can raise into its own statement. The verifier counts these as `known` only
+  when both sides raise an error that rejects the input (`ValueError`, `IndexError`, a division
+  by zero), never when one side returns a value.
 - **`assert`** always runs in C++; `python -O` strips it.
 - **Shape and bounds checks** are always on, as they are in NumPy. Defining your own
   `eigen_assert` before including the header turns them off.
@@ -767,9 +827,11 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               371 tests: generated text, refusals, compiled semantics, every example,
+tests/               378 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
-tools/               scripts that back the numbers in this README
+tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
+                     (generator, checker, shrinker: `python -m tools.fuzz`)
+ci/                  the reference job's pinned packages
 run_examples.py      press-Run entry point
 ```
 
@@ -784,9 +846,10 @@ run_examples.py      press-Run entry point
 6. ~~Tooling~~: a pybind11 wrapper so the C++ can be called back from Python (0.7), PyPI
    (0.7), multi-module projects (0.8).
 7. **Trust**: 0.8.1 brought rectangular, empty and extreme-value inputs to the verifier,
-   checked int arithmetic and a time limit on Python calls. **Next (0.9)**: Clang,
-   sanitizers, optimisation levels and macOS ARM64 in CI; generated-program fuzzing with
-   automatic minimisation; operation-specific numerical checks (backward error of solves,
+   checked int arithmetic and a time limit on Python calls. 0.9 so far: Clang, sanitizers,
+   optimisation levels, Python 3.10/3.14, Windows and macOS ARM64 in CI
+   ([Platforms](#platforms)); a program fuzzer with automatic minimisation
+   ([Fuzzing](#fuzzing)). **Next**: operation-specific numerical checks (backward error of solves,
    residuals of eigendecompositions and Cholesky, Moore-Penrose conditions judged against the
    condition number); `qtrans doctor` / `inspect` / `explain`; traceable headers (source hash,
    Python line references, CMake); a reproducible benchmark protocol.

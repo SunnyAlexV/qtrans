@@ -34,6 +34,12 @@ def test_in_place_operator_is_a_modification():
     assert "void f(qt::Vec& a, double k)" in cpp("def f(a: Vec, k: float) -> None:\n    a *= k\n")
 
 
+def test_temporary_passed_to_an_in_place_parameter():
+    # Python changes the temporary and drops it; qt::lvalue hands C++ the same temporary
+    h = cpp("def g(x: Vec) -> None:\n    x[0] = 1.0\n\ndef f(a: Vec) -> None:\n    g(a * 2)\n")
+    assert "g(qt::lvalue(qt::Vec(a * 2.0)));" in h
+
+
 def test_rebound_array_by_value():
     assert "qt::Vec f(qt::Vec a)" in cpp("def f(a: Vec) -> Vec:\n    a = a * 2\n    return a\n")
 
@@ -130,7 +136,7 @@ def test_elementwise_update_needs_no_eval():
     ("def f(a: Vec) -> None:\n    for x in a:\n        a[0] = x\n", "while iterating"),
     ("def g(x: Vec, y: Vec) -> None:\n    x[0] = y[0]\n\ndef f(a: Vec) -> None:\n    g(a, a)\n",
      "is passed twice to g()"),
-    ("def g(x: Vec) -> None:\n    x[0] = 1.0\n\ndef f(a: Vec) -> None:\n    g(a * 2)\n", "modifies its argument"),
+    ("def g(x: Vec) -> None:\n    x[0] = 1.0\n\ndef f(a: Vec) -> None:\n    g(a[1:])\n", "is a view"),
     ("def f(a: Vec) -> float:\n    return a.reshape(2, 2).sum()\n", "not supported"),
     ("def f(A: Mat, i: int) -> Vec:\n    return A[i, 1:3]\n", "mixing an index and a partial slice"),
     ("def f(a: Vec) -> float:\n    return sum(a)\n", "built-in sum() of an array"),

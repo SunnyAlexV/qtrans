@@ -1,0 +1,50 @@
+# The program fuzzer (tools/fuzz): random typed Python programs in qtrans's subset, translated,
+# compiled and checked against Python; a failure is shrunk to a minimal reproducer, which is
+# uploaded with the run (Summary page -> Artifacts -> fuzz-report).
+#   on every push: a fixed seed for 3 minutes, the same programs each time (a regression check)
+#   nightly:       a new seed for 30 minutes (new programs; GitHub emails when it fails)
+name: fuzz
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: ${{ github.event_name == 'schedule' && 'nightly (new seed, 30 min)' || 'fixed seed (3 min)' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      QTRANS_REQUIRE_CXX: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Python packages (pinned)
+        run: python -m pip install -r ci/requirements-pinned.txt
+
+      - name: Install Eigen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev
+
+      - name: Fuzz
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python -m tools.fuzz --seed ${{ github.run_number }}000 --minutes 30 --shrink-minutes 8 --out fuzz_out
+          else
+            python -m tools.fuzz --seed 1 --minutes 3 --shrink-minutes 4 --out fuzz_out
+          fi
+
+      - name: Upload the report and reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-report
+          path: fuzz_out/

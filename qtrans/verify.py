@@ -172,6 +172,7 @@ class Case:
     ulps: int = 0
     tiny: bool = False  # passed only because |difference| <= atol (values near zero)
     sensitivity: float = 0.0  # Python's own relative change under a 4-ULP input nudge
+    order: bool = False  # 'known' because the input breaks two checks at once (see classify)
 
 
 @dataclass
@@ -260,6 +261,13 @@ class VerifyReport:
                 lines += ["", f"  {f.name}: {f.timeouts} case(s) left out: Python didn't finish a call within "
                               f"{PYTHON_CASE_SECONDS:g} s (it hung), so there is nothing to compare; after a hang on",
                           "  inf / NaN / near-overflow inputs, its other such cases are skipped"]
+        order = [c for f in self.functions for c in f.cases if c.order]
+        if order:
+            c = order[0]
+            lines += ["", f"  {len(order)} 'known' case(s) break two checks in one expression, and the two sides "
+                          "report different ones (Python",
+                      "  raises the first, left to right; C++ leaves the order of a call's arguments unspecified),",
+                      f"  e.g. {c.func}: Python {c.py[1]} ({c.py[2][:60]}), C++ {c.cpp[1]}"]
         edge = [c for f in self.functions for c in f.cases if c.outcome == "edge"]
         if edge:
             c = edge[0]
@@ -274,7 +282,7 @@ class VerifyReport:
                       f"  own answer by up to {worst.sensitivity:.1e} (relative); C++ agreed within 100x that."]
         known = [c for f in self.functions for c in f.cases if c.outcome == "known"]
         ints = [c for c in known if c.cpp[0] == "exc" and c.cpp[1] == "IntOverflow"]
-        floats = [c for c in known if c not in ints]
+        floats = [c for c in known if c not in ints and not c.order]
         if floats:
             c = floats[0]
             lines += ["", f"  'known' = Python raised a float error where IEEE-754 C++ returns inf/NaN,",
@@ -1141,8 +1149,21 @@ def classify(case: Case, ret, rtol, atol):
         # does next (returns NaN, or a later check throws) follows from that, not from a
         # translation error.
         case.outcome = "known"
+    elif py[0] == "exc" and cpp[0] == "exc" and py[1] in _ARG_ERRORS and cpp[1] in _ARG_ERRORS:
+        # both reject the input, with different errors: it breaks two checks in one expression
+        # (shapes that don't broadcast, and an index out of range or a division by zero). Python raises
+        # the first in left-to-right order; C++ leaves the order of a call's arguments
+        # unspecified (GCC and MSVC usually go right to left, Clang left to right).
+        case.outcome = "known"
+        case.order = True
     else:
         case.outcome = "mismatch"
+
+
+# The errors that reject an input (a shape, an index, a singular matrix, a division by zero),
+# as opposed to a wrong value: when an input breaks two of these checks, which one is raised
+# first may differ (see classify).
+_ARG_ERRORS = {"ValueError", "IndexError", "ShapeError", "LinAlgError", "ZeroDivisionError", "ArithmeticError"}
 
 
 def _ulps(v, k):
@@ -1514,7 +1535,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 enc = " ".join(_encode(v, p.type) for v, p in zip(c.args, sigs[fc.name].params))
                 lines.append(f"CALL {fc.key} {enc}")
                 index.append((fc, c))
-    run = subprocess.run([str(exe)], input="\n".join(lines) + "\n", capture_output=True, text=True,
+    run = subprocess.run([str(exe)], input="".join(x + "\n" for x in lines), capture_output=True, text=True,
                          encoding="utf-8", errors="replace", timeout=600)
     outputs = run.stdout.splitlines()
     if len(outputs) != len(lines):

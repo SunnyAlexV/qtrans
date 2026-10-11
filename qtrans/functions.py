@@ -176,6 +176,39 @@ class _Event:
         self.name, self.kind, self.payload, self.stmt, self.index = name, kind, payload, stmt, index
 
 
+def _orientation(node):
+    """For a bare view of a matrix variable: (name, 'row' | 'col'), else None.
+    A[i], A[i, :] -> row; A[:, j] -> col; through .T the other way round."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    base, flip = node.value, False
+    if isinstance(base, ast.Attribute) and base.attr == "T":
+        base, flip = base.value, True
+    if not isinstance(base, ast.Name):
+        return None
+    parts = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+    full = lambda p: isinstance(p, ast.Slice) and p.lower is None and p.upper is None and p.step is None  # noqa: E731
+    if len(parts) == 1 and not isinstance(parts[0], ast.Slice):
+        o = "row"
+    elif len(parts) == 2 and not isinstance(parts[0], ast.Slice) and full(parts[1]):
+        o = "row"
+    elif len(parts) == 2 and full(parts[0]) and not isinstance(parts[1], ast.Slice):
+        o = "col"
+    else:
+        return None
+    return base.id, ({"row": "col", "col": "row"}[o] if flip else o)
+
+
+def _crossing_view(target, value):
+    """A[i] = A[:, j] (a column into a row of the same matrix, or the other way): NumPy copies
+    such overlapping 1-D views element by element without a temporary, so its result depends on
+    its loop order. -> the right side's orientation, or None."""
+    t, v = _orientation(target), _orientation(value)
+    if t and v and t[0] == v[0] and t[1] != v[1]:
+        return v[1]
+    return None
+
+
 class FunctionTranslator(ExprTranslator):
     def __init__(self, mod, fdef, sig):
         super().__init__(mod)
@@ -395,6 +428,14 @@ class FunctionTranslator(ExprTranslator):
         return tuple(x if x is not None else (("now", name, k, id(self.current)) if now_ok else None)
                      for k, x in enumerate(h)), None
 
+    def _unused(self, name: str) -> str:
+        """`[[maybe_unused]] ` for a local Python assigns but never reads: the C++ variable would
+        otherwise draw -Wunused-variable (the generated code is meant to compile warning-free,
+        also under -Werror), and the attribute says what the Python says: this value is not used."""
+        if not hasattr(self, "_read_names"):
+            self._read_names = {n.id for n in ast.walk(self.fdef) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        return "" if name in self._read_names else "[[maybe_unused]] "
+
     def ident(self, name: str) -> str:
         """The C++ name of a local or parameter. Inside a method, one that would hide a field
         or method of the class (and trip -Wshadow) gets a trailing underscore."""
@@ -454,7 +495,33 @@ class FunctionTranslator(ExprTranslator):
                                          "(Python would return None)", "add a final return or raise")
         self.emit_block(self.body)
         self.flush_comments(self.fdef.end_lineno + 1)
+        self._mark_unread_locals()
         return self.lines
+
+    def _mark_unread_locals(self):
+        """[[maybe_unused]] on a local the C++ never reads, though Python does: its only read was
+        in code the translation dropped (the else of `if True:`). Writes (`x = ...`, `x += ...`)
+        aren't reads, as for -Wunused-but-set-variable."""
+        import re
+        code = [re.sub(r"//.*", "", line) for line in self.lines]
+        for name in self.locals_order:
+            ident = self.ident(name)
+            word = re.compile(rf"\b{re.escape(ident)}\b")
+            decl = re.compile(rf"^(\s*)(?!\[\[maybe_unused\]\])(\S.*?) {re.escape(ident)}( = |\{{\}};| = )")
+            write = re.compile(rf"^\s*{re.escape(ident)} (=|\+=|-=|\*=|/=) ")
+            reads, at = 0, None
+            for k, line in enumerate(code):
+                n = len(word.findall(line))
+                if not n:
+                    continue
+                if at is None and decl.match(line):
+                    at, n = k, n - 1
+                elif write.match(line):
+                    n -= 1
+                reads += n
+            if at is not None and reads == 0:
+                self.lines[at] = decl.sub(lambda m: f"{m.group(1)}[[maybe_unused]] {m.group(2)} {ident}{m.group(3)}",
+                                          self.lines[at], count=1)
 
     # --- pass 1: scan ----------------------------------------------------------------
     def _add_event(self, name, kind, payload, stmt, index=None):
@@ -1298,8 +1365,8 @@ class FunctionTranslator(ExprTranslator):
         self.flush_comments(s.lineno)
         for n in self.hoist_at.get(id(s), ()):
             t = self.local_types[n]
-            self.emit(f"{t.cpp()} {self.ident(n)} = {t.zero()};" if isinstance(t, Scalar)
-                      else f"{t.cpp()} {self.ident(n)}{{}};")
+            self.emit(f"{self._unused(n)}{t.cpp()} {self.ident(n)} = {t.zero()};" if isinstance(t, Scalar)
+                      else f"{self._unused(n)}{t.cpp()} {self.ident(n)}{{}};")
         compound = isinstance(s, (ast.If, ast.While, ast.For))
         last = s.lineno if compound else s.end_lineno
         texts = [self.mod.inline_comments[ln] for ln in range(s.lineno, last + 1) if ln in self.mod.inline_comments]
@@ -1381,7 +1448,7 @@ class FunctionTranslator(ExprTranslator):
                 self._needs_eval(value_node, name, whole_array=True):
             code = f"({code}).eval()"  # Eigen is lazy: read all of the old value before overwriting it
         if name in inline_set:
-            self.emit(f"{vt.cpp()} {self.ident(name)} = {code};")
+            self.emit(f"{self._unused(name)}{vt.cpp()} {self.ident(name)} = {code};")
         elif code == self.ident(name):  # w = w.copy() of a parameter passed by value
             self.emit(f"// {ast.unparse(s)}: {name} is already this function's own copy")
         else:
@@ -1458,6 +1525,14 @@ class FunctionTranslator(ExprTranslator):
                               f"after the None check, work on a new name: {root}_ = {root}.copy()")
         code, kind = self.array_subscript(t, target=True)
         part = self._last_target_dims  # (reading the right side may index other arrays)
+        crossing = _crossing_view(t, value_node)
+        if crossing:
+            src, dst = ("row", "column") if crossing == "row" else ("column", "row")
+            raise Unsupported(s, f"`{ast.unparse(s).strip()}` copies a {src} of '{root}' into a "
+                                 f"{dst} of it, and the two share an "
+                                 "element: NumPy's result then depends on the order of its copy loop (it reads "
+                                 "an element it has already overwritten)",
+                              f"write `{ast.unparse(value_node)}.copy()` for the usual meaning")
         v = self.expr(value_node)
         if kind == "mask":
             base, mask = code
@@ -1701,7 +1776,7 @@ class FunctionTranslator(ExprTranslator):
             while end in self.all_names:
                 end += "_"
             self.all_names.add(end)
-            self.emit(f"const long long {end} = {self.as_type(stop, INT).code};")
+            self.emit(f"const long long {end} = {self.as_type(stop, INT, False).code};")
             stop_code = end
         cmp = "<" if step > 0 else ">"
         inc = {1: f"++{var}", -1: f"--{var}"}.get(step, f"{var} += {step}" if step > 0 else f"{var} -= {-step}")

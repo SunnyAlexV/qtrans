@@ -124,6 +124,16 @@ class _ConstTranslator(ExprTranslator):
     """Expressions evaluated at module level: constants and default arguments."""
 
 
+def _used_params(fdef, body_lines, sig) -> set:
+    """Parameters the C++ body uses: read in Python, and still named in the generated body
+    (comments aside). The others get [[maybe_unused]]: a parameter only assigned, or used
+    only in code the translation dropped (the else of `if True:`), would draw a warning."""
+    loads = {x.id for x in ast.walk(fdef) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+    loads |= {x.target.id for x in ast.walk(fdef) if isinstance(x, ast.AugAssign) and isinstance(x.target, ast.Name)}  # a *= k
+    text = "\n".join(re.sub(r"//.*", "", line) for line in body_lines)
+    return {p.name for p in sig.params if p.name in loads and re.search(rf"\b{re.escape(p.cpp)}\b", text)}
+
+
 class ModuleTranslator:
     def __init__(self, source: str, module_name: str, filename: str = "<input>", deps: dict | None = None):
         """deps: the already-translated modules of the project (name -> ModuleTranslator) that
@@ -134,6 +144,7 @@ class ModuleTranslator:
         self.tree = ast.parse(source, filename)
         self.full_comments, self.inline_comments = _collect_comments(source)
         self.imports: dict = {}
+        self.array_users: dict = {}  # function -> whether its translation used any array value
         self.constants: dict = {}
         self.skipped_globals: dict = {}
         self.sigs: dict = {}
@@ -1070,6 +1081,7 @@ class ModuleTranslator:
                 tr = FunctionTranslator(self, f, self.sigs[name])
                 try:
                     bodies[name] = tr.translate()
+                    self.array_users[name] = tr.used_arrays
                     notes[name] = list(self.sigs[name].decorator_notes)
                     for key, text in tr.notes:
                         if key in GENERAL_NOTES:
@@ -1236,7 +1248,7 @@ class ModuleTranslator:
             sig = self.sigs[m.key]
             if sig.doc:
                 out += [("/// " + line).rstrip() for line in sig.doc.splitlines()]
-            used = {x.id for x in ast.walk(m.fdef) if isinstance(x, ast.Name)}
+            used = _used_params(m.fdef, bodies[m.key], sig)
             line = "inline " + self.cpp_signature(sig, defaults=False, used_params=used,
                                                    name=f"{info.cpp}::{sig.cpp}")
             if m.kind not in ("static", "class") and sig.const:
@@ -1292,7 +1304,7 @@ class ModuleTranslator:
                 out.append("// " + c)
             if sig.doc:
                 out += [("/// " + line).rstrip() for line in sig.doc.splitlines()]
-            used = {x.id for x in ast.walk(f) if isinstance(x, ast.Name)}
+            used = _used_params(f, bodies[n], sig)
             out.append("inline " + self.cpp_signature(sig, defaults=not forward, used_params=used) + " {")
             out += bodies[n]
             out.append("}")
@@ -1312,7 +1324,8 @@ class ModuleTranslator:
         inc_lines = [f"#include {i}" for i in includes]
         if "qt::Rng" in text:
             inc_lines.append('#include "qtrans_random.hpp"  // NumPy\'s generator, plus Eigen arrays')
-        elif re.search(r"qt::(Vec|Mat|Mask2?)\b", text) or "Eigen::" in text:
+        elif re.search(r"qt::(Vec|Mat|Mask2?)\b", text) or "Eigen::" in text \
+                or any(self.array_users.get(n) for n in bodies):  # e.g. qt::dot(qt::vec({...}), ...) only
             inc_lines.append('#include "qtrans_arrays.hpp"  // Eigen, plus NumPy semantics')
         elif "qt::" in text:
             inc_lines.append('#include "qtrans_runtime.hpp"')
