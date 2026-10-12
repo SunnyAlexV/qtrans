@@ -10,7 +10,7 @@ def discount(r: float, t: float) -> float:
 
 
 def annuity(r: float, n: int) -> float:
-    return sum(discount(r, t) for t in range(1, n + 1))  # generator expression
+    return sum(map(lambda t: discount(r, t), range(1, n + 1)))  # lambda and map()
 
 
 def portfolio_value(weights: np.ndarray, prices: np.ndarray) -> float:  # arrays: stage 2

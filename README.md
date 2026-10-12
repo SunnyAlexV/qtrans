@@ -158,7 +158,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (471 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (485 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -349,6 +349,20 @@ x     |1234.568|42 2.67
   or lists of lists are refused, and so is any sharing a copy would break: `b = a` where
   either is then changed, a function changing a list passed to it, a loop changing what it
   goes through (the hints: `list(a)` for a copy).
+- `for i, x in enumerate(xs)` and `for a, b in zip(xs, ys)` (also `enumerate(xs, start)`,
+  `enumerate(zip(...))`, three or more sequences, and the same in comprehensions) become
+  index loops, written as a C++ programmer writes them: `for (long long i = 0, i_end = ...;
+  i < i_end; ++i) { double x = xs[i]; ... }`, zip stopping at the shorter sequence. They work
+  over lists and arrays; a sequence that is computed (`xs[1:]`, `sorted(xs)`) is computed once,
+  before the loop, as Python does. Python's iterators read element k by position, so the index
+  loop reads exactly the same values, even when the body changes elements; a loop that changes
+  the length of what it goes through, or rebinds it, is refused, and so is `zip(strict=True)`.
+  An index that can't leave the list (`range(len(xs))`, `zip`) reads `xs[i]` without a check.
+- Generators: `sum`, `min`, `max`, `sorted`, `list` and `", ".join(...)` read a generator to the
+  end, so `sum(x * w for x, w in zip(xs, ws))` is the comprehension it is equal to; `any(...)`
+  and `all(...)` stop at the first element that decides, as in Python (the elements after it
+  are never computed, so `any(1 / z > 1 for z in zs if z != 0)` can't divide by zero).
+  `sep.join(names)` joins a list of strings (of numbers it is Python's `TypeError`, refused).
 - Objects print as Python prints them: a dataclass or NamedTuple as `Option(strike=100.0,
   expiry=0.5, kind='call')` (fields with `repr=False` left out, nested objects included), a
   class with `__repr__` / `__str__` through those methods, translated. Where a field may hold a
@@ -1094,11 +1108,11 @@ Each is listed in the per-module report next to the functions it affects.
   [Programs](#programs-a-script-becomes-a-c-program) for what is supported and refused).
 - **Statements:** assignment (including tuple unpacking, swaps, `a[i] = x`, `a[i:j] = v`,
   `A[i] = row`, `A[:, j] = col`), augmented assignment, `if`/`elif`/`else`, `while`,
-  `for` over `range(...)`, a `Vec` or a literal list, `break`, `continue`, `return`, `raise` with a
+  `for` over `range(...)`, a `Vec`, a list or a literal list, `enumerate(...)`, `zip(...)`, `break`, `continue`, `return`, `raise` with a
   message, `assert`, `try`/`except np.linalg.LinAlgError` or `ValueError`, `with np.errstate(...)`.
 - **Scalar library:** `math.*`, scalar NumPy functions, `scipy.stats.norm.cdf/pdf/ppf/sf`
   with `loc`/`scale`, `scipy.special.erf/erfc/ndtr/ndtri`, and the builtins `abs`, `min`,
-  `max`, `float`, `int`, `bool`, `round`, `pow`.
+  `max`, `float`, `int`, `bool`, `round`, `pow`, and `any` / `all` of a generator.
 - **Array library:**
   - Creation: `zeros`, `ones`, `full`, `eye`, `linspace`, `arange`, `array([...])`,
     `*_like`, `copy`.
@@ -1158,6 +1172,8 @@ qtrans/
   functions.py       per function: scan, loops, inference, aliasing, declarations, emission
   expressions.py     scalar expressions, Python semantics, library calls
   printing.py        print, f-strings, str/repr/format, % formatting: Python's text, exactly
+  lists.py           lists as std::vector, comprehensions, any/all, str.join
+  loops.py           enumerate / zip loops rewritten as index loops, before translation
   origins.py         which values are Python's and which NumPy's (they repr and round differently)
   arrays.py          array expressions: arithmetic, broadcasting, indexing, NumPy functions
   classes.py         @dataclass / NamedTuple: fields, defaults, methods (stage 5)
@@ -1173,11 +1189,12 @@ qtrans/
   runtime/qtrans_arrays.hpp    array helpers on Eigen, NumPy algorithms ported
   runtime/qtrans_random.hpp    NumPy's Generator (SeedSequence + PCG64 + ziggurat)
   runtime/qtrans_print.hpp     Python's repr and format mini-language, NumPy's array printing
+  runtime/qtrans_list.hpp      lists: indexes, slices, sum, sorted, ... with Python's rules
   runtime/qtrans_pybind.hpp    the bindings' conversions, write-backs and exceptions
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               471 tests: generated text, refusals, compiled semantics, every example,
+tests/               485 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1205,9 +1222,9 @@ run_examples.py      press-Run entry point
    `qtrans explain` (Python and C++ side by side, with reasons), `inspect` and `doctor`
    ([Python and C++ side by side](#python-and-c-side-by-side)). **0.10 so far**: `qtrans live`, the
    editor with the C++ updating as you type; programs, with Python's printing reproduced
-   exactly, types taken from how a script calls its functions, lists, and objects printed
-   ([Programs](#programs-a-script-becomes-a-c-program)). **Next**: `enumerate`/`zip` loops and
-   dictionaries; the editor inside VS Code; traceable headers (source hash, Python line references, CMake); a reproducible
+   exactly, types taken from how a script calls its functions, lists, `enumerate`/`zip` loops,
+   generators, and objects printed ([Programs](#programs-a-script-becomes-a-c-program)).
+   **Next**: dictionaries; the editor inside VS Code; traceable headers (source hash, Python line references, CMake); a reproducible
    benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the

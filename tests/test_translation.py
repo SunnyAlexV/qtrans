@@ -111,7 +111,7 @@ def test_round_is_half_to_even():
 
 def test_range_bound_hoisted_when_body_changes_it():
     h = cpp("def f(n: int) -> int:\n    t = 0\n    for i in range(n):\n        n -= 1\n        t += 1\n    return t\n")
-    assert "const long long i_end = n;" in h and "i < i_end" in h
+    assert "for (long long i = 0, i_end = n; i < i_end; ++i) {" in h
 
 
 def test_negative_step_loop():

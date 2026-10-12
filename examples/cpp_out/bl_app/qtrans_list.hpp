@@ -200,6 +200,16 @@ inline long long len(const std::string& s) {
     return n;
 }
 
+// sep.join(xs) for a list of str
+inline std::string join(const std::string& sep, const std::vector<std::string>& xs) {
+    std::string out;
+    for (size_t k = 0; k < xs.size(); ++k) {
+        if (k) out += sep;
+        out += xs[k];
+    }
+    return out;
+}
+
 // list(range(...)): the ints of a range
 inline std::vector<long long> range_list(long long start, long long stop, long long step = 1) {
     if (step == 0) throw std::invalid_argument("range() arg 3 must not be zero");

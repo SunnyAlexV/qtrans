@@ -204,8 +204,7 @@ inline double Curve::zero(double t) const {
     if (t >= ts(ts.size() - 1)) {
         return rs(rs.size() - 1);
     }
-    const long long i_end = ts.size();
-    for (long long i = 1; i < i_end; ++i) {
+    for (long long i = 1, i_end = ts.size(); i < i_end; ++i) {
         if (t <= ts(i)) {
             double w = (t - ts(i - 1)) / (ts(i) - ts(i - 1));
             return rs(i - 1) + w * (rs(i) - rs(i - 1));

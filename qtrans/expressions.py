@@ -21,7 +21,7 @@ from .arrays import STACKERS, ArrayOps
 from .structs import StructOps
 from .printing import TextOps
 from .lists import ListOps, list_of
-from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
+from .types import (ListType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
 from .core import cpp_string
@@ -57,6 +57,8 @@ _REJECTED_BUILTINS = {
     "divmod": "divmod() returns a pair; use // and % separately",
     "isinstance": "run-time type checks have no meaning in typed C++",
     "complex": "complex numbers are not supported",
+    "map": "write a comprehension instead: [f(x) for x in xs], or sum(f(x) for x in xs)",
+    "filter": "write a comprehension instead: [x for x in xs if keep(x)]",
 }
 
 
@@ -665,6 +667,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
                 e = self.list_builtin(node, name)
                 if e is not None:
                     return e
+            if name in ("any", "all"):
+                return self.any_all(node, name)
             if name in _BUILTINS:
                 return self.call_builtin(node, name)
             if name == "len" and len(node.args) == 1 and not node.keywords:
@@ -698,9 +702,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
                 return self.list_method(node, base, f.attr)
             if base.type == RNG:
                 return self.rng_method(node, base, f.attr)
+            if base.type == STR and f.attr == "join":
+                return self.str_join(node, base)
         if q is None:
-            raise Unsupported(node, f"method call '{ast.unparse(f)}(...)' is not supported",
-                              "objects and classes arrive in stage 4")
+            raise Unsupported(node, f"method call '{ast.unparse(f)}(...)' is not supported")
         return self.call_library(node, q)
 
     def call_user(self, node, name):
@@ -796,6 +801,11 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
             if isinstance(a, ast.Name) and p.type != STR:
                 passed.append(a.id)
             return e.code
+        if isinstance(p.type, ListType):  # passed as `const std::vector<T>&`
+            e = self.expr(a)
+            if not isinstance(e.type, ListType) or e.type.elem not in (None, p.type.elem):
+                raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
+            return f"{p.type.cpp()}{{}}" if e.type.elem is None else e.code
         e = self.expr(a)
         self.need_scalar(e, a, f"argument '{p.name}' of {display}()")
         if not assignable(p.type, e.type):

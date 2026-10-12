@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from .core import P_ADD, P_ATOM, Expr, cpp_string, wrap
 from .errors import Unsupported
 from .origins import NP, PY
-from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
+from .types import (ArrayType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, is_array)
 
 _SAMPLE = {"float": 1.5, "int": 7, "bool": True}  # a value of each type, to try a format spec on
@@ -216,7 +216,50 @@ class TextOps:
             return self.int_cond(node.operand)
         if self._empty_sum(node):  # sum([]) is the int 0
             return f"{self.ident(node.args[0].id)}.empty()"
+        empty = self._empty_comprehension_sum(node)
+        if empty:
+            return empty
         return False if self.maybe_int(node) else None
+
+    def _empty_comprehension_sum(self, node):
+        """sum(x * w for x, w in zip(xs, ws)), sum(x * x for x in xs): the int 0 exactly when
+        the sequences it goes through are empty (no `if` in it): that condition as C++, or None."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "sum"
+                and len(node.args) == 1 and isinstance(node.args[0], ast.ListComp) and not self.is_variable("sum")):
+            return None
+        comp = node.args[0]
+        if len(comp.generators) != 1 or comp.generators[0].ifs or self._quiet_type(node) != FLOAT:
+            return None
+        it = comp.generators[0].iter
+        if isinstance(it, ast.Name):
+            names = [it]
+        elif isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" \
+                and len(it.args) == 1 and not it.keywords:
+            stop = it.args[0]
+            lens = stop.args if isinstance(stop, ast.Call) and isinstance(stop.func, ast.Name) \
+                and stop.func.id == "min" else [stop]
+            names = []
+            for n in lens:  # len(xs), or len(xs) - 1 (zip(xs, xs[1:]))
+                cut = 0
+                if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Sub) and isinstance(n.right, ast.Constant) \
+                        and type(n.right.value) is int and n.right.value > 0:
+                    n, cut = n.left, n.right.value
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "len"
+                        and len(n.args) == 1 and isinstance(n.args[0], ast.Name)):
+                    return None
+                names.append((n.args[0], cut))
+        else:
+            return None
+        if isinstance(it, ast.Name):
+            names = [(it, 0)]
+        conds = []
+        for n, cut in names:
+            t = self._quiet_type(n)
+            if not (isinstance(t, ListType) or t == ArrayType(1)):
+                return None
+            x = self.ident(n.id)
+            conds.append(f"{x}.size() <= {cut}" if cut else f"{x}.empty()" if isinstance(t, ListType) else f"{x}.size() == 0")
+        return " || ".join(dict.fromkeys(conds))
 
     def _empty_sum(self, node) -> bool:
         """sum(xs) of a list of floats, xs a variable: the int 0 when xs is empty, a float otherwise."""

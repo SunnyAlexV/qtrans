@@ -22,6 +22,7 @@ from . import library as lib
 from .errors import Unsupported
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
+from . import loops
 from .functions import FunctionTranslator, is_docstring, python_reads, source_mark, strip_marks, subscript_root, target_leaves, view_root
 from .origins import Origins
 from .report import FunctionReport, ModuleReport
@@ -234,7 +235,7 @@ class ModuleTranslator:
         self.source = source
         self.module_name = module_name
         self.filename = filename
-        self.tree = ast.parse(source, filename)
+        self.tree = loops.rewrite(ast.parse(source, filename))  # enumerate / zip loops -> index loops
         self.full_comments, self.inline_comments = _collect_comments(source)
         self.imports: dict = {}
         self.array_users: dict = {}  # function -> whether its translation used any array value

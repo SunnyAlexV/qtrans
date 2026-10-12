@@ -696,7 +696,11 @@ class FunctionTranslator(ExprTranslator):
                 raise Unsupported(s, f"{what} are not supported in stage 1", hint)
             if isinstance(s, ast.For):
                 if not isinstance(s.target, ast.Name):
-                    raise Unsupported(s, "for-loops must use a single loop variable")
+                    why = getattr(s, "qt_why", None)
+                    if why:
+                        raise Unsupported(s, f"this enumerate() / zip() loop is not supported: {why}")
+                    raise Unsupported(s, "for-loops must use a single loop variable",
+                                      "unpacking works for enumerate() and zip(): for i, x in enumerate(xs)")
                 if s.orelse:
                     raise Unsupported(s, "for ... else is not supported")
                 if s.target.id in self.params or s.target.id == "self":
@@ -952,6 +956,17 @@ class FunctionTranslator(ExprTranslator):
                     raise Unsupported(node, f"nested loops reuse the loop variable '{v}'")
                 for s in node.body:
                     walk(s, active | {v})
+                return
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+                # [i * 2 for i in range(3)]: the comprehension's own i, not a loop variable
+                own = {t.id for g in node.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)}
+                walk(node.generators[0].iter, active)
+                rest = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+                rest += [x for g in node.generators for x in g.ifs] + [g.iter for g in node.generators[1:]]
+                for x in rest:
+                    for n in ast.walk(x):
+                        if isinstance(n, ast.Name) and n.id in self.loop_vars and n.id not in own:
+                            walk(n, active)
                 return
             if isinstance(node, ast.Name) and node.id in self.loop_vars:
                 if node.id not in active:
@@ -2142,6 +2157,9 @@ class FunctionTranslator(ExprTranslator):
             return
         if "range" in self.mod.imports or self.is_variable("range"):
             raise Unsupported(s, "'range' is redefined in this module")
+        if getattr(s, "qt_rewritten", None):
+            self.note("indexloop", "enumerate() / zip() become an index loop: Python's iterator reads element k by position, so "
+                  "xs[k] is the same value; zip stops at the shorter sequence (the min of the lengths)")
         if it.keywords or not 1 <= len(it.args) <= 3:
             raise Unsupported(s, "range() takes 1 to 3 positional arguments")
         args = [self.expr(a) for a in it.args]
@@ -2170,17 +2188,26 @@ class FunctionTranslator(ExprTranslator):
         risky = any(isinstance(n, ast.Call) or (isinstance(n, ast.Name) and n.id in body_stores)
                     for n in ast.walk(stop_node))
         stop_code = wrap(stop, P_REL - 1)
-        if risky:
+        init = f"{var} = {start.code}"
+        if risky:  # for (long long i = 0, i_end = ...; i < i_end; ++i): the end, computed once
             end = f"{var}_end"
-            while end in self.all_names:
+            active = self.__dict__.setdefault("loop_ends", [])
+            while end in self.all_names or end in active:
                 end += "_"
-            self.all_names.add(end)
-            self.emit(f"const long long {end} = {self.as_type(stop, INT, False).code};")
+            init += f", {end} = {self.as_type(stop, INT, False).code}"
             stop_code = end
         cmp = "<" if step > 0 else ">"
         inc = {1: f"++{var}", -1: f"--{var}"}.get(step, f"{var} += {step}" if step > 0 else f"{var} -= {-step}")
-        self.emit(f"for (long long {var} = {start.code}; {var} {cmp} {stop_code}; {inc}) {{")
-        self._block(s.body)
+        self.emit(f"for (long long {init}; {var} {cmp} {stop_code}; {inc}) {{")
+        if risky:
+            self.loop_ends.append(end)
+        saved = self._safe_index_push(s.target.id, self.range_over_len(it, s.body))
+        try:
+            self._block(s.body)
+        finally:
+            self._safe_index_pop(s.target.id, saved)
+            if risky:
+                self.loop_ends.pop()
         self.emit("}")
 
     def s_Return(self, s):

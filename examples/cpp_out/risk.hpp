@@ -40,8 +40,7 @@ inline qt::Vec ewma_vol(const qt::Vec& returns, double lam) {
         return var;
     }
     var(0) = std::pow(returns(0), 2);
-    const long long t_end = returns.size();
-    for (long long t = 1; t < t_end; ++t) {
+    for (long long t = 1, t_end = returns.size(); t < t_end; ++t) {
         var(t) = lam * var(t - 1) + (1 - lam) * std::pow(returns(t - 1), 2);
     }
     return var.sqrt();

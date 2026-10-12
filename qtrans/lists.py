@@ -72,7 +72,58 @@ class ListOps:
         i = self.expr(sl)
         if i.type not in (INT, BOOL):
             raise Unsupported(sl, f"list indices must be ints (Python raises TypeError for a {i.type})")
+        if self.index_in_range(node.value, sl):  # for i in range(len(xs)): xs[i] -- no check needed
+            return Expr(f"{wrap(base, P_ATOM)}[{i.code}]", P_ATOM, base.type.elem)
         return Expr(f"qt::py::item({base.code}, {self.as_type(i, INT).code})", P_ATOM, base.type.elem)
+
+    # --- for k in range(len(xs)): xs[k] is always in range ------------------------------------
+    @staticmethod
+    def range_over_len(it, body) -> set:
+        """The lists a range() loop's index stays inside: `range(len(xs))`, `range(1, len(xs))`,
+        `range(min(len(xs), len(ys)))`, when the loop (body: its statements or expressions)
+        neither changes the list's length nor rebinds it."""
+        from .loops import _changes
+        if not (isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range") \
+                or it.keywords or not 1 <= len(it.args) <= 3:
+            return set()
+        def const(n):
+            return n.value if isinstance(n, ast.Constant) and type(n.value) is int else None
+        if len(it.args) >= 2 and (const(it.args[0]) is None or const(it.args[0]) < 0):
+            return set()
+        if len(it.args) == 3 and (const(it.args[2]) is None or const(it.args[2]) <= 0):
+            return set()
+        stop = it.args[0] if len(it.args) == 1 else it.args[1]
+        lens = stop.args if isinstance(stop, ast.Call) and isinstance(stop.func, ast.Name) and stop.func.id == "min" \
+            and not stop.keywords else [stop]
+        names = set()
+        for n in lens:
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "len"
+                    and len(n.args) == 1 and isinstance(n.args[0], ast.Name)):
+                return set()
+            names.add(n.args[0].id)
+        stmts = [b if isinstance(b, ast.stmt) else ast.Expr(value=b) for b in body]
+        return {x for x in names if _changes(stmts, x) is None}
+
+    def index_in_range(self, seq, index) -> bool:
+        if not (isinstance(seq, ast.Name) and isinstance(index, ast.Name)):
+            return False
+        return seq.id in self.__dict__.get("safe_index", {}).get(index.id, ())
+
+    def _safe_index_push(self, var, names):
+        safe = self.__dict__.setdefault("safe_index", {})
+        saved = safe.get(var)
+        if names:
+            safe[var] = names
+        else:
+            safe.pop(var, None)
+        return saved
+
+    def _safe_index_pop(self, var, saved):
+        safe = self.__dict__.setdefault("safe_index", {})
+        if saved is None:
+            safe.pop(var, None)
+        else:
+            safe[var] = saved
 
     # --- methods ---------------------------------------------------------------------------------
     def list_method(self, node, base, name):
@@ -217,16 +268,45 @@ class ListOps:
             raise Unsupported(node, f"joining a list of {L.type.elem} and a list of {R.type.elem}")
         return Expr(f"qt::py::concat({L.code}, {R.code})", P_ATOM, L.type)
 
+    # --- ", ".join(names) ------------------------------------------------------------------------
+    def str_join(self, node, sep):
+        if node.keywords or len(node.args) != 1:
+            raise Unsupported(node, "str.join() takes one list")
+        xs = self.expr(node.args[0])
+        if not list_of(xs.type):
+            raise Unsupported(node.args[0], f"str.join() of a {xs.type} is not supported", "join a list of str")
+        if xs.type.elem not in (STR, None):
+            raise Unsupported(node.args[0], f"str.join() of a list of {xs.type.elem}: Python raises TypeError "
+                                            "(it joins only strings)", "join [str(x) for x in xs]")
+        code = "std::vector<std::string>{}" if xs.type.elem is None else xs.code
+        return Expr(f"qt::py::join({sep.code}, {code})", P_ATOM, STR)
+
     # --- [expr for x in it if cond] -------------------------------------------------------------
-    def e_ListComp(self, node):
+    def any_all(self, node, name):
+        """any(cond for x in xs) / all(...): Python stops at the first element that decides, so
+        the C++ is a loop that returns there (elements after it are never computed)."""
+        if node.keywords or len(node.args) != 1 or not isinstance(node.args[0], ast.GeneratorExp):
+            raise Unsupported(node, f"{name}() is supported over a generator: {name}(x > 0 for x in xs)")
+        return self.e_ListComp(node.args[0], mode=name)
+
+    def e_ListComp(self, node, mode="list"):
         if len(node.generators) != 1 or node.generators[0].is_async:
             raise Unsupported(node, "a list comprehension with several `for`s is not supported",
                               "write the loops out")
         g = node.generators[0]
         if not isinstance(g.target, ast.Name):
-            raise Unsupported(g.target, "a comprehension variable must be one name")
+            why = getattr(g, "qt_why", None)
+            raise Unsupported(g.target, f"this enumerate() / zip() comprehension is not supported: {why}" if why
+                              else "a comprehension variable must be one name",
+                              None if why else "unpacking works for enumerate() and zip()")
         var = g.target.id
         it = g.iter
+        if getattr(g, "qt_rewritten", False):
+            self.note("indexloop", "enumerate() / zip() become an index loop: Python's iterator reads element k by position, so "
+                  "xs[k] is the same value; zip stops at the shorter sequence (the min of the lengths)")
+        if mode != "list":
+            self.note("anyall", f"{mode}() of a generator stops at the first element that decides, in C++ "
+                                "too: a loop that returns there, so later elements are never computed")
         is_range = isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" \
             and not self.is_variable("range")
         if is_range:
@@ -257,17 +337,21 @@ class ListOps:
         outer = self.__dict__.setdefault("comp_vars", {})
         saved = outer.get(var)
         outer[var] = (vt, ident)
+        safe_saved = self._safe_index_push(var, self.range_over_len(it, [node.elt] + list(g.ifs)) if is_range else set())
         try:
             e = self.expr(node.elt)
             conds = [self.truth(self.expr(c), c) for c in g.ifs]
         finally:
+            self._safe_index_pop(var, safe_saved)
             if saved is None:
                 outer.pop(var, None)
             else:
                 outer[var] = saved
-        if e.type not in ELEMS:
+        if mode != "list":
+            test = self.truth(e, node.elt)
+        elif e.type not in ELEMS:
             raise Unsupported(node.elt, f"a list of {e.type} values is not supported", "lists of float, int or str are")
-        if self._list_maybe_int(node.elt, e.type):
+        if mode == "list" and self._list_maybe_int(node.elt, e.type):
             raise Unsupported(node.elt, "this value may be a Python int for some elements and a float for others",
                               "make it a float on every path (0.0 rather than 0)")
         out = "out"
@@ -280,6 +364,12 @@ class ListOps:
         else:
             decl = "const std::string&" if vt == STR else vt.cpp()
             loop = f"for ({decl} {ident} : {src.code})"
+        if mode != "list":
+            hit = wrap(test, 13) if mode == "any" else "!" + wrap(test, P_UNARY)
+            if not conds and mode == "any":
+                hit = test.code
+            body = f"if ({' && '.join([wrap(c, 13) for c in conds] + [hit])}) return {'true' if mode == 'any' else 'false'};"
+            return Expr(f"[&] {{ {loop} {body} return {'false' if mode == 'any' else 'true'}; }}()", P_ATOM, BOOL)
         body = f"{out}.push_back({e.code});"
         if conds:
             body = f"if ({' && '.join(wrap(c, 13) for c in conds)}) {body}"

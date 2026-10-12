@@ -70,7 +70,7 @@ def test_statements_map_to_their_own_lines():
         if span:
             by.setdefault(span[0], []).append(line.strip())
     assert by[4] == ["inline double f(qt::Vec& v, long long k) {"]
-    assert by[6][-1].startswith("for (long long i = 0;")
+    assert by[6] == ["for (long long i = 0, i_end = v.size(); i < i_end; ++i) {"]
     assert by[7] == ["if (v(i) > 0) {"]
     assert by[9] == ["} else {"]
     assert by[10] == ["s -= 1.0;", "}", "}"]  # the closing braces of the if and the for come after its last line

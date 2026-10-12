@@ -16,8 +16,8 @@ These only matter on inputs where Python would raise an exception or overflow.
 
 ## Not translated
 
-- `annuity` (line 12). line 13: generator expressions are not supported in stage 1
-  - Hint: use an explicit for-loop over range()
+- `annuity` (line 12). line 13: map() is not supported
+  - Hint: write a comprehension instead: [f(x) for x in xs], or sum(f(x) for x in xs)
 - `portfolio_value` (line 16). line 16: type annotation 'np.ndarray' doesn't say whether the array is 1-D or 2-D
   - Hint: annotate with Vec (1-D) or Mat (2-D): `from qtrans.typing import Vec, Mat`
 - `safe_log` (line 20). line 23: except ValueError around math.sqrt / math.log / ...: Python raises ValueError outside their domain, C++ returns NaN, so the handler would run in Python but not in C++
