@@ -144,3 +144,32 @@ def test_what_a_cpp_dict_would_do_differently_is_refused_at_its_line(src, line, 
     assert bad, r.report.to_text()
     first = next((f for f in bad if f.reason_line == line), bad[-1])
     assert first.reason_line == line and (words in first.reason or words in (first.hint or "")), first.reason
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_enumerate_and_zip_over_dict_views(tmp_path):
+    f = tmp_path / "views.py"
+    f.write_text(textwrap.dedent("""
+        prices = {"AAPL": 190.5, "MSFT": 410.25, "GOOG": 140.0}
+        weights = {"AAPL": 0.5, "MSFT": 0.3, "GOOG": 0.2}
+        for i, (k, v) in enumerate(prices.items()):
+            prices[k] = v * 2  # an existing key: allowed, as in Python
+            print(i, k, v, prices[k])
+        for k, w in zip(prices.keys(), weights.values()):
+            print(k, w)
+        for n, (k, v) in enumerate(weights.items(), start=1):
+            print(n, k, f"{v:.1%}")
+        """).lstrip())
+    rep = verify_file(f, n_random=5, build_dir=tmp_path / "build")
+    assert rep.program is not None and rep.program.identical, rep.to_text()
+
+
+@pytest.mark.parametrize("src, words", [
+    ("d = {'a': 1.0}\nfor i, (k, v) in enumerate(d.items()):\n    d['b'] = v\n", "dictionary changed size"),
+    ("d = {'a': 1.0}\nfor k, w in zip(d.keys(), [1.0]):\n    d.pop(k)\n", "dictionary changed size"),
+    ("d = {'a': 1.0}\nfor i, (_, v) in enumerate(d.items()):\n    print(v)\n", "name the key"),
+])
+def test_dict_views_in_enumerate_and_zip_refuse_what_python_would_raise_on(src, words):
+    r = translate_source(src, "m", "m.py")
+    bad = [f for f in r.report.functions if not f.translated]
+    assert bad and words in bad[0].reason, r.report.to_text()

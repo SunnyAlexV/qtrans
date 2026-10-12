@@ -115,6 +115,7 @@ class _Plan:
         self.seqs: list = []          # the sequence expressions, in order
         self.binds: list = []         # (target name, ("item", seq index) | ("index", start node))
         self.why: str | None = None
+        self.dicts: set = set()       # dicts it goes through (d.items(), d.keys(), d.values())
 
 
 def _plan(target, it, builtins_ok) -> _Plan | None:
@@ -169,6 +170,22 @@ def _plan(target, it, builtins_ok) -> _Plan | None:
         if _call_of(a, "range"):
             p.why = "a range() inside enumerate() or zip() is not supported; loop over range() and index"
             return
+        owner = _dict_view(a)
+        if owner is not None:
+            p.dicts.add(owner[0])
+            if owner[1] == "items":
+                # enumerate(d.items()): the keys, in order, and each value read by its key, d[k]
+                if not (isinstance(t, ast.Tuple) and len(t.elts) == 2 and all(isinstance(e, ast.Name) for e in t.elts)):
+                    p.why = "unpack d.items() into two names: for i, (k, v) in enumerate(d.items())"
+                    return
+                if t.elts[0].id == "_":
+                    p.why = "name the key (not _): its value is read by it"
+                    return
+                keys = ast.Call(func=ast.Attribute(value=_name(owner[0]), attr="keys", ctx=ast.Load()), args=[], keywords=[])
+                p.seqs.append(keys)
+                bind(t.elts[0], ("item", len(p.seqs) - 1))
+                p.binds.append((t.elts[1].id, ("lookup", owner[0], t.elts[0].id)))
+                return
         p.seqs.append(a)
         bind(t, ("item", len(p.seqs) - 1))
 
@@ -182,6 +199,36 @@ def _plan(target, it, builtins_ok) -> _Plan | None:
     if p.why is None and len({n for n, _ in p.binds if n != "_"}) != len([n for n, _ in p.binds if n != "_"]):
         p.why = "a name appears twice in the loop target"
     return p
+
+
+def _dict_view(a):
+    """d.items() / d.keys() / d.values() of a name d: (d, which), else None."""
+    if isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute) and a.func.attr in ("items", "keys", "values") \
+            and not a.args and not a.keywords and isinstance(a.func.value, ast.Name):
+        return a.func.value.id, a.func.attr
+    return None
+
+
+def _dict_changes(body, d, own_keys=()) -> str | None:
+    """How a loop body may change the size of dict d (Python raises RuntimeError when a dict it is
+    going through changes size), or rebind it; None if it can't."""
+    for n in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) \
+                and n.func.value.id == d and n.func.attr in ("pop", "popitem", "clear", "setdefault", "update"):
+            return f"d.{n.func.attr}()"
+        if isinstance(n, ast.Delete) and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                                             and t.value.id == d for t in n.targets):
+            return "del"
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                                             and t.value.id == d and not (isinstance(t.slice, ast.Name)
+                                                                          and t.slice.id in own_keys)
+                                             for t in n.targets):
+            return "storing a key other than the loop's own (it may be a new one)"
+        if isinstance(n, ast.Name) and n.id in own_keys and isinstance(n.ctx, ast.Store):
+            return f"assigning the key '{n.id}'"
+        if isinstance(n, ast.Name) and n.id == d and isinstance(n.ctx, ast.Store):
+            return "assigning the name"
+    return None
 
 
 def _changes(body, seq_name) -> str | None:
@@ -327,6 +374,15 @@ class Rewriter(ast.NodeTransformer):
                     p.why = _changes(node.body + node.orelse, s.id)
                     if p.why:
                         break
+        if p.why is None:
+            for d in sorted(p.dicts):
+                own = {how[2] for _, how in p.binds if how[0] == "lookup" and how[1] == d}
+                why = _dict_changes(node.body + node.orelse, d, own)
+                if why:
+                    p.why = (f"the loop may change the size of '{d}' while going through it ({why}): Python raises "
+                             "RuntimeError (dictionary changed size during iteration); loop over list(" + d + ".items()) "
+                             "is not supported yet either, so copy the keys first: ks = list(" + d + ")")
+                    break
         if p.why is not None:
             setattr(node, WHY, p.why)
             return node
@@ -358,6 +414,8 @@ class Rewriter(ast.NodeTransformer):
                 continue
             if how[0] == "item":
                 value = ast.Subscript(value=seqs[how[1]], slice=_name(k), ctx=ast.Load())
+            elif how[0] == "lookup":  # v of d.items(): d[key], the value the iterator gives
+                value = ast.Subscript(value=_name(how[1]), slice=_name(how[2]), ctx=ast.Load())
             elif name == k:
                 continue
             elif start_zero:

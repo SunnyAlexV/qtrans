@@ -169,7 +169,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (532 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (536 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -1305,7 +1305,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               532 tests: generated text, refusals, compiled semantics, every example,
+tests/               536 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1331,7 +1331,7 @@ run_examples.py      press-Run entry point
    ([Fuzzing](#fuzzing)); every `numpy.linalg` operation audited for backward stability,
    in each verification and operation by operation ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)).
    `qtrans explain` (Python and C++ side by side, with reasons), `inspect` and `doctor`
-   ([Python and C++ side by side](#python-and-c-side-by-side)). **0.10 so far**: `qtrans live`, the
+   ([Python and C++ side by side](#python-and-c-side-by-side)). **0.10**: `qtrans live`, the
    editor with the C++ updating as you type; programs, with Python's printing reproduced
    exactly, types taken from how a script calls its functions, lists, `enumerate`/`zip` loops,
    generators, dicts, and objects printed ([Programs](#programs-a-script-becomes-a-c-program)).
@@ -1340,12 +1340,14 @@ run_examples.py      press-Run entry point
    hints in the Python ([Your own C++](#your-own-c-for-a-function)).
    `qtrans export`: a CMake package with golden tests that need no Python
    ([Export](#export-a-c-package-with-its-own-tests)).
-   **Next**: lists of tuples,
-   string methods, `key=`; the editor inside VS Code; Python line references in the headers;
-   a reproducible benchmark protocol.
-8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
-   in-house libraries), integer arrays (the bootstrap), a written specification of the
-   supported subset. Not planned: pandas, all of Python, GPU backends.
+   **Next**: lists of tuples and `for a, b in pairs:`, string methods, `key=` (and a lambda
+   passed straight to `sorted` / `min` / `max`), `try`/`finally` and your own exceptions,
+   `for`/`else`, inheritance, the `random` module; the editor inside VS Code; Python line
+   references in the headers; a reproducible benchmark protocol.
+8. **Later (1.0)**: integer arrays (the bootstrap), a written specification of the supported
+   subset. (Mapping a Python function to existing C++, QuantLib or in-house, is what
+   [your own C++](#your-own-c-for-a-function) does since 0.10, verified.) Not planned: pandas,
+   all of Python, GPU backends.
 
 ## Licence
 

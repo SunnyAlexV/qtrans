@@ -53,6 +53,11 @@ jobs:
           /tmp/env/bin/qtrans verify hello.py
           /tmp/env/bin/qtrans translate hello.py -o out && g++ -std=c++17 -I out out/hello.cpp -o hello
           test "$(./hello)" = "$(/tmp/env/bin/python hello.py)"
+          printf 'prices = {"AAPL": 190.5, "MSFT": 410.25}\nfor i, (k, v) in enumerate(prices.items()):\n    print(i, k, f"{v:.2f}")\nprint(sum(v for v in prices.values()), sorted(prices))\n' > dicts_demo.py
+          /tmp/env/bin/qtrans verify dicts_demo.py | tee v.txt && grep -q "output identical" v.txt
+          /tmp/env/bin/qtrans override black_scholes.py d1
+          /tmp/env/bin/qtrans verify black_scholes.py --cases 30 | tee v.txt && grep -q "your C++ against qtrans's" v.txt
+          /tmp/env/bin/qtrans export black_scholes.py -o bs_cpp --cases 20 | tee e.txt && grep -q "ctest tests passed" e.txt
           /tmp/env/bin/qtrans bind instruments.py --check --cases 50
           /tmp/env/bin/python -c "import instruments_cpp as m; print(m.Option(100.0, 95.0, 0.5, 0.2, 0.04).price())"
 
