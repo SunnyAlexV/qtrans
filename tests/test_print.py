@@ -124,6 +124,13 @@ def _float(rng):
     return round(rng.uniform(-100, 100), rng.randint(0, 4))
 
 
+if sys.version_info < (3, 11):  # the z option (no negative zero) arrived in Python 3.11: before,
+    # Python rejects it, and so does the translation (specs are checked with the Python running it)
+    SPECS_F = [x for x in SPECS_F if "z" not in x]
+    SPECS_I = [x for x in SPECS_I if "z" not in x]
+    SPECS_S = [x for x in SPECS_S if "z" not in x]
+
+
 def _python(v, spec):
     try:
         return repr(v) if spec == "@repr" else format(v, spec)

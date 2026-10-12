@@ -32,7 +32,7 @@ def live(tmp_path):
         started.set()
     t = threading.Thread(target=serve, args=(f,), kwargs={"open_browser": False, "ready": ready}, daemon=True)
     t.start()
-    assert started.wait(10)
+    assert started.wait(60)
     page = urllib.request.urlopen(box["url"]).read().decode("utf-8")
     box["token"] = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
     box["file"], box["page"] = f, page

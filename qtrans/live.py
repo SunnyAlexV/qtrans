@@ -306,6 +306,17 @@ def make_handler(doc: Document, token: str, page: bytes, port_ref: list):
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self):
+        # HTTPServer.server_bind looks up the host's full DNS name (socket.getfqdn), which on
+        # macOS can wait seconds for a DNS timeout; the page only ever uses 127.0.0.1
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+
 def serve(path, port: int = 0, open_browser: bool = True, ready=None):
     """Run the server until interrupted. `ready(url, server)` is called once it listens."""
     PAGE = (Path(__file__).with_name("live_page.html")).read_text(encoding="utf-8")
@@ -314,7 +325,7 @@ def serve(path, port: int = 0, open_browser: bool = True, ready=None):
     token = secrets.token_urlsafe(24)
     page = PAGE.replace("@@TOKEN@@", token).replace("@@NAME@@", path.name).encode("utf-8")
     port_ref = [port]
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(doc, token, page, port_ref))
+    server = _Server(("127.0.0.1", port), make_handler(doc, token, page, port_ref))
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     if ready:
         ready(url, server)
