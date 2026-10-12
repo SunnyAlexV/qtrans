@@ -480,14 +480,17 @@ def build_and_test(out, name, uses_eigen, compiler=None) -> list:
             return [f"CMake {what} FAILED:"] + ["  " + x for x in tail]
     text = p.stdout + p.stderr
     summary = re.search(r"golden: \d+ of \d+ cases agree with Python", text)
-    count = re.search(r"tests passed, 0 tests failed out of (\d+)", text)
+    # each test's own status line ("1/2 Test #1: pricer_golden ....   Passed"), the same on every
+    # platform and CMake version (the closing summary's wording isn't)
+    statuses = re.findall(r"Test\s+#\d+:\s+\S+\s+\.*\s*(\*{0,3}\w+)", text)
     programs = len(re.findall(r"same output as Python, character for character", text))
     shutil.rmtree(b, ignore_errors=True)
     what = [summary.group(0)[8:]] if summary else []
     if programs:
         what.append(f"{programs} program(s) print exactly what Python printed")
-    n = count.group(1) if count else "all"
-    return [f"built and tested with CMake here: {n} of {n} ctest tests passed" + (f" ({'; '.join(what)})" if what else "")]
+    passed = sum(1 for x in statuses if x == "Passed")
+    return [f"built and tested with CMake here: {passed} of {len(statuses)} ctest tests passed"
+            + (f" ({'; '.join(what)})" if what else "")]
 
 
 def _readme(name, modules, programs, uses_eigen, sources, recorded) -> str:
