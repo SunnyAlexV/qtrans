@@ -44,6 +44,9 @@ jobs:
           /tmp/env/bin/pip install "$(ls dist/*.whl)[bind]"
           mkdir /tmp/smoke && cp examples/black_scholes.py examples/instruments.py /tmp/smoke/
           cd /tmp/smoke
+          /tmp/env/bin/qtrans doctor --bind
+          /tmp/env/bin/qtrans inspect black_scholes.py
+          /tmp/env/bin/qtrans explain instruments.py --html instruments.html && test -s instruments.html
           /tmp/env/bin/qtrans translate black_scholes.py -o out
           /tmp/env/bin/qtrans verify instruments.py --cases 50
           /tmp/env/bin/qtrans bind instruments.py --check --cases 50

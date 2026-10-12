@@ -27,7 +27,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, assignable, is_array)
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
 # code. Reported once per module instead of under every function.

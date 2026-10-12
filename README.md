@@ -47,6 +47,15 @@ strong evidence, but no finite set of cases can rule out a difference elsewhere.
   int arithmetic that could overflow is checked and raises `OverflowError` instead of wrapping;
   a Python call that hangs is stopped after 10 seconds. Length-1 arrays now broadcast as in
   NumPy (`a - b` with `len(a) == 1`), which the new shapes caught. See [Verification](#verification).
+- **0.9, trust and tools:** CI on Linux, Windows and macOS ARM64, with Clang, the sanitizers,
+  -O0 and -O3, and Python 3.10 to 3.14 ([Platforms](#platforms)); a program fuzzer that writes
+  random programs, checks them and shrinks every failure to a minimal one (it found 12
+  problems, all fixed: [Fuzzing](#fuzzing)); every `numpy.linalg` operation audited for
+  backward stability in each verification, and checked operation by operation on 2,549
+  constructed matrices, which found `pinv` breaking down on nearly rank-deficient ones
+  ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)); and `qtrans explain`, your
+  Python next to its C++ with the reason for each choice, `inspect` and `doctor`
+  ([Python and C++ side by side](#python-and-c-side-by-side)).
 
 ```python
 def black_litterman(cov: Mat, w_mkt: Vec, P: Mat, Q: Vec, omega_diag: Vec,
@@ -140,7 +149,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (414 tests). To see the Python next to its C++, ask what will happen
+`python -m pytest` (415 tests). To see the Python next to its C++, ask what will happen
 before translating, or check a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
 **Requirements:**
@@ -994,7 +1003,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               414 tests: generated text, refusals, compiled semantics, every example,
+tests/               415 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1014,7 +1023,7 @@ run_examples.py      press-Run entry point
 6. ~~Tooling~~: a pybind11 wrapper so the C++ can be called back from Python (0.7), PyPI
    (0.7), multi-module projects (0.8).
 7. **Trust**: 0.8.1 brought rectangular, empty and extreme-value inputs to the verifier,
-   checked int arithmetic and a time limit on Python calls. 0.9 so far: Clang, sanitizers,
+   checked int arithmetic and a time limit on Python calls. 0.9: Clang, sanitizers,
    optimisation levels, Python 3.10/3.14, Windows and macOS ARM64 in CI
    ([Platforms](#platforms)); a program fuzzer with automatic minimisation
    ([Fuzzing](#fuzzing)); every `numpy.linalg` operation audited for backward stability,
