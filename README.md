@@ -140,7 +140,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (413 tests). To see the Python next to its C++, ask what will happen
+`python -m pytest` (414 tests). To see the Python next to its C++, ask what will happen
 before translating, or check a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
 **Requirements:**
@@ -994,7 +994,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               413 tests: generated text, refusals, compiled semantics, every example,
+tests/               414 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:

@@ -176,3 +176,17 @@ def test_doctor_catches_a_compiler_that_cannot_build(monkeypatch, tmp_path):
     monkeypatch.setenv("CXX", str(fake))
     checks = {c.name: c for c in doctor.run()}
     assert checks["C++17"].status == doctor.FAIL
+
+
+def test_text_views_survive_a_console_that_cannot_show_their_marks():
+    """A Windows console on cp1252 has no ✓ ✗ │ ↳: the commands print ASCII there instead of
+    failing with UnicodeEncodeError (CI found this on Windows)."""
+    import os
+    import subprocess
+    import sys
+    env = dict(os.environ, PYTHONIOENCODING="cp1252")
+    f = str(ROOT / "examples" / "portfolio.py")
+    for args in (["inspect", f], ["explain", f + ":sample_cov"]):
+        r = subprocess.run([sys.executable, "-m", "qtrans", *args], capture_output=True, env=env, cwd=ROOT)
+        assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-500:]
+        assert b"|" in r.stdout or b"ok" in r.stdout

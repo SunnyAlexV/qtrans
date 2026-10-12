@@ -217,7 +217,7 @@ def to_json(checks) -> str:
     return json.dumps([asdict(c) for c in checks], indent=2)
 
 
-def main(bind=False, as_json=False) -> int:
+def main(bind=False, as_json=False, out=print) -> int:
     checks = run(bind)
-    print(to_json(checks) if as_json else to_text(checks))
+    out(to_json(checks) if as_json else to_text(checks))
     return 1 if any(c.status == FAIL for c in checks) else 0

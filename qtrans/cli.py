@@ -21,6 +21,23 @@ from .project import translate_project
 from .verify import verify_project
 
 
+_ASCII = {"✓": "ok", "✗": "X", "│": "|", "↳": "->", "─": "-", "–": "-", "—": "-", "…": "...", "→": "->",
+          "±": "+/-", "≤": "<=", "≥": ">=", "×": "x", "·": "."}
+
+
+def _print(text: str):
+    """Print, falling back to ASCII for the marks the text views use when the console can't show
+    them (a Windows console on cp1252, say), instead of failing with UnicodeEncodeError."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        text.encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        for k, v in _ASCII.items():
+            text = text.replace(k, v)
+        text = text.encode(enc, errors="replace").decode(enc, errors="replace")
+    print(text)
+
+
 def _inputs(files):
     return files[0] if len(files) == 1 and Path(files[0]).is_dir() else files
 
@@ -75,11 +92,11 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "doctor":
         from .doctor import main as doctor
-        return doctor(bind=args.bind, as_json=args.json)
+        return doctor(bind=args.bind, as_json=args.json, out=_print)
     if args.cmd == "inspect":
         from .inspect_ import inspect_file, to_json as ijson, to_text as itext
         infos = inspect_file(args.file)
-        print(ijson(args.file, infos) if args.json else itext(args.file, infos))
+        _print(ijson(args.file, infos) if args.json else itext(args.file, infos))
         return 0 if all(x.translated for x in infos) else 1
     if args.cmd == "explain":
         from .explain import explain_file, to_html, to_json as ejson, to_text as etext
@@ -90,9 +107,9 @@ def main(argv=None) -> int:
             Path(args.html).write_text(to_html(view), encoding="utf-8")
             print(f"wrote {args.html}: open it in a browser")
         elif args.json:
-            print(ejson(view))
+            _print(ejson(view))
         else:
-            print(etext(view, args.width))
+            _print(etext(view, args.width))
         return 0
     inputs = _inputs(args.files)
     if args.cmd == "bind":
