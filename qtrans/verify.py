@@ -112,10 +112,27 @@ class Compiler:
             return Path(self.path).name
 
 
+def cpu_model() -> str:
+    """The CPU's name: glibc, NumPy and OpenBLAS pick their exp / log / matrix-product kernels for
+    it (FMA, AVX2, AVX-512), so the last bit of such results can change with it."""
+    try:
+        if sys.platform.startswith("linux"):
+            for line in Path("/proc/cpuinfo").read_text(errors="replace").splitlines():
+                if line.startswith("model name"):
+                    return " ".join(line.split(":", 1)[1].split())
+        if sys.platform == "darwin":
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+        return platform.processor()
+    except Exception:  # noqa: BLE001 - only a label
+        return ""
+
+
 def environment(cxx: "Compiler | None" = None) -> str:
     """What produced a result: OS, CPU, Python, NumPy, SciPy, the compiler and extra flags.
     Results that depend on the platform's maths library (exp, pow, erf) hold only for it."""
-    parts = [f"{platform.system()} {platform.release()} {platform.machine()}",
+    parts = [f"{platform.system()} {platform.release()} {platform.machine()}"
+             + (f" ({cpu_model()})" if cpu_model() else ""),
              f"Python {platform.python_version()}", f"NumPy {np.__version__}"]
     try:
         import scipy

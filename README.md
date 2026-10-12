@@ -851,7 +851,7 @@ runs the tests on every push, in these configurations:
 
 | Job | What it shows |
 |---|---|
-| **Reference**: Ubuntu 24.04, x86-64, GCC 13, Python 3.13, NumPy and SciPy pinned ([`ci/requirements-pinned.txt`](https://github.com/SunnyAlexV/qtrans/blob/main/ci/requirements-pinned.txt)) | Where this README's numbers come from. It also runs `run_examples.py --check`: every header in `examples/cpp_out/` and every count in `examples/RESULTS.md` must reproduce, and so must the error and ULP columns of every function that doesn't use matrix products or `np.linalg` (OpenBLAS picks its kernels for the CPU, so NumPy's own rounding there changes from one CPU to another) |
+| **Reference**: Ubuntu 24.04, x86-64, GCC 13, Python 3.13, NumPy and SciPy pinned ([`ci/requirements-pinned.txt`](https://github.com/SunnyAlexV/qtrans/blob/main/ci/requirements-pinned.txt)) | Where this README's numbers come from. It also runs `run_examples.py --check`: every file in `examples/cpp_out/` and every count in `examples/RESULTS.md` (cases, match, ill-cond, known, mismatch) must reproduce. Not the error and ULP columns: glibc, NumPy and OpenBLAS pick their `exp`, `log`, `pow` and matrix-product kernels for the CPU (FMA, AVX2, AVX-512), and GitHub's runners don't all have the same one, so the last bit of those results moves from one CPU to another |
 | Ubuntu latest, latest NumPy and SciPy | An early warning: a new compiler or NumPy release that changes a result shows up here first |
 | Clang | The generated C++ doesn't depend on GCC |
 | `-O0` and `-O3` | The numbers don't depend on the optimisation level (`-ffp-contract=off` and no `-ffast-math`: no operation is reordered or fused) |
@@ -863,7 +863,9 @@ runs the tests on every push, in these configurations:
 Results built from `+ - * /` and `sqrt` are exactly rounded by IEEE-754, so they can be the
 same bits on every platform. Results that use the C library's or NumPy's own `exp`, `log`,
 `pow` or `erf` are checked against the verifier's tolerance everywhere; their ULP counts are
-those of the reference platform. `QTRANS_CXXFLAGS` adds flags to the verifier's compile command
+those of the machine named on the results' platform line, CPU included. (The first 0.9.0 run
+showed why the CPU is named: on a different runner CPU, `gamma`'s 1 ULP from Python became 0,
+and the Black-Litterman example's 14 ill-conditioned cases 15.) `QTRANS_CXXFLAGS` adds flags to the verifier's compile command
 (after its own, so `-O3` replaces `-O2`).
 
 What the first runs found, all fixed:

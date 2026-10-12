@@ -110,16 +110,24 @@ def _audit_line(rows) -> str:
 
 
 def _check(lines, results, out, committed) -> int:
-    """Counts must reproduce exactly everywhere. The max rel err / ULP columns too, except for
-    functions using matrix products or numpy.linalg: OpenBLAS picks its kernels for the CPU it
-    runs on, so NumPy's own rounding there (and so the distance to it) changes with the CPU."""
+    """What must reproduce on any machine: every function's number of cases, of `known` cases
+    (Python raised a float error) and of mismatches (0), and how many cases match or are
+    ill-conditioned together, plus every generated file. Not the error and ULP columns: glibc and
+    NumPy pick their exp / log / pow kernels for the CPU they run on (FMA, AVX2, AVX-512), so the
+    last bit of a result built on them, and so its distance from Python, changes from one CPU to
+    another; OpenBLAS does the same for matrix products. For a function using neither, match and
+    ill-cond are compared separately too; for one using matrix products or numpy.linalg, only their
+    sum (a case at the 1e-10 tolerance can fall either side)."""
     from qtrans.verify import linalg_functions
     blas = {(name, f) for name in EXAMPLES for f in linalg_functions([HERE / "examples" / f"{name}.py"])}
     rows = lambda ls: [_det(x) for x in ls if x.startswith("| ") and not x.startswith("| module")]
     new, old = rows(lines), rows(results.read_text(encoding="utf-8").splitlines())
 
-    def key(r):
-        return r[:7] if (r[0], r[1].strip("`")) in blas else r
+    def key(r):  # module, function, cases, match, ill-cond, known, mismatch
+        mod, fn, cases, match, ill, known, mism = r[:7]
+        if (mod, fn.strip("`")) in blas:
+            return (mod, fn, cases, int(match.replace(",", "")) + int(ill.replace(",", "")), known, mism)
+        return (mod, fn, cases, match, ill, known, mism)
     bad = [f"  committed {o}\n  now       {n}" for o, n in zip(old, new) if key(o) != key(n)]
     if len(new) != len(old):
         bad.append(f"  {len(old)} rows committed, {len(new)} now")
@@ -131,8 +139,8 @@ def _check(lines, results, out, committed) -> int:
     if bad:
         print("examples/RESULTS.md or examples/cpp_out/ don't reproduce:\n" + "\n".join(bad))
         return 1
-    print(f"OK: {len(new)} rows of examples/RESULTS.md and every header in examples/cpp_out/ reproduce "
-          f"({sum((r[0], r[1].strip('`')) in blas for r in new)} use BLAS / LAPACK: counts only)")
+    print(f"OK: the counts of all {len(new)} rows of examples/RESULTS.md and every file in examples/cpp_out/ "
+          f"reproduce ({sum((r[0], r[1].strip('`')) in blas for r in new)} use BLAS / LAPACK: match + ill-cond together)")
     return 0
 
 
