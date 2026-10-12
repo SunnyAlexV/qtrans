@@ -153,7 +153,7 @@ def test_includes_only_what_is_used():
     ("def f(a: int, b: int) -> int:\n    return a ** b\n", "non-constant exponent"),
     ("def f(a: float, b: float) -> bool:\n    return a and b\n", "`and`/`or` on non-bool"),
     ("def f(n: int) -> int:\n    n = n / 2\n    return n\n", "declared int but gets a float"),
-    ("def f(x: float) -> float:\n    return [x][0]\n", "not supported"),
+    ("def f(x: float) -> float:\n    return {'a': x}['a']\n", "not supported"),
     ("def f(x: float) -> float:\n    try:\n        return 1.0 / x\n    except ZeroDivisionError:\n        return 0.0\n",
      "catching ZeroDivisionError is not supported: x / 0.0 raises it in Python but gives inf in C++"),
     ("def f(x: float) -> float:\n    raise ValueError('bad', x)\n", "several arguments"),
@@ -166,7 +166,7 @@ def test_rejections(src, expected):
 
 
 def test_rejection_propagates_to_callers():
-    r = translate_source("def bad(x: float) -> float:\n    return [x][0]\n\n"
+    r = translate_source("def bad(x: float) -> float:\n    return {'a': x}['a']\n\n"
                          "def good(x: float) -> float:\n    return bad(x) + 1\n", "m")
     reasons = {f.name: f.reason for f in r.report.rejected}
     assert "calls bad()" in reasons["good"]

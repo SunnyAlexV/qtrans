@@ -292,6 +292,13 @@ std::string str(const std::optional<T>& x) { return x ? str(*x) : std::string("N
 template <class T>
 std::string repr(const std::optional<T>& x) { return x ? repr(*x) : std::string("None"); }
 
+// a local that Python holds as an int in some assignments and a float in others (total = 0, then
+// total += 0.5): the C++ keeps a double and a flag saying which Python holds now, and shows it so
+inline std::string str(double x, bool as_int) {
+    return as_int ? std::to_string(static_cast<long long>(x)) : str(x);
+}
+inline std::string repr(double x, bool as_int) { return str(x, as_int); }
+
 // a value NumPy made (np.sum(v), v[i], v @ w, ...): print() and str() show it as Python shows a
 // float, int or bool, but repr() names its type, as NumPy 2 does: np.float64(2.5), np.int64(3),
 // np.True_. The translator wraps a value in np() only where Python would hold a NumPy scalar.
@@ -554,6 +561,10 @@ std::string format(const std::optional<T>& x, const std::string& spec) {
     if (x) return format(*x, spec);
     if (spec.empty()) return "None";
     throw type_error("unsupported format string passed to NoneType.__format__");
+}
+
+inline std::string format(double x, const std::string& spec, bool as_int) {  // see str(x, as_int)
+    return as_int ? format(static_cast<long long>(x), spec) : format(x, spec);
 }
 
 template <class T>

@@ -142,6 +142,81 @@ PROGRAMS = {
         if __name__ == "__main__":
             main()
         ''',
+    "overloads": '''
+        def half(x):
+            return x // 2
+
+
+        def scale(x, k=2):
+            return x * k
+
+
+        print(half(7), half(7.0), half(-7.5), half(True))
+        print(scale(3), scale(1.5), scale(2.5, 3), scale(-4, k=3))
+        ''',
+    "int_or_float": '''
+        def total_of(n):
+            total = 0
+            for i in range(n):
+                total += 0.5
+            print("total", total, f"{total}|{total:>6}|{total:.2f}", total * 2, total / 2)
+            return total
+
+
+        x = 0
+        print(x, repr(x))
+        x = 2.5
+        print(x)
+        count = 0
+        count += 1
+        print(count, count * 3)
+        count += 1.5
+        print(count)
+        total_of(0)
+        total_of(3)
+        ''',
+    "objects": '''
+        from dataclasses import dataclass, field
+        from typing import NamedTuple
+
+
+        @dataclass
+        class Option:
+            strike: float
+            expiry: float
+            kind: str = "call"
+            notes: int = field(default=0, repr=False)
+
+
+        class Point(NamedTuple):
+            x: float
+            y: int
+
+
+        @dataclass
+        class Book:
+            first: Option
+            size: int
+
+
+        class Account:
+            def __init__(self, owner: str, cash: float):
+                self.owner = owner
+                self.cash = cash
+
+            def __repr__(self) -> str:
+                return f"Account({self.owner!r}, cash={self.cash:.2f})"
+
+            def __str__(self):
+                return f"{self.owner}: {self.cash}"
+
+
+        o = Option(100.0, 0.5)
+        print(o, repr(o), [o.strike])
+        print(Point(1.5, 2), Book(Option(90.0, 1.0, "put"), 3))
+        a = Account("ann", 12.5)
+        print(a, repr(a), f"{a!r} and {a}")
+        ''',
     "exception": '''
         def check(n: int) -> int:
             if n < 0:
@@ -236,9 +311,9 @@ def test_print_and_format_read_naturally():
 
 
 def test_what_isnt_translated_says_why_at_its_line():
-    r = translate_source("import numpy as np\n\nvalues = [1.0, 2.0]\nprint(values)\n", "m", "m.py")
+    r = translate_source("import numpy as np\n\nvalues = {'a': 1.0}\nprint(values)\n", "m", "m.py")
     prog = next(f for f in r.report.functions if f.name == "(program)")
-    assert not prog.translated and prog.reason_line == 3 and "lists" in prog.reason
+    assert not prog.translated and prog.reason_line == 3 and "dicts" in prog.reason
     r = translate_source("print(twice(2))\n\n\ndef twice(x: int) -> int:\n    return 2 * x\n", "m", "m.py")
     prog = next(f for f in r.report.functions if f.name == "(program)")
     assert not prog.translated and "NameError" in prog.reason and prog.reason_line == 1
@@ -246,18 +321,20 @@ def test_what_isnt_translated_says_why_at_its_line():
     src = ("import numpy as np\nv = np.ones(3)\nx = 0.0\nfor e in v:\n    x += e\nprint(repr(x))\n")
     prog = next(f for f in translate_source(src, "m", "m.py").report.functions if f.name == "(program)")
     assert not prog.translated and "np.float64" in prog.reason and prog.reason_line == 6
-    # `total = 0`, then floats added: a Python int until the first float arrives, shown as 0, not 0.0
+    # `total = 0`, then floats added: a Python int until the first float arrives, shown as 0, not
+    # 0.0. A flag beside it follows which Python holds (the loop may not run)...
     src = "n = 3\ntotal = 0\nfor i in range(n):\n    total += 0.5\nprint(total)\n"
-    prog = next(f for f in translate_source(src, "m", "m.py").report.functions if f.name == "(program)")
-    assert not prog.translated and prog.reason_line == 5 and "total = 0.0" in prog.hint
-    ok = "total = 0\nfor v in [0.5, 1.5]:\n    total += v\nprint(total, f'{total:.1f}')\n"  # the loop surely runs
-    assert translate_source(ok, "m", "m.py").report.functions[0].translated
+    r = translate_source(src, "m", "m.py")
+    assert r.report.functions[0].translated and "bool total_is_int = true;" in r.program
+    assert "total_is_int = false;" in r.program and "qt::py::str(total, total_is_int)" in r.program
+    ok = "total = 0\nfor v in [0.5, 1.5]:\n    total += v\nprint(total, f'{total:.1f}')\n"  # ...unless it surely ran
+    assert "_is_int" not in translate_source(ok, "m", "m.py").program
     # `return 0` from a float function: a Python int on that path, printed as 0 (also through a
     # local, another function, or a tuple element); a float spec writes both the same
     f = "def f(x: float) -> float:\n    if x < 0:\n        return 0\n    return x\n\n\n"
-    for use, line in (("print(f(-1.0))", 7), ("y = f(-1.0)\nprint(y)", 8), ("print(max(2.5 - 3.0, 0))", 7)):
+    for use, line in (("print(f(-1.0))", 7), ("y = f(-1.0)\nprint(y)", 7), ("print(max(2.5 - 3.0, 0))", 7)):
         prog = next(x for x in translate_source(f + use + "\n", "m", "m.py").report.functions if x.name == "(program)")
-        assert not prog.translated and prog.reason_line == line and "0.0 rather than 0" in prog.hint, (use, prog.reason)
+        assert not prog.translated and prog.reason_line == line and "0.0" in prog.hint, (use, prog.reason)
     assert translate_source(f + "print(f'{f(-1.0):.2f}', f(-1.0) / 2)\n", "m", "m.py").report.functions[-1].translated
     # a bad format spec: Python raises, so qtrans refuses it rather than guess
     prog = next(f for f in translate_source("x = 2.5\nprint(f'{x:d}')\n", "m", "m.py").report.functions)
@@ -297,9 +374,46 @@ def test_types_come_from_the_calls_when_left_out():
     note = next(f for f in r.report.functions if f.name == "scale").notes[0]
     assert note == "types from how the file calls it (no annotations): x: float, k: int, -> float"
     # one call gives an int, another a float: Python computes with each as it is; refused
+    # called with an int and with a float: one C++ version for each (overloads), each computing
+    # as Python does with that type (7 // 2 is 3, 7.0 // 2 is 3.0)
     r = translate_source("def half(x):\n    return x // 2\n\n\nprint(half(7), half(7.0))\n", "m", "m.py")
-    half = next(f for f in r.report.functions if f.name == "half")
-    assert not half.translated and "int (line 5)" in half.reason and "float (line 5)" in half.reason
+    assert {f.name for f in r.report.translated} == {"half(int)", "half(float)", "(program)"}
+    assert "inline long long half(long long x) {" in r.program and "inline double half(double x) {" in r.program
+    assert "m::half(7LL)" in r.program and "m::half(7.0)" in r.program
+    note = next(f for f in r.report.functions if f.name == "half(float)").notes[0]
+    assert note.startswith("one C++ version for each kind of call (overloads of half): this one for x: float")
+    # a version that would return an int on one path and a float on another can't be made: refused
+    r = translate_source("def f(x):\n    if x > 0:\n        return x\n    return 0\n\n\nprint(f(7), f(7.5))\n",
+                         "m", "m.py")
+    f = next(f for f in r.report.functions if f.name == "f")
+    assert not f.translated and "int (line 7)" in f.reason and "float (line 7)" in f.reason
     # never called: nothing shows its types
     r = translate_source("def f(x):\n    return x\n", "m", "m.py")
     assert "no call in this file shows its type" in r.report.functions[0].reason
+
+
+def test_objects_print_as_python_prints_them_or_say_why_not():
+    src = textwrap.dedent('''
+        from dataclasses import dataclass
+        import numpy as np
+
+
+        @dataclass
+        class R:
+            m: float
+
+
+        class P:
+            def __init__(self, x: float):
+                self.x = x
+
+
+        v = np.ones(3)
+        r = R(np.mean(v))
+        print(r)
+        ''')
+    prog = next(f for f in translate_source(src, "m", "m.py").report.functions if f.name == "(program)")
+    assert not prog.translated and "np.mean(v)` on line 17" in prog.reason and "np.float64" in prog.reason
+    prog = next(f for f in translate_source(src.replace("print(r)", "print(P(1.0))"), "m", "m.py").report.functions
+                if f.name == "(program)")
+    assert not prog.translated and "memory address" in prog.reason and "__repr__" in prog.hint

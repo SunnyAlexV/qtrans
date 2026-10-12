@@ -22,7 +22,7 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .translator import (ARRAYS_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
+from .translator import (ARRAYS_HEADER, LIST_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
 
 
 class ProjectError(Exception):
@@ -86,13 +86,14 @@ class ProjectResult:
             (out / f"{name}_report.md").write_text(r.report.to_markdown(), encoding="utf-8")
         headers = [RUNTIME_HEADER]
         texts = [r.header + (r.program or "") for r in self.modules.values()]
-        if any("qtrans_print.hpp" in t for t in texts):
-            headers.append(PRINT_HEADER)
+        if any("qtrans_print.hpp" in t or "qtrans_list.hpp" in t for t in texts):
+            headers += [PRINT_HEADER, LIST_HEADER]
         if self.uses_arrays or any("qtrans_arrays.hpp" in t or "qtrans_random.hpp" in t for t in texts):
             headers.append(ARRAYS_HEADER)
         if self.uses_random or any("qtrans_random.hpp" in t for t in texts):
             headers.append(RANDOM_HEADER)
         if any(r.uses_runtime or r.uses_arrays or "qtrans_print.hpp" in r.header + (r.program or "")
+               or "qtrans_list.hpp" in r.header + (r.program or "")
                for r in self.modules.values()):
             for h in headers:
                 (out / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")

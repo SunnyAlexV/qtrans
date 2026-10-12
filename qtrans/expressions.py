@@ -20,6 +20,7 @@ from .errors import Unsupported
 from .arrays import STACKERS, ArrayOps
 from .structs import StructOps
 from .printing import TextOps
+from .lists import ListOps, list_of
 from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
@@ -29,10 +30,8 @@ from .core import (CPP_RESERVED, P_ADD, P_AND, P_ATOM, P_COND, P_EQ, P_MUL, P_OR
                    P_UNARY, Expr, cpp_ident, float_literal, wrap)
 
 _UNSUPPORTED_EXPR = {
-    "List": ("lists", "arrays arrive in stage 2"),
     "Dict": ("dicts", None),
     "Set": ("sets", None),
-    "ListComp": ("list comprehensions", "arrays arrive in stage 2"),
     "SetComp": ("set comprehensions", None),
     "DictComp": ("dict comprehensions", None),
     "GeneratorExp": ("generator expressions", "use an explicit for-loop over range()"),
@@ -101,7 +100,7 @@ def _outer_call(code: str):
     return None
 
 
-class ExprTranslator(ArrayOps, StructOps, TextOps):
+class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
@@ -284,6 +283,13 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
         return None
 
     def e_Subscript(self, node):
+        if not self._is_module_path(node.value):
+            try:
+                base = self.expr(node.value)
+            except Unsupported:
+                base = None
+            if base is not None and list_of(base.type):
+                return self.list_subscript(node, base)
         return self.array_subscript(node)
 
     def e_Attribute(self, node):
@@ -311,6 +317,14 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
         return self.binop(node, node.op, self.expr(node.left), self.expr(node.right))
 
     def binop(self, node, op, L: Expr, R: Expr) -> Expr:
+        if list_of(L.type) or list_of(R.type):
+            if isinstance(op, ast.Add) and list_of(L.type) and list_of(R.type):
+                return self.list_concat(node, L, R)
+            if isinstance(op, ast.Mult) and (L.type in (INT, BOOL) or R.type in (INT, BOOL)):
+                xs, n = (L, R) if list_of(L.type) else (R, L)
+                self._need_list(xs, node, "*")
+                return Expr(f"qt::py::repeat({xs.code}, {self.as_type(n, INT).code})", P_ATOM, xs.type)
+            raise Unsupported(node, f"{type(op).__name__} on a list is not supported", "lists join with +")
         node = node or self.current
         if STR in (L.type, R.type):
             if isinstance(op, ast.Add) and L.type == R.type == STR:
@@ -473,6 +487,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
         if any(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
             return self._is_none(node)
         if any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+            if len(node.ops) == 1 and not isinstance(node.comparators[0], (ast.Tuple, ast.List, ast.Set)):
+                return self.list_contains(node, node.left, node.comparators[0], isinstance(node.ops[0], ast.NotIn))
             return self._in_literals(node)
         vals = [node.left] + list(node.comparators)
         exprs = [self.expr(v) for v in vals]
@@ -633,6 +649,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
                 raise Unsupported(node, f"'{name}' is a variable, not a function")
             if name in self.mod.sigs or name in self.mod.rejected:
                 return self.call_user(node, name)
+            if name in getattr(self.mod, "variants", {}):
+                return self.call_version(node, name)
             pending = getattr(self.mod, "pending_sigs", {})
             if name in pending:  # being typed from its calls (translator._infer_from_calls)
                 sig = pending[name]
@@ -643,10 +661,16 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
                 return self.call_library(node, self.mod.imports[name])
             if name in ("str", "repr", "format"):
                 return self.text_value(node)
+            if name in ("len", "sum", "min", "max", "sorted", "list") and len(node.args) == 1:
+                e = self.list_builtin(node, name)
+                if e is not None:
+                    return e
             if name in _BUILTINS:
                 return self.call_builtin(node, name)
             if name == "len" and len(node.args) == 1 and not node.keywords:
                 a = self.expr(node.args[0])
+                if a.type == STR:  # characters, not bytes
+                    return Expr(f"qt::py::len({self.as_string(a).code})", P_ATOM, INT)
                 if is_array(a.type):
                     return Expr(f"{wrap(a, P_ATOM)}.{'size' if a.type.rank == 1 else 'rows'}()", P_ATOM, INT,
                                 iv=SIZE_IV, dimtok=dims_of(a)[0])
@@ -670,6 +694,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
             base = self.expr(f.value)
             if is_array(base.type) or isinstance(base.type, MaskType):
                 return self.array_method(node, base, f.attr)
+            if list_of(base.type):
+                return self.list_method(node, base, f.attr)
             if base.type == RNG:
                 return self.rng_method(node, base, f.attr)
         if q is None:
@@ -684,6 +710,27 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
             raise Unsupported(node, f"calls {name}(), which could not be translated")
         sig = self.mod.sigs[name]
         return Expr(f"{sig.cpp}({', '.join(self.bind_args(node, sig, name))})", P_ATOM, sig.ret)
+
+    def call_version(self, node, name):
+        """A call of a function with one C++ version per kind of call: the version whose
+        parameter types are this call's argument types."""
+        keys = self.mod.variants[name]
+        first = self.mod.sigs.get(keys[0])
+        names = [p.name for p in first.params] if first else []
+        bound = dict(zip(names, node.args))
+        bound.update({k.arg: k.value for k in node.keywords if k.arg in names})
+        types = {p: self.expr_raw(a).type for p, a in bound.items()}
+        for key in keys:
+            sig = self.mod.sigs.get(key)
+            if sig is None:
+                continue
+            if all(types[p.name] == p.type for p in sig.params if p.name in types):
+                return self.call_user(node, key)
+        for key in keys:  # that version may have been refused
+            if key in self.mod.rejected:
+                raise Unsupported(node, f"calls {key}, which could not be translated")
+        shown = ", ".join(str(types[p]) for p in names if p in types)
+        raise Unsupported(node, f"no version of {name}() takes ({shown})")
 
     def bind_args(self, node, sig, display):
         """C++ arguments for a call to a translated function or method, in parameter order,
@@ -702,6 +749,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
                 raise Unsupported(node, f"{display}() got two values for '{k.arg}'")
             bound[k.arg] = k.value
         last = max((i for i, p in enumerate(params) if p.name in bound), default=-1)
+        self._exact_args = getattr(sig, "overloaded", False)  # overloads: no int/double conversion left to choose
         codes = []
         passed = []
         for i, p in enumerate(params):
@@ -753,7 +801,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps):
         if not assignable(p.type, e.type):
             raise Unsupported(a, f"argument '{p.name}' of {display}() is declared {p.type} but a {e.type} is passed",
                               f"annotate '{p.name}' as float, or convert with int(...)")
-        return self.promote(e, p.type).code
+        e = self.promote(e, p.type)
+        return self.as_type(e, p.type).code if getattr(self, "_exact_args", False) else e.code
 
     def _is_view(self, a) -> bool:
         """An array expression NumPy returns as a view of another array: a slice or row

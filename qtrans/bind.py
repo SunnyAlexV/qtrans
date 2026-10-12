@@ -57,8 +57,8 @@ from pathlib import Path
 import numpy as np
 
 from . import verify as V
-from .translator import ARRAYS_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
-from .types import (BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
+from .translator import ARRAYS_HEADER, LIST_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
+from .types import (ListType, BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
                     VoidType)
 
 PYBIND_HEADER = Path(__file__).parent / "runtime" / "qtrans_pybind.hpp"
@@ -91,7 +91,8 @@ def _is_leafy(t) -> bool:
 def _native(t) -> bool:
     """Passed straight through pybind11's own conversions."""
     inner = t.inner if isinstance(t, OptionalType) else t
-    return isinstance(inner, Scalar) or inner == STR
+    # a list is copied in (pybind11's list caster): a function never changes a list passed to it
+    return isinstance(inner, Scalar) or inner == STR or isinstance(inner, ListType)
 
 
 def _cstr(s: str) -> str:
@@ -367,7 +368,8 @@ class Binder:
             # order with Python's own output, rather than straight to the process's stdout
             extra += ", py::call_guard<py::scoped_ostream_redirect, py::scoped_estream_redirect>()"
         doc = _doc(sig.doc)
-        return [f"    m.def({_cstr(name)}, {lam}{extra}{', ' + doc if doc else ''});"]
+        pyname = sig.name if getattr(sig, "overloaded", False) else name  # versions: one Python name, overloads
+        return [f"    m.def({_cstr(pyname)}, {lam}{extra}{', ' + doc if doc else ''});"]
 
     # --- classes -----------------------------------------------------------------------------------
     def _mutable(self, info) -> bool:
@@ -618,7 +620,15 @@ class Binder:
                 self.bound_classes.append(info.name)
             except BindError as e:
                 self.notes.setdefault(info.name, []).append(f"left out: {e}")
-        for name, sig in res.signatures.items():
+        def rank(item):  # versions of one function: bool, then int, then float arguments, so that
+            _, sig = item  # pybind11 (trying overloads in order) gives a Python int to the int version
+            order = {"bool": 0, "int": 1, "float": 2}
+            return (sig.name, tuple(order.get(getattr(p.type, "name", ""), 3) for p in sig.params)) \
+                if getattr(sig, "overloaded", False) else ("", ())
+        items = list(res.signatures.items())
+        versions = sorted((it for it in items if getattr(it[1], "overloaded", False)), key=rank)
+        items = [it for it in items if not getattr(it[1], "overloaded", False)] + versions
+        for name, sig in items:
             if sig.owner:
                 continue
             try:
@@ -809,7 +819,7 @@ def build_extension(path, out_dir=None, build_dir=None, eigen=None, module_name=
     if not any(b.bound or b.bound_classes for b in binders.values()):
         raise RuntimeError(f"nothing in {first.name} could be translated and bound")
     path = first
-    for h in (RUNTIME_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, PYBIND_HEADER):
+    for h in (RUNTIME_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, LIST_HEADER, PYBIND_HEADER):
         shutil.copy(h, build / h.name)
     cpp = build / f"{name}_bind.cpp"
     cpp.write_text(src, encoding="utf-8")
@@ -1110,12 +1120,12 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
             continue
         f_rtol, f_atol = tol_of(name)
         fc = CallableCheck(prefix + name, "function")
-        fn, bfn = getattr(pymod, name), getattr(mod, name)
+        fn, bfn = getattr(pymod, sig.name), getattr(mod, sig.name)
         types = [p.type for p in sig.params]
         ref_idx = [i for i, p in enumerate(sig.params) if p.mode == "ref"]
         cases = []
         defaults = [p.default for p in inspect.signature(fn).parameters.values()]
-        for args in given.get(name, []):
+        for args in given.get(sig.name, []) if not getattr(sig, "overloaded", False) else []:
             args = list(args) + [defaults[i] for i in range(len(args), len(sig.params))]
             cases.append(tuple(V._py_value(a, p.type) for a, p in zip(args, sig.params)))
         plans = V.shape_plans(fn, sig, rng)

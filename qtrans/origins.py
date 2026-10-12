@@ -35,7 +35,9 @@ def join(a, b):
         return b
     if b == _BOTTOM:
         return a
-    if isinstance(a, tuple) and isinstance(b, tuple) and len(a[1]) == len(b[1]):
+    if isinstance(a, tuple) and isinstance(b, tuple) and a[0] == b[0] == "list":
+        return ("list", join(a[1], b[1]))
+    if isinstance(a, tuple) and isinstance(b, tuple) and a[0] == b[0] == "tuple" and len(a[1]) == len(b[1]):
         return ("tuple", tuple(join(x, y) for x, y in zip(a[1], b[1])))
     return a if a == b else None
 
@@ -47,6 +49,15 @@ def arith(*xs):
     if any(x is None or isinstance(x, tuple) or x == RNG_ for x in xs):
         return None
     return NP if NP in xs else PY
+
+
+def binop(left, right):
+    """An operator's result, lists included (a + b holds both lists' elements)."""
+    if isinstance(left, tuple) and left[0] == "list" or isinstance(right, tuple) and right[0] == "list":
+        if isinstance(left, tuple) and isinstance(right, tuple) and left[0] == right[0] == "list":
+            return ("list", join(left[1], right[1]))
+        return left if isinstance(left, tuple) and left[0] == "list" else right  # xs * n: xs's elements
+    return arith(left, right)
 
 
 def of_type(t):
@@ -81,14 +92,15 @@ class Origins:
         """The origin of what user function `name` returns."""
         if name in self._returns:
             return self._returns[name]
-        if name in self._busy or name not in self.mod.fdefs:
+        fdef = self.mod.fdef_named(name) if hasattr(self.mod, "fdef_named") else self.mod.fdefs.get(name)
+        if name in self._busy or fdef is None:
             return None  # recursion: can't tell
         sig = self.mod.sigs.get(name)
         if sig is not None and (is_array(sig.ret) or isinstance(sig.ret, ArrayType)):
             return NP
         self._busy.add(name)
         try:
-            fo = self.function(self.mod.fdefs[name], sig)
+            fo = self.function(fdef, sig)
             out = _BOTTOM
             for n in _own_nodes(fo.fdef):
                 if isinstance(n, ast.Return) and n.value is not None:
@@ -130,7 +142,7 @@ class _FunctionOrigins:
             elif isinstance(n, ast.AnnAssign) and n.value is not None:
                 recs.append((n.target, lambda v=n.value: self.of(v), n.value))
             elif isinstance(n, ast.AugAssign):
-                recs.append((n.target, lambda n=n: arith(self.of(n.target), self.of(n.value)), None))
+                recs.append((n.target, lambda n=n: binop(self.of(n.target), self.of(n.value)), None))
             elif isinstance(n, ast.For):
                 recs.append((n.target, lambda it=n.iter: self._element(it), None))
             elif isinstance(n, ast.NamedExpr):
@@ -139,9 +151,22 @@ class _FunctionOrigins:
                 for it in n.items:
                     if it.optional_vars is not None:
                         recs.append((it.optional_vars, lambda: None, None))
+            elif isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute) \
+                    and isinstance(n.value.func.value, ast.Name) and n.value.func.attr in ("append", "insert", "extend") \
+                    and n.value.args:
+                c = n.value  # xs.append(x): the list now also holds x
+                arg = c.args[-1] if c.func.attr == "insert" else c.args[0]
+                ext = c.func.attr == "extend"
+                recs.append((c.func.value, lambda a=arg, ext=ext: self._as_list(a, ext), None))
             elif isinstance(n, ast.ExceptHandler) and n.name:
                 recs.append((ast.Name(id=n.name, ctx=ast.Store()), lambda: None, None))
         return recs
+
+    def _as_list(self, arg, ext):
+        o = self.of(arg)
+        if ext:
+            return o if isinstance(o, tuple) and o[0] == "list" or o == _BOTTOM else None
+        return ("list", o)
 
     def _element(self, it):
         """The origin of one element of a for-loop's iterable."""
@@ -155,6 +180,8 @@ class _FunctionOrigins:
         o = self.of(it)
         if o == NP:
             return NP
+        if isinstance(o, tuple) and o[0] == "list":
+            return o[1]
         if isinstance(o, tuple) and len(set(o[1])) == 1:
             return o[1][0]
         return None if o != _BOTTOM else _BOTTOM
@@ -220,7 +247,7 @@ class _FunctionOrigins:
             q = self.mod.imports.get(node.id)
             return PY if q in lib.CONSTANTS else None
         if isinstance(node, ast.BinOp):
-            return arith(self.of(node.left), self.of(node.right))
+            return binop(self.of(node.left), self.of(node.right))
         if isinstance(node, ast.UnaryOp):
             return PY if isinstance(node.op, ast.Not) else arith(self.of(node.operand))
         if isinstance(node, ast.BoolOp):
@@ -236,6 +263,22 @@ class _FunctionOrigins:
             return join(self.of(node.body), self.of(node.orelse))
         if isinstance(node, ast.Tuple):
             return ("tuple", tuple(self.of(e) for e in node.elts))
+        if isinstance(node, ast.List):
+            out = _BOTTOM
+            for e in node.elts:
+                out = join(out, self.of(e))
+            return ("list", out)
+        if isinstance(node, ast.ListComp) and len(node.generators) == 1 and isinstance(node.generators[0].target, ast.Name):
+            g = node.generators[0]
+            saved = self.env.get(g.target.id, "<unset>")
+            self.env[g.target.id] = self._element(g.iter)
+            try:
+                return ("list", self.of(node.elt))
+            finally:
+                if saved == "<unset>":
+                    self.env.pop(g.target.id, None)
+                else:
+                    self.env[g.target.id] = saved
         if isinstance(node, ast.Attribute):
             q = self.qualify(node)
             if q is not None:
@@ -244,6 +287,11 @@ class _FunctionOrigins:
                 return "shape"
             if node.attr in ("size", "ndim"):
                 return PY
+            owners = [c for c in self.mod.classes.values() if c.field(node.attr) is not None and not c.external]
+            if owners and hasattr(self.mod, "struct_repr_problem") and isinstance(node.value, (ast.Name, ast.Attribute)):
+                f = owners[0].field(node.attr)
+                if isinstance(f.type, Scalar) and all(self.mod.struct_repr_problem(c) is None for c in owners):
+                    return PY  # obj.x: every value the file puts in x is a Python number
             base = self.of(node.value)
             return NP if base == NP else (_BOTTOM if base == _BOTTOM else None)
         if isinstance(node, ast.Subscript):
@@ -252,6 +300,8 @@ class _FunctionOrigins:
                 return PY
             if base == NP:
                 return NP
+            if isinstance(base, tuple) and base[0] == "list":
+                return base if isinstance(node.slice, ast.Slice) else base[1]
             if isinstance(base, tuple) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
                 k = node.slice.value
                 return base[1][k] if -len(base[1]) <= k < len(base[1]) else None
@@ -263,10 +313,20 @@ class _FunctionOrigins:
     def _call(self, node):
         f = node.func
         if isinstance(f, ast.Name) and f.id not in self.env:
-            if f.id in self.mod.fdefs:
+            if f.id in self.mod.fdefs or f.id in getattr(self.mod, "variants", {}):
                 return self.owner.returns(f.id)
             if f.id in self.mod.classes:
                 return None
+            if f.id == "range":
+                return ("list", PY)  # its ints are Python's (list(range(n)), for i in range(n))
+            if f.id in ("sum", "min", "max", "sorted", "list") and len(node.args) == 1:
+                o = self.of(node.args[0])
+                if isinstance(o, tuple) and o[0] == "list":
+                    if f.id in ("sorted", "list"):
+                        return o
+                    return arith(o[1]) if f.id == "sum" else o[1]  # sum: 0 + x keeps x's kind
+                if o == _BOTTOM:
+                    return _BOTTOM
             if f.id == "round" and len(node.args) == 2 and not (
                     isinstance(node.args[1], ast.Constant) and node.args[1].value is None):
                 return arith(self.of(node.args[0]))  # round(np.float64(x), 2) is a NumPy float64
@@ -299,6 +359,13 @@ class _FunctionOrigins:
                 sized = len(node.args) > k or any(a.arg == "size" and not (
                     isinstance(a.value, ast.Constant) and a.value.value is None) for a in node.keywords)
                 return NP if sized else PY  # a draw without size is a Python float
+            if isinstance(base, tuple) and base[0] == "list":
+                if f.attr == "pop":
+                    return base[1]
+                if f.attr == "copy":
+                    return base
+                if f.attr in ("index", "count"):
+                    return PY
             if f.attr in _PY_METHODS:
                 return PY
             if base == NP:

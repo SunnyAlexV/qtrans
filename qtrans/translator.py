@@ -26,7 +26,7 @@ from .functions import FunctionTranslator, is_docstring, python_reads, source_ma
 from .origins import Origins
 from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
-                    StructType, TupleType, assignable, is_array)
+                    StructType, TupleType, ListType, assignable, is_array)
 
 VERSION = "0.9.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
@@ -38,6 +38,7 @@ RUNTIME_HEADER = Path(__file__).parent / "runtime" / "qtrans_runtime.hpp"
 ARRAYS_HEADER = Path(__file__).parent / "runtime" / "qtrans_arrays.hpp"
 RANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_random.hpp"
 PRINT_HEADER = Path(__file__).parent / "runtime" / "qtrans_print.hpp"
+LIST_HEADER = Path(__file__).parent / "runtime" / "qtrans_list.hpp"
 
 
 @dataclass
@@ -138,6 +139,11 @@ def _own_body_nodes(fdef):
         yield n
         stack += [c for c in ast.iter_child_nodes(n)
                   if not isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))]
+
+
+def cpp_string_literal(text):
+    from .core import cpp_string
+    return cpp_string(text)
 
 
 def _is_main_guard(node) -> bool:
@@ -257,6 +263,7 @@ class ModuleTranslator:
         self.translated: set = set()       # after translate(): the names that got a body
         self.origins = Origins(self)       # which numbers are Python's and which NumPy's (for repr)
         self.printing: set = set()         # functions that print, also through a function they call
+        self.variants: dict = {}           # function -> its versions' keys, one per kind of call (overloads)
 
     # --- annotations -----------------------------------------------------------------
     def parse_annotation(self, node, allow_void=False):
@@ -291,6 +298,11 @@ class ModuleTranslator:
         elif isinstance(node, ast.Subscript):
             base = node.value
             bname = base.id if isinstance(base, ast.Name) else getattr(base, "attr", None)
+            if bname in ("list", "List"):
+                elem = self.parse_annotation(node.slice)
+                if elem in (FLOAT, INT, STR):
+                    return ListType(elem)
+                raise Unsupported(node, f"'{ast.unparse(node)}': lists of float, int or str are supported")
             if bname in ("tuple", "Tuple"):
                 elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
                 ts = tuple(self.parse_annotation(e) for e in elts)
@@ -443,7 +455,11 @@ class ModuleTranslator:
                                body=f.body, decorator_list=[], returns=f.returns, lineno=f.lineno)
         if m.kind in ("post_init", "init") and f.returns is None:
             stub.returns = ast.Constant(None)
+        if m.name in cls_.TEXT_METHODS and f.returns is None:
+            stub.returns = ast.Name(id="str", ctx=ast.Load())
         sig = self.signature(stub)
+        if m.name in cls_.TEXT_METHODS:
+            sig.cpp = cls_.TEXT_METHODS[m.name]  # __repr__ -> repr() (a C++ name can't start with __)
         sig.owner, sig.kind = info.name, m.kind
         py_names = {n.id for n in ast.walk(f) if isinstance(n, ast.Name)} | {a.arg for a in f.args.args}
         for prm in sig.params:  # a parameter named like a field would shadow it
@@ -830,6 +846,54 @@ class ModuleTranslator:
                                type_params=[], lineno=first.lineno, col_offset=0,
                                end_lineno=last.end_lineno, end_col_offset=0)
 
+    def struct_repr_problem(self, info):
+        """Why the dataclass repr of `info` can't be written exactly, or None. Python shows each
+        field's repr, and a field that holds a NumPy float64 shows as np.float64(...): so every
+        value the file puts in a numeric field (constructor arguments, attribute stores, defaults)
+        must be a Python number, as qtrans can see from how each was made (origins.py)."""
+        cache = self.__dict__.setdefault("_repr_problems", {})
+        if info.name in cache:
+            return cache[info.name]
+        cache[info.name] = (info.node, f"the fields of {info.name} depend on each other")  # while working it out
+        from .origins import PY
+        numeric = {f.name for f in info.fields if isinstance(f.type, Scalar) or
+                   (isinstance(f.type, OptionalType) and isinstance(f.type.inner, Scalar))}
+        problem = None
+        for f in info.fields:
+            if f.repr and f.type == RNG:
+                problem = (info.node, f"field '{f.name}' holds a random generator, which Python shows by its address")
+            if f.name in numeric and f.default is not None and not isinstance(f.default, ast.Constant):
+                problem = problem or (f.default, f"the default of field '{f.name}' isn't a plain number")
+        if self.is_program and self.main_body and getattr(self, "_main_fdef_cache", None) is None:
+            self._main_fdef_cache = self._main_fdef()
+        defs = [(f, self.sigs.get(k)) for k, f in self.fdefs.items()]
+        if getattr(self, "_main_fdef_cache", None) is not None:
+            defs.append((self._main_fdef_cache, None))
+        init = [f.name for f in info.init_fields] if hasattr(info, "init_fields") else [f.name for f in info.fields]
+        for fdef, sig in defs:
+            if problem:
+                break
+            fo = self.origins.function(fdef, sig)
+            for n in _own_body_nodes(fdef):
+                pairs = []
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == info.name:
+                    pairs = [(init[i], a) for i, a in enumerate(n.args) if i < len(init)]
+                    pairs += [(k.arg, k.value) for k in n.keywords]
+                elif isinstance(n, ast.Call) and _ConstTranslator(self).qualify(n.func) == "dataclasses.replace":
+                    pairs = [(k.arg, k.value) for k in n.keywords]
+                elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)) and getattr(n, "value", None) is not None:
+                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                    pairs = [(t.attr, n.value) for t in targets if isinstance(t, ast.Attribute)]
+                for name, value in pairs:
+                    if name in numeric and fo.of(value) != PY:
+                        problem = (value, f"field '{name}' of {info.name} gets `{ast.unparse(value)}` on line {value.lineno}, which may be a "
+                                          "NumPy number: Python's repr of the object would show it as np.float64(...)")
+                        break
+                if problem:
+                    break
+        cache[info.name] = problem
+        return problem
+
     def _provisional(self, name, f, known):
         """A signature with what is known so far (None for a type not known yet)."""
         a = f.args
@@ -882,6 +946,7 @@ class ModuleTranslator:
             progress = False
             self.pending_sigs = {n: self._provisional(n, self.fdefs[n], known[n]) for n in pending}
             seen = {n: {} for n in pending}  # parameter -> {type: [lines]}
+            calls_seen = {n: [] for n in pending}  # each call: ({parameter: type}, line)
             todo = [(f, self.sigs.get(n) or self.pending_sigs.get(n)) for n, f in callers]
             if main is not None:
                 todo.append((main, Signature(PROGRAM, "main", [], VOID, main.lineno, None)))
@@ -902,6 +967,7 @@ class ModuleTranslator:
                     names = param_names[call.func.id]
                     pairs = [(names[i], a) for i, a in enumerate(call.args) if i < len(names) and not isinstance(a, ast.Starred)]
                     pairs += [(k.arg, k.value) for k in call.keywords if k.arg in names]
+                    this = {}
                     for pname, a in pairs:
                         tr.current = call
                         try:
@@ -910,6 +976,8 @@ class ModuleTranslator:
                             continue
                         if t is not None and t not in (VOID, NONE):
                             seen[call.func.id].setdefault(pname, {}).setdefault(t, []).append(a.lineno)
+                            this[pname] = t
+                    calls_seen[call.func.id].append((this, call.lineno))
                 # what a pending function returns, once its parameters are known
                 name = getattr(f, "name", None)
                 if name in pending and "return" not in known[name] and sig.ret is None \
@@ -956,6 +1024,8 @@ class ModuleTranslator:
             f = self.fdefs[name]
             missing = [x.arg for x in list(f.args.posonlyargs) + list(f.args.args) if x.annotation is None]
             bad = [(p, conflict[(name, p)]) for p in missing if (name, p) in conflict and p not in known[name]]
+            if bad and self._overloads(name, f, missing, known[name], calls_seen[name]):
+                continue  # one C++ version per kind of call
             if bad:
                 p, types = bad[0]
                 where = "; ".join(f"{t} (line {', '.join(map(str, sorted(set(ls))))})" for t, ls in types.items())
@@ -980,6 +1050,95 @@ class ModuleTranslator:
                 shown.append(f"-> {known[name]['return']}")
             sig.decorator_notes.append("types from how the file calls it (no annotations): " + ", ".join(shown))
             self.sigs[name] = sig
+
+    def _infer_return(self, name, f, given):
+        """The one type every `return` of f gives, with these parameter types; None if not one."""
+        from .functions import FunctionTranslator
+        sig = self._provisional(name, f, given)
+        sig.ret = None
+        tr = FunctionTranslator(self, f, sig)
+        try:
+            tr.scan(tr.body)
+            tr.check_loop_vars()
+            tr.finish_scan()
+            tr.infer_types()
+        except Exception:  # noqa: BLE001 - typed as far as it goes
+            pass
+        tr.inferring = True
+        types = set()
+        for r in (n for n in _own_body_nodes(f) if isinstance(n, ast.Return) and n.value is not None):
+            tr.current = r
+            try:
+                types.add(tr.expr_raw(r.value).type)
+            except Exception:  # noqa: BLE001 - a recursive call, typed by the others
+                continue
+        if len(types) != 1:
+            return None
+        t = next(iter(types))
+        return None if t in (None, VOID, NONE) or isinstance(t, OptionalType) else t
+
+    def _overloads(self, name, f, missing, known, calls) -> bool:
+        """A function the file calls with different types (half(7) and half(7.0)): one C++
+        version for each kind of call, overloads of one name, each computing as Python does
+        with those types. True if made; False (and nothing changed) if some call can't be typed."""
+        a = f.args
+        nodes = list(a.posonlyargs) + list(a.args)
+        defaults = dict(zip([x.arg for x in nodes[len(nodes) - len(a.defaults):]], a.defaults))
+        tr0 = _ConstTranslator(self)
+        kinds, lines = [], {}
+        for types, line in calls:
+            row = []
+            for p in missing:
+                t = types.get(p)
+                if t is None and p in defaults:
+                    try:
+                        t = tr0.expr(defaults[p]).type
+                    except Unsupported:
+                        t = None
+                if t is None or not (isinstance(t, (Scalar, ArrayType, StructType)) or t in (STR, RNG)):
+                    return False  # a call whose types aren't known: no version can be chosen for it
+                row.append(t)
+            row = tuple(row)
+            if row not in lines:
+                kinds.append(row)
+            lines.setdefault(row, []).append(line)
+        if len(kinds) < 2 or len(kinds) > 8:
+            return False
+        made = []
+        for row in kinds:
+            given = dict(zip(missing, row))
+            returns_value = any(isinstance(n, ast.Return) and n.value is not None and not (
+                isinstance(n.value, ast.Constant) and n.value.value is None) for n in _own_body_nodes(f))
+            if f.returns is None and returns_value:
+                ret = self._infer_return(name, f, given)
+                if ret is None:
+                    return False
+                given["return"] = ret
+            try:
+                sig = self.signature(f, given=given)
+            except Unsupported:
+                return False
+            key = f"{name}({','.join(str(t) for t in row)})"  # no spaces: also the verifier's name for it
+            where = ", ".join(map(str, sorted(set(lines[row]))))
+            sig.overloaded = True
+            sig.decorator_notes.append(f"one C++ version for each kind of call (overloads of {name}): this one for "
+                                       + ", ".join(f"{p}: {t}" for p, t in zip(missing, row))
+                                       + (f" -> {given['return']}" if "return" in given else "")
+                                       + f", called so on line {where}")
+            made.append((key, sig))
+        # in the file's order: each version where the function was
+        order = list(self.fdefs.items())
+        self.fdefs.clear()
+        for k, node in order:
+            if k == name:
+                for key, _ in made:
+                    self.fdefs[key] = node
+            else:
+                self.fdefs[k] = node
+        for key, sig in made:
+            self.sigs[key] = sig
+        self.variants[name] = [key for key, _ in made]
+        return True
 
     def _collect_import(self, node):
         if isinstance(node, ast.Import):
@@ -1018,6 +1177,13 @@ class ModuleTranslator:
                 if name not in self.printing and called & self.printing:
                     self.printing.add(name)
                     changed = True
+
+    def fdef_named(self, name):
+        """The def of a module function by its Python name (its versions share one)."""
+        if name in self.fdefs:
+            return self.fdefs[name]
+        keys = self.variants.get(name)
+        return self.fdefs[keys[0]] if keys else None
 
     def _qualify_path(self, node):
         parts = []
@@ -1303,7 +1469,10 @@ class ModuleTranslator:
         tr = _ConstTranslator(self)
         try:
             e = tr.expr(node.value)
-            if not isinstance(e.type, Scalar) and e.type != STR:
+            if isinstance(e.type, ListType) and e.type.elem is not None:
+                e = Expr(e.code[len(e.type.cpp()):] if e.code.startswith(e.type.cpp() + "{") else e.code,
+                         P_ATOM, e.type)  # inline const std::vector<double> RATES = {0.01, 0.02};
+            elif not isinstance(e.type, Scalar) and e.type != STR:
                 raise Unsupported(node, f"{e.type} constants are not supported")
             t = e.type
             if isinstance(node, ast.AnnAssign):
@@ -1346,7 +1515,7 @@ class ModuleTranslator:
                 e.missing_annotation = True
                 raise e
             t = given[arg.arg] if arg.annotation is None else self.parse_annotation(arg.annotation)
-            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType)) and t != STR:
+            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType, ListType)) and t != STR:
                 raise Unsupported(arg, f"parameter '{arg.arg}': {t} parameters are not supported; "
                                        "use float, int, bool, Vec, Mat or np.random.Generator")
             if d is not None and isinstance(t, RngType):
@@ -1425,7 +1594,8 @@ class ModuleTranslator:
                     progress = True
             for info in self.classes.values():  # one untranslatable method sinks its class
                 if info.rejected is None and not info.external:
-                    bad = next((m for m in info.methods.values() if m.key in self.rejected), None)
+                    bad = next((m for m in info.methods.values() if m.key in self.rejected
+                                and m.name not in cls_.TEXT_METHODS), None)  # a refused __repr__: refused where printed
                     if bad is not None:
                         e = self.rejected[bad.key]
                         info.rejected = Unsupported(bad.fdef, f"method {bad.name} could not be translated: "
@@ -1483,7 +1653,7 @@ class ModuleTranslator:
                                  notes, program, pmap,
                                  self._main_spans(),
                                  bool(sigs or live or any(not c.external for c in self.constants.values())),
-                                 frozenset(n for n in bodies if n in self.printing))
+                                 frozenset(n for n in bodies if n.split("(")[0] in self.printing))
 
     def _main_spans(self) -> tuple:
         """The Python lines of the program: the `if __name__ == "__main__":` line, then each statement."""
@@ -1513,7 +1683,7 @@ class ModuleTranslator:
             return
         later = {}
         for name, f in self.fdefs.items():
-            later[name] = f.lineno
+            later[name.split("(")[0]] = f.lineno
         for name, info in self.classes.items():
             if not info.external:
                 later[name] = info.node.lineno
@@ -1580,7 +1750,9 @@ class ModuleTranslator:
         parts = []
         for p in sig.params:
             attr = "[[maybe_unused]] " if used_params is not None and p.name not in used_params else ""
-            if is_array(p.type) or p.type in (RNG, STR) or _optional_array(p.type) or isinstance(p.type, StructType):
+            if isinstance(p.type, ListType):
+                ty = f"const {p.type.cpp()}&"  # a function never changes a list passed to it (check_lists)
+            elif is_array(p.type) or p.type in (RNG, STR) or _optional_array(p.type) or isinstance(p.type, StructType):
                 ty = {"cref": f"const {p.type.cpp()}&", "ref": f"{p.type.cpp()}&"}.get(p.mode, p.type.cpp())
             else:
                 ty = p.type.cpp()
@@ -1651,6 +1823,8 @@ class ModuleTranslator:
             elif sig.const:
                 decl += " const"
             out.append(f"    {decl};" + ("  // @property" if m.kind == "property" else ""))
+        if info.name in getattr(self, "repr_needed", set()) and "__repr__" not in info.methods:
+            out.append("    std::string repr() const;  // repr(), as Python writes it for this class")
         if info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields):
             out.append(f"    bool operator==(const {info.cpp}& other) const;")
             out.append(f"    bool operator!=(const {info.cpp}& other) const {{ return !(*this == other); }}")
@@ -1702,6 +1876,20 @@ class ModuleTranslator:
             out.append(line + " {" + source_mark(first, fd.body[0].lineno - 1 if fd.body[0].lineno > fd.lineno else fd.lineno))
             out += bodies[m.key]
             out.append("}" + source_mark(fd.end_lineno, fd.end_lineno))
+            out.append("")
+        if info.name in getattr(self, "repr_needed", set()) and "__repr__" not in info.methods:
+            mark = source_mark(cls, cls)
+            pieces, text = [], f"{info.name}("
+            for k, f in enumerate(x for x in info.fields if x.repr):
+                text += ("" if k == 0 else ", ") + f"{f.name}="
+                pieces += [cpp_string_literal(text),
+                           f"{f.cpp}.repr()" if isinstance(f.type, StructType) else f"qt::py::repr({f.cpp})"]
+                text = ""
+            pieces.append(cpp_string_literal(text + ")"))
+            code = " + ".join(pieces)
+            out.append(f"inline std::string {info.cpp}::repr() const {{" + mark)
+            out.append(f"    return {code};" + mark)
+            out.append("}" + mark)
             out.append("")
         if info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields):
             terms = [f"{f.cpp} == other.{f.cpp}" for f in info.fields if f.compare]
@@ -1771,7 +1959,7 @@ class ModuleTranslator:
 
     def _includes(self, text, bodies) -> list:
         includes = ["<cmath>"]
-        checks = [("<algorithm>", r"std::(max|min)\("), ("<cstdlib>", r"std::(abs|exit)\("),
+        checks = [("<algorithm>", r"std::(max|min|reverse)\("), ("<vector>", r"std::vector<"), ("<cstdlib>", r"std::(abs|exit)\("),
                   ("<stdexcept>", r"throw std::"), ("<tuple>", r"std::(tuple|tie|ignore|make_tuple)"),
                   ("<initializer_list>", r"(?m)std::(max|min)\(\{|^\s*for \([^:;]+ : \{"), ("<string>", r"std::(string|to_string)\b"),
                   ("<optional>", r"std::optional"), ("<utility>", r"std::move\("),
@@ -1790,7 +1978,10 @@ class ModuleTranslator:
             inc_lines.append('#include "qtrans_arrays.hpp"  // Eigen, plus NumPy semantics')
         elif "qt::" in code.replace("qt::py::", ""):
             inc_lines.append('#include "qtrans_runtime.hpp"')
-        if "qt::py::" in code:
+        if "std::vector<" in code or re.search(r"qt::py::(item|slice|sum|sum_left|min|max|sorted|sort|pop|insert|index|"
+                                                r"count|contains|concat|range_list|repeat|len|none)\b", code):
+            inc_lines.append('#include "qtrans_list.hpp"  // lists, and print(), str(), repr(), format() as Python writes them')
+        elif "qt::py::" in code:
             inc_lines.append('#include "qtrans_print.hpp"  // print(), str(), repr(), format() as Python writes them')
         for d in self.project_deps:  # the modules of the project it imports from
             inc_lines.append(f'#include "{d}.hpp"  // from {d} import ...')
@@ -1861,7 +2052,7 @@ def translate_file(path, out_dir=None) -> TranslationResult:
             (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
         if result.uses_random or "qtrans_random.hpp" in everything:
             (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
-        if "qtrans_print.hpp" in result.header + (result.program or ""):
-            for h in (RUNTIME_HEADER, PRINT_HEADER):
+        if re.search(r"qtrans_(print|list)\.hpp", result.header + (result.program or "")):
+            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER):
                 (out / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")
     return result

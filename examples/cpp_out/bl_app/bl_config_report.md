@@ -19,6 +19,7 @@
 - `DEFAULT_VIEW_CONFIDENCE: float`
 - `DEFAULT_VOL_TARGET_PCT: float`
 - `DEFAULT_VOL_TARGET_FRAC_PCT: int`
+- `VIEW_TYPES: list[str]`
 
 ## Module-level notes
 
@@ -28,6 +29,5 @@
 - line 51: `BENCHMARKS` not translated: dicts are not supported in stage 1
 - line 67: `MARKET_DEFAULTS` not translated: dicts are not supported in stage 1
 - line 97: `MARKETS` not translated: dicts are not supported in stage 1
-- line 233: `VIEW_TYPES` not translated: lists are not supported in stage 1
 - line 252: `VIEW_ENGINES` not translated: dicts are not supported in stage 1
 - line 260: `ENGINE_NOTES` not translated: dicts are not supported in stage 1

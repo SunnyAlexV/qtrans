@@ -31,7 +31,8 @@ from .core import cpp_ident
 from .errors import Unsupported
 from .types import ArrayType, OptionalType, Scalar, StructType, is_array
 
-DUNDERS_SKIPPED = {"__repr__", "__str__", "__format__"}
+DUNDERS_SKIPPED = {"__format__"}
+TEXT_METHODS = {"__repr__": "repr", "__str__": "str"}  # translated as std::string repr() const / str() const
 DUNDERS_REFUSED = {"__eq__", "__ne__", "__hash__", "__lt__", "__le__", "__gt__", "__ge__", "__init__",
                    "__new__", "__setattr__", "__getattr__", "__getattribute__", "__bool__", "__len__",
                    "__iter__", "__getitem__", "__call__", "__add__", "__sub__", "__mul__", "__truediv__"}
@@ -47,6 +48,7 @@ class FieldInfo:
     factory: object = None          # AST of the default_factory's result expression
     init: bool = True               # a parameter of the constructor
     compare: bool = True            # part of ==
+    repr: bool = True               # shown by the dataclass's repr
     default_code: str | None = None  # C++ for the default, once translated
 
 
@@ -258,7 +260,9 @@ def _field_default(mod, info, f: FieldInfo, value):
                 f.init = _const_bool(k.value, "init=")
             elif k.arg == "compare":
                 f.compare = _const_bool(k.value, "compare=")
-            elif k.arg in ("repr", "hash", "metadata", "kw_only"):
+            elif k.arg == "repr":
+                f.repr = _const_bool(k.value, "repr=")
+            elif k.arg in ("hash", "metadata", "kw_only"):
                 if k.arg == "kw_only":
                     raise Unsupported(value, "kw_only fields are not supported")
             else:
@@ -300,7 +304,7 @@ def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
     elif s.name in DUNDERS_REFUSED:
         raise Unsupported(s, f"defining {s.name} is not supported: it changes what Python operators mean",
                           "use a plainly named method")
-    elif s.name.startswith("__") and s.name.endswith("__") and s.name not in DUNDERS_SKIPPED:
+    elif s.name.startswith("__") and s.name.endswith("__") and s.name not in DUNDERS_SKIPPED and s.name not in TEXT_METHODS:
         raise Unsupported(s, f"defining {s.name} is not supported")
     args = s.args
     if args.vararg or args.kwarg or args.kwonlyargs or args.posonlyargs:
@@ -312,6 +316,19 @@ def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
     if kind in ("property", "post_init") and len(args.args) != 1:
         raise Unsupported(s, f"{s.name} takes only self")
     return MethodInfo(s.name, s, kind, f"{info.name}.{s.name}")
+
+
+def auto_repr(info: ClassInfo) -> bool:
+    """Does Python write a repr for it (Point(x=1.0, y=2.0))? A dataclass unless repr=False, and a
+    NamedTuple; a plain class shows its memory address instead."""
+    if info.plain:
+        return False
+    for dec in info.node.decorator_list:
+        if isinstance(dec, ast.Call):
+            for k in dec.keywords:
+                if k.arg == "repr" and isinstance(k.value, ast.Constant) and k.value.value is False:
+                    return False
+    return True
 
 
 def check_field_types(mod, info: ClassInfo):

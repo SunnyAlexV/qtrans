@@ -25,7 +25,7 @@ from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown
 from .structs import THIS
 from .classes import member_safe_name
 from .types import VEC as VEC_T
-from .types import RNG, STR
+from .types import RNG, STR, ListType
 from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
@@ -493,15 +493,22 @@ class FunctionTranslator(ExprTranslator):
         return set(self.locals_order)
 
     def is_variable(self, name):
+        if name in getattr(self, "comp_vars", {}):
+            return True
         return (name in self.params or name in self.loop_vars or name in self.ignored
                 or name in self._locals_cache or (name == "self" and self.has_self))
 
     def variable(self, node):
         n = node.id
+        if n in getattr(self, "comp_vars", {}):  # inside a list comprehension
+            t, ident = self.comp_vars[n]
+            return Expr(ident, P_ATOM, t, simple=True)
         if n == "self" and self.has_self:
             return Expr(THIS, P_ATOM, self.owner.type, simple=True)
         if n in self.loop_vars:
             t = self.loop_types.get(n, INT)
+            if t is None:  # over a list or a Vec: its element type
+                t = self._loop_elem_type(n)
             if t == INT:  # a range() loop index lies between start and stop
                 return Expr(self.ident(n), P_ATOM, t, simple=True, iv=self.loop_iv.get(n))
         elif n in self.params:
@@ -532,7 +539,9 @@ class FunctionTranslator(ExprTranslator):
             self.note("errstate", "np.errstate(...) blocks are translated as their contents: they only "
                                   "change which floating-point warnings NumPy prints, never the values")
         self.check_aliasing()
+        self.check_lists()
         self.check_random_draws()
+        self._flag_int_or_float()
         self.plan_declarations()
         self.check_generator_declarations()
         self.definite_assignment()
@@ -543,6 +552,109 @@ class FunctionTranslator(ExprTranslator):
         self.flush_comments(self.fdef.end_lineno + 1)
         self._mark_unread_locals()
         return self.lines
+
+    def check_lists(self):
+        """A Python list is one object, however many names it has: `b = a` shares it, a function
+        given a list changes the caller's, a loop sees appends made while it runs. The C++ copies
+        instead, so wherever that sharing would show it is refused."""
+        types = {**self.local_types, **self.params}
+        lists = {n for n, t in types.items() if isinstance(t, ListType)}
+        globals_ = {n for n, c in self.mod.constants.items() if isinstance(c.type, ListType)}
+        if not lists and not globals_:
+            return
+        mutated = {}  # name -> the first statement that changes it in place
+
+        def mark(name, st):
+            mutated.setdefault(name, st)
+        for st in (x for x in ast.walk(self.fdef) if isinstance(x, ast.stmt)):
+            for e in self._own_exprs(st):  # the statement's own expressions, not its nested blocks'
+                for n in ast.walk(e) if e is not None else ():
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) \
+                            and n.func.attr in ("append", "extend", "insert", "pop", "sort", "reverse", "clear", "remove"):
+                        mark(n.func.value.id, st)
+            if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+                targets = st.targets if isinstance(st, (ast.Assign, ast.Delete)) else [st.target]
+                for t in targets:
+                    if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                        mark(t.value.id, st)
+                    elif isinstance(st, ast.AugAssign) and isinstance(t, ast.Name) and t.id in lists:
+                        mark(t.id, st)  # xs += ys extends xs in place
+        for name, st in mutated.items():
+            if name in globals_ and name not in lists:
+                raise Unsupported(st, f"this changes the module's list '{name}', which the C++ holds as a constant",
+                                  "copy it first: xs = list(" + name + ")")
+            if name in self.params and name in lists:
+                raise Unsupported(st, f"this changes the list '{name}' passed in, which in Python changes the caller's "
+                                      "list too; the C++ function gets its own copy",
+                                  f"work on a copy: {name} = list({name}), and return it")
+        for st in (x for x in ast.walk(self.fdef) if isinstance(x, (ast.Assign, ast.AnnAssign))):
+            value = st.value
+            targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id in lists and isinstance(value, ast.Name) and value.id != t.id \
+                        and (value.id in lists or value.id in globals_) and (t.id in mutated or value.id in mutated):
+                    raise Unsupported(st, f"'{t.id}' and '{value.id}' are one list in Python (assignment shares it) and "
+                                          f"'{t.id if t.id in mutated else value.id}' is changed, which would show "
+                                          "through the other name; the C++ copies", f"{t.id} = list({value.id}) for a copy")
+        for st in (x for x in ast.walk(self.fdef) if isinstance(x, ast.Return)):
+            if isinstance(st.value, ast.Name) and st.value.id in self.params and st.value.id in lists:
+                raise Unsupported(st, f"returning the list '{st.value.id}' passed in: Python hands back the caller's own "
+                                      "list (the same object), the C++ a copy", f"return list({st.value.id})")
+        for loop in (x for x in ast.walk(self.fdef) if isinstance(x, ast.For)):
+            if isinstance(loop.iter, ast.Name) and loop.iter.id in mutated:
+                inside = {id(x) for b in loop.body for x in ast.walk(b)}
+                if id(mutated[loop.iter.id]) in inside:
+                    raise Unsupported(loop, f"the loop changes '{loop.iter.id}' while going through it (Python's loop "
+                                            "sees the change)", f"loop over a copy: for x in list({loop.iter.id})")
+
+    def _flag_int_or_float(self):
+        """Locals that hold an int in some assignments and a float in others, shown as text where
+        they may still hold the int (`total = 0`, `for ...: total += x`, `print(total)`): Python
+        prints 0 or 2.5 as the run goes. Each such local gets a flag beside it, `total_is_int`,
+        kept as Python's type goes, and the text is written as an int or a float by it."""
+        self.flagged = set()
+        if not getattr(self, "widened", None):
+            return
+
+        def text_nodes(e):
+            for n in ast.walk(e):
+                if isinstance(n, ast.JoinedStr):
+                    yield n
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("print", "str", "repr", "format"):
+                    yield n
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "format":
+                    yield n
+                elif isinstance(n, ast.BinOp) and isinstance(n.op, ast.Mod) and isinstance(n.left, ast.Constant) \
+                        and isinstance(n.left.value, str):
+                    yield n
+        saved = self.current
+        for st in (x for x in ast.walk(self.fdef) if isinstance(x, ast.stmt) and x is not self.fdef):
+            for e in self._own_exprs(st):
+                if e is None:
+                    continue
+                for t in text_nodes(e):
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name) and n.id in self.widened and n.id not in self.flagged:
+                            self.current = st
+                            if not self._surely_float(n.id):
+                                self.flagged.add(n.id)
+        self.current = saved
+
+    def flag_name(self, name) -> str:
+        return f"{self.ident(name)}_is_int"
+
+    def _emit_flag(self, name, value_node, s, declare):
+        """After `name = value`: whether Python now holds an int there."""
+        cond = self.int_cond(value_node)
+        if cond is None:
+            cond = "false"
+        elif cond is False:
+            why = self.maybe_int(value_node) or "it depends on the run"
+            raise Unsupported(s, f"'{name}' is shown as text, and this value is a Python int or a float depending "
+                                 f"on the run, in a way qtrans can't follow ({why})",
+                              "make it a float on every path (return 0.0, not 0), or format it with a float "
+                              "spec (:.2f, :g)")
+        self.emit(f"{'bool ' if declare else ''}{self.flag_name(name)} = {cond};")
 
     def _mark_unread_locals(self):
         """[[maybe_unused]] on a local the C++ never reads, though Python does: its only read was
@@ -671,9 +783,9 @@ class FunctionTranslator(ExprTranslator):
                 return True
             if isinstance(n.func, ast.Name) and n.func.id in self.mod.ext_math_domain:
                 return True  # a function of another module of the project that may raise it
-            if isinstance(n.func, ast.Name) and n.func.id in self.mod.fdefs and n.func.id not in seen:
+            if isinstance(n.func, ast.Name) and self.mod.fdef_named(n.func.id) is not None and n.func.id not in seen:
                 seen.add(n.func.id)
-                if self._uses_math_domain(self.mod.fdefs[n.func.id].body, seen):
+                if self._uses_math_domain(self.mod.fdef_named(n.func.id).body, seen):
                     return True
         return False
 
@@ -733,7 +845,23 @@ class FunctionTranslator(ExprTranslator):
         lit = self._literal_items(s.iter)
         if lit is not None:
             return lit[0]
-        return INT if self._is_range(s.iter) else FLOAT
+        if self._is_range(s.iter):
+            return INT
+        self.__dict__.setdefault("loop_iters", {})[s.target.id] = s.iter
+        return None  # the element type of what it iterates (a Vec, a list): known after inference
+
+    def _loop_elem_type(self, name):
+        it = self.loop_iters[name]
+        saved = self.current
+        try:
+            t = self.expr(it).type
+        finally:
+            self.current = saved
+        if isinstance(t, ListType):
+            if t.elem is None:
+                raise _Unknown(name) if self.inferring else Unsupported(it, "the list's element type is not known")
+            return t.elem
+        return FLOAT
 
     @staticmethod
     def _literal_items(it):
@@ -839,6 +967,45 @@ class FunctionTranslator(ExprTranslator):
             walk(s, frozenset())
 
     # --- pass 3: type inference ------------------------------------------------------------
+    def _list_mutations(self):
+        """(list name, method, argument node, statement) for xs.append(x) / insert / extend."""
+        if not hasattr(self, "_list_muts"):
+            out = []
+            for st in ast.walk(self.fdef):
+                if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
+                    c = st.value
+                    if isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name) \
+                            and c.func.attr in ("append", "insert", "extend") and c.args:
+                        out.append((c.func.value.id, c.func.attr, c.args[-1] if c.func.attr == "insert" else c.args[0], st))
+            self._list_muts = out
+        return self._list_muts
+
+    def _list_element_types(self) -> bool:
+        """`xs = []`, then xs.append(2.5): the element type comes from what is added."""
+        changed = False
+        for name, how, arg, st in self._list_mutations():
+            t = self.local_types.get(name)
+            if not isinstance(t, ListType) or name in self.annotated:
+                continue
+            self.current = st
+            try:
+                a = self.expr(arg).type
+            except (_Unknown, Unsupported):
+                continue
+            elem = (a.elem if isinstance(a, ListType) else None) if how == "extend" else a
+            if elem is None:
+                continue
+            if t.elem is None:
+                if elem not in (FLOAT, INT, STR):
+                    raise Unsupported(st, f"a list of {elem} values is not supported", "lists of float, int or str are")
+                self.local_types[name] = ListType(elem)
+                changed = True
+            elif t.elem != elem:
+                raise Unsupported(st, f"'{name}' gets a {elem} here and holds {t.elem} values: Python keeps each "
+                                      "element's type (an int prints as 1, a float as 1.0), a std::vector has one",
+                                  "make them one type: 1.0 rather than 1")
+        return changed
+
     def event_type(self, ev):
         self.current = ev.stmt
         e = self.expr_raw(ev.payload) if ev.kind == "expr" else self.expr(ev.payload)
@@ -878,6 +1045,7 @@ class FunctionTranslator(ExprTranslator):
                     if new != old:
                         self.local_types[ev.name] = new
                         changed = True
+                changed = self._list_element_types() or changed
                 if not changed:
                     break
         finally:
@@ -1074,6 +1242,9 @@ class FunctionTranslator(ExprTranslator):
             if bt == RNG:
                 roots.add(subscript_root(f.value))
                 draw = True
+            elif isinstance(bt, ListType) and f.attr in ("append", "extend", "insert", "pop", "sort", "reverse",
+                                                          "clear", "remove"):
+                roots.add(subscript_root(f.value))  # xs.pop() changes xs
             elif isinstance(bt, StructType) and bt.name in self.mod.classes:
                 m = self.mod.classes[bt.name].methods.get(f.attr)
                 if m is not None and m.key in self.mod.sigs:
@@ -1499,6 +1670,8 @@ class FunctionTranslator(ExprTranslator):
             t = self.local_types[n]
             self.emit(f"{self._unused(n)}{t.cpp()} {self.ident(n)} = {t.zero()};" if isinstance(t, Scalar)
                       else f"{self._unused(n)}{t.cpp()} {self.ident(n)}{{}};")
+            if n in getattr(self, "flagged", ()):
+                self.emit(f"bool {self.flag_name(n)} = false;  // does Python hold an int in {n} here?")
         compound = isinstance(s, (ast.If, ast.While, ast.For))
         last = s.lineno if compound else s.end_lineno
         texts = [self.mod.inline_comments[ln] for ln in range(s.lineno, last + 1) if ln in self.mod.inline_comments]
@@ -1608,12 +1781,16 @@ class FunctionTranslator(ExprTranslator):
         if (is_array(vt) or (isinstance(vt, OptionalType) and is_array(vt.inner))) and \
                 self._needs_eval(value_node, name, whole_array=True):
             code = f"({code}).eval()"  # Eigen is lazy: read all of the old value before overwriting it
+        if isinstance(vt, ListType) and code.startswith(vt.cpp() + "{"):
+            code = code[len(vt.cpp()):]  # std::vector<double> xs = {1.0, 2.0};
         if name in inline_set:
             self.emit(f"{self._unused(name)}{vt.cpp()} {self.ident(name)} = {code};")
         elif code == self.ident(name):  # w = w.copy() of a parameter passed by value
             self.emit(f"// {ast.unparse(s)}: {name} is already this function's own copy")
         else:
             self.emit(f"{self.ident(name)} = {code};")
+        if name in getattr(self, "flagged", ()):
+            self._emit_flag(name, value_node, s, declare=name in inline_set)
 
     def s_Assign(self, s):
         inline = self.inline_at.get(id(s), set())
@@ -1681,6 +1858,9 @@ class FunctionTranslator(ExprTranslator):
     def store_subscript(self, t, value_node, s, sym):
         """a[i] = x, a[i:j] = v, A[i] = row, A[:, j] = col, A[r0:r1, c0:c1] = M (and +=, -=, ...)."""
         root = subscript_root(t)
+        lt = self.var_type(root) if root and (root in self.params or root in self.local_types) else None
+        if isinstance(lt, ListType):
+            return self.store_list_item(t, value_node, s, sym, lt)
         if isinstance(self.var_type(root) if root else None, OptionalType):
             raise Unsupported(s, f"'{root}' may be None, and storing into it is not supported",
                               f"after the None check, work on a new name: {root}_ = {root}.copy()")
@@ -1720,6 +1900,27 @@ class FunctionTranslator(ExprTranslator):
                 self.emit(f"qt::store({code}, {rhs}{op});")
                 return
         self.emit(f"{code} {sym} {rhs};")
+
+    def store_list_item(self, t, value_node, s, sym, lt):
+        """xs[i] = x (and xs[i] += x): the element keeps the list's one type, as Python's would."""
+        if isinstance(t.slice, ast.Slice) or not isinstance(t.value, ast.Name):
+            raise Unsupported(s, "assigning to a slice of a list is not supported", "build a new list")
+        target = self.list_subscript(t, self.expr(t.value))
+        v = self.expr(value_node)
+        if sym != "=" and lt.elem == INT and sym == "/=":
+            raise Unsupported(s, "xs[i] /= ... makes a float in a list of ints: Python keeps each element's type")
+        if v.type != lt.elem and not (sym != "=" and lt.elem == FLOAT and v.type in (INT, BOOL)):
+            raise Unsupported(s, f"storing a {v.type} in a list of {lt.elem}: Python keeps each element's type "
+                                 "(an int prints as 1, a float as 1.0)")
+        if lt.elem == FLOAT and self.maybe_int(value_node) and sym == "=":
+            raise Unsupported(s, "this value may be a Python int here, in a list of floats",
+                              "make it a float on every path (0.0 rather than 0)")
+        if sym in ("+=", "-=", "*=") and lt.elem == INT:
+            op = {"+=": "qt::iadd", "-=": "qt::isub", "*=": "qt::imul"}[sym]
+            self.emit(f"{target.code} = {op}({target.code}, {self.as_type(v, INT).code});")
+            return
+        code = self.as_double(v).code if lt.elem == FLOAT else v.code
+        self.emit(f"{target.code} {sym} {code};")
 
     def _field_target(self, t, s):
         """`obj.x` as an assignment target: (C++ lvalue, field)."""
@@ -1761,6 +1962,14 @@ class FunctionTranslator(ExprTranslator):
                 raise Unsupported(s, f"{type(s.op).__name__}= on an array element is not supported")
             self.store_subscript(s.target, s.value, s, syms[type(s.op)])
             return
+        if isinstance(self.var_type(s.target.id), ListType):  # xs += ys: extends xs in place
+            if not isinstance(s.op, ast.Add):
+                raise Unsupported(s, f"{type(s.op).__name__}= on a list is not supported")
+            call = ast.copy_location(ast.Call(func=ast.Attribute(value=ast.Name(id=s.target.id, ctx=ast.Load()),
+                                                                 attr="extend", ctx=ast.Load()),
+                                              args=[s.value], keywords=[]), s)
+            self.emit(f"{self.expr(call).code};")
+            return
         if isinstance(self.var_type(s.target.id), OptionalType) and is_array(self.var_type(s.target.id).inner):
             raise Unsupported(s, f"'{s.target.id}' may be None; in-place arithmetic on it is not supported",
                               f"work on a new name: {s.target.id}_ = {s.target.id} + ...")
@@ -1794,6 +2003,17 @@ class FunctionTranslator(ExprTranslator):
             self.emit(f"{self.ident(name)} {sym} {rhs.code};")
         else:
             self.emit(f"{self.ident(name)} = {result.code};")
+        if name in getattr(self, "flagged", ()):
+            # int op int stays an int in Python (x / y never does); a float operand makes a float
+            cond = "false" if isinstance(s.op, ast.Div) else self.int_cond(s.value)
+            if cond is False:
+                raise Unsupported(s, f"'{name}' is shown as text where it may be an int or a float, and this value "
+                                     "is one or the other depending on the run in a way qtrans can't follow",
+                                  f"start it as a float ({name} = 0.0 rather than 0)")
+            if cond is None or cond == "false":
+                self.emit(f"{self.flag_name(name)} = false;")
+            elif cond != "true":
+                self.emit(f"{self.flag_name(name)} = {self.flag_name(name)} && {cond};")
 
     def _emit_inplace(self, s, target, tt, tdims, rhs, code, syms):
         """target op= rhs for arrays. NumPy broadcasts the right side into the target's shape
@@ -1906,6 +2126,12 @@ class FunctionTranslator(ExprTranslator):
             return
         if not self._is_range(it):
             arr = self.expr(it)
+            if isinstance(arr.type, ListType) and arr.type.elem is not None:
+                decl = "const std::string&" if arr.type.elem == STR else arr.type.elem.cpp()
+                self.emit(f"for ({decl} {self.ident(s.target.id)} : {arr.code}) {{")
+                self._block(s.body)
+                self.emit("}")
+                return
             if arr.type != VEC_T:
                 raise Unsupported(s, "for-loops are supported over range(...) and over a Vec",
                                   "for a Mat, loop over range(A.shape[0]) and take rows")

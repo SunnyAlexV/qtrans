@@ -48,9 +48,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .translator import (ARRAYS_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
+from .translator import (ARRAYS_HEADER, LIST_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
                          library_tree, translate_file)
-from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, OptionalType, StructType, TupleType
+from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, ListType, OptionalType, StructType, TupleType
 
 # Which Python exceptions a given C++ exception class stands for.
 CPP_EXC_MATCHES = {
@@ -247,6 +247,7 @@ class FunctionCheck:
     atol: float = 0.0
     key: str = ""      # how the driver names it ("module:function" in a project)
     module: str = ""
+    py_name: str = ""  # the Python function (a version, "half(float)", names its function "half")
     shape_plans: list = field(default_factory=list)  # the non-square shapes it was tried on
     timeouts: int = 0  # cases left out because Python didn't finish one in time
 
@@ -406,6 +407,9 @@ def random_value(rng, t, n=3, shape=None):
     `if stance == "Long only"` branches run."""
     if t == STR:
         return str(rng.choice(_STRINGS))
+    if isinstance(t, ListType):  # a list of 0 to 6 elements (empty lists are where sum() is the int 0)
+        k = int(rng.integers(0, 7)) if rng.random() < 0.9 else 0
+        return [random_value(rng, t.elem) for _ in range(k)]
     if isinstance(t, StructType):
         info, cls = _CLASSES[t.name]
         for _ in range(30):
@@ -532,6 +536,8 @@ def _encode(v, t):
         return " ".join(_encode(getattr(v, f.name), f.type) for f in info.fields)
     if t == STR:
         return "S" + str(v).encode("utf-8").hex()
+    if isinstance(t, ListType):
+        return " ".join([str(len(v))] + [_encode(x, t.elem) for x in v])
     if isinstance(t, OptionalType):
         return "N" if v is None else _encode(v, t.inner)
     if t == RNG:
@@ -597,6 +603,12 @@ def _has_complex(v):
 
 
 def _py_value(v, t):
+    if isinstance(t, ListType):
+        if not isinstance(v, list):
+            raise TypeError(f"expected a list, got {type(v).__name__}")
+        if t.elem == FLOAT and any(type(x) is int for x in v):
+            raise TypeError("a list of floats holding an int (Python prints it as one)")
+        return [_py_value(x, t.elem) for x in v]
     if isinstance(t, StructType):
         if not _is_object(v) or type(v).__name__ != t.name:
             raise TypeError(f"expected a {t.name}, got {type(v).__name__}")
@@ -1024,6 +1036,14 @@ static void out(const std::string& s) {
     for (unsigned char c : s) std::printf("%02x", c);
 }
 static double num(const std::string& s) { return static_cast<double>(s.size()); }
+// a list arrives as its length, then its elements
+template <class T, class Fn>
+static std::vector<T> qtrans_list(Reader& r, Fn f) {
+    const long long n = std::strtoll(r.next().c_str(), nullptr, 10);
+    std::vector<T> v;
+    for (long long i = 0; i < n; ++i) v.push_back(f(r));
+    return v;
+}
 // an argument that may be None arrives as N
 template <class T, class Fn>
 static std::optional<T> qtrans_optional(Reader& r, Fn f) {
@@ -1038,6 +1058,13 @@ static double num(double x) { return x; }
 static double num(long long x) { return static_cast<double>(x); }
 static double num(bool x) { return x ? 1.0 : 0.0; }
 @@ARRAY_IO@@
+template <class T>
+static void out(const std::vector<T>& v) {
+    std::printf(" %lld", static_cast<long long>(v.size()));
+    for (const T& x : v) out(x);
+}
+template <class T>
+static double num(const std::vector<T>& v) { return v.empty() ? 0.0 : num(v[0]); }
 template <class T>
 static void out(const std::optional<T>& x) {
     if (x) out(*x); else std::printf(" N");
@@ -1200,7 +1227,7 @@ def _branch(key, sig, namespace) -> str:
     def read(i, p, volatile):
         if p.type == RNG:
             return f"qt::Rng p{i}(I(r));"
-        if isinstance(p.type, (OptionalType, StructType)):
+        if isinstance(p.type, (OptionalType, StructType, ListType)):
             return f"auto p{i} = {_reader(p.type, namespace)};"
         if volatile and p.type in _CTYPE:
             return f"volatile {_CTYPE[p.type]} p{i} = {_PARSE[p.type]}(r);"
@@ -1232,6 +1259,8 @@ def _reader(t, ns, r="r") -> str:
     if isinstance(t, OptionalType):
         inner = t.inner
         return (f"qtrans_optional<{inner.cpp()}>({r}, [](Reader& rr) {{ return {_reader(inner, ns, 'rr')}; }})")
+    if isinstance(t, ListType):
+        return f"qtrans_list<{t.elem.cpp()}>({r}, [](Reader& rr) {{ return {_reader(t.elem, ns, 'rr')}; }})"
     return f"{_PARSE[t]}({r})"
 
 
@@ -1311,6 +1340,9 @@ def _parse_cpp_line(line, out_t):
 
 
 def _parse_value(t, toks):
+    if isinstance(t, ListType):
+        n = int(next(toks))
+        return [_parse_value(t.elem, toks) for _ in range(n)]
     if isinstance(t, StructType):
         info, _ = _CLASSES[t.name]
         return {f.name: _parse_value(f.type, toks) for f in info.fields}
@@ -1480,6 +1512,14 @@ def _compare_values(pv, cv, t, rtol, atol):
     """-> (equal, rel_err, ulps)"""
     if t == VOID:
         return (True, 0.0, 0)
+    if isinstance(t, ListType):
+        if len(pv) != len(cv):
+            return (False, math.inf, 0)
+        worst = (True, 0.0, 0)
+        for a, b in zip(pv, cv):
+            eq, r, u = _compare_values(a, b, t.elem, rtol, atol)
+            worst = (worst[0] and eq, max(worst[1], r), max(worst[2], u))
+        return worst
     if isinstance(t, TupleType):
         worst = (True, 0.0, 0)
         for a, b, et in zip(pv, cv, t.elts):
@@ -1918,10 +1958,15 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
             fc = FunctionCheck(name, rtol=f_rtol, atol=f_atol)
             fc.key = name if single else f"{module}:{name}"
             fc.module = module
-            fn = getattr(pymod, name)
+            fc.py_name = sig.name
+            fn = getattr(pymod, sig.name)
             defaults = [p.default for p in inspect.signature(fn).parameters.values()]
-            for args in given.get(name, []):
+            for args in given.get(sig.name, []):
                 args = list(args)
+                if getattr(sig, "overloaded", False) and any(
+                        isinstance(v, bool) != (p.type == BOOL) or (isinstance(v, int) and not isinstance(v, bool)) != (p.type == INT)
+                        for v, p in zip(args, sig.params) if p.type in (INT, FLOAT, BOOL)):
+                    continue  # a hand-picked case for another version (an int case, a float version)
                 # cases may leave out trailing arguments that have defaults
                 for i in range(len(args), len(sig.params)):
                     if defaults[i] is inspect.Parameter.empty:
@@ -1970,6 +2015,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
     if not (build / "qtrans_runtime.hpp").exists():
         shutil.copy(RUNTIME_HEADER, build / "qtrans_runtime.hpp")
     shutil.copy(PRINT_HEADER, build / "qtrans_print.hpp")
+    shutil.copy(LIST_HEADER, build / "qtrans_list.hpp")
     for m, r in project.modules.items():  # the driver includes each module's header, programs' too
         if not (build / f"{m}.hpp").exists():
             (build / f"{m}.hpp").write_text(r.header, encoding="utf-8")
@@ -2026,32 +2072,32 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
             c.printed_differs = True
         if c.unstable:
             continue  # a linalg operation broke its stability bound: a failure, whatever the values
-        if c.outcome == "mismatch" and python_went_complex(getattr(pymods[fc.module], fc.name), c.args, sig):
+        if c.outcome == "mismatch" and python_went_complex(getattr(pymods[fc.module], fc.py_name or fc.name), c.args, sig):
             # x ** y with x < 0 and fractional y went complex in Python and NaN in C++ before
             # this result: the documented difference, wherever it shows (or doesn't) in the value
             c.outcome = "known"
         if c.outcome == "mismatch" and c.py[0] == "ok" and c.cpp[0] == "ok":
-            c.sensitivity = python_sensitivity(getattr(pymods[fc.module], fc.name), c, sig, output_type(sig),
-                                               nudge_rng, normwise_too=fc.name in normwise)
+            c.sensitivity = python_sensitivity(getattr(pymods[fc.module], fc.py_name or fc.name), c, sig, output_type(sig),
+                                               nudge_rng, normwise_too=(fc.py_name or fc.name) in normwise)
             if c.rel_err <= 100 * c.sensitivity:
                 c.outcome = "illcond"
-        elif c.outcome == "mismatch" and fc.name in linalg and (c.py[0] == "ok") != (c.cpp[0] == "ok") \
+        elif c.outcome == "mismatch" and (fc.py_name or fc.name) in linalg and (c.py[0] == "ok") != (c.cpp[0] == "ok") \
                 and "ValueError" in (c.py[1] if c.py[0] == "exc" else c.cpp[1]):
             # one side found the matrix singular (LinAlgError is a ValueError): ill-conditioned
             # when Python's own verdict changes under a rounding-sized nudge
-            fn = getattr(pymods[fc.module], fc.name)
-            if python_flips(fn, c, sig, nudge_rng, normwise_too=fc.name in normwise) \
+            fn = getattr(pymods[fc.module], fc.py_name or fc.name)
+            if python_flips(fn, c, sig, nudge_rng, normwise_too=(fc.py_name or fc.name) in normwise) \
                     or (_singular_verdict(c) and python_near_singular(fn, c, sig)):
                 c.sensitivity = math.inf
                 c.outcome = "illcond"
-        if c.outcome == "mismatch" and fc.name in linalg and c.py[0] == "ok" and c.cpp[0] == "ok" \
+        if c.outcome == "mismatch" and (fc.py_name or fc.name) in linalg and c.py[0] == "ok" and c.cpp[0] == "ok" \
                 and _nonfinite_ties(c.py[1], c.cpp[1], fc.rtol, fc.atol):
             # differing elements are inf / -inf / NaN on both sides, all else agrees: a value that
             # is zero up to LAPACK's or Eigen's rounding (1e-16 vs exactly 0) was divided by
             # zero, so its sign decided the result. Rounding decides it: ill-conditioned.
             c.sensitivity = math.inf
             c.outcome = "illcond"
-        if c.outcome == "mismatch" and fc.name in linalg and edge_inputs(c.args):
+        if c.outcome == "mismatch" and (fc.py_name or fc.name) in linalg and edge_inputs(c.args):
             # matrix products / LAPACK on inf, NaN, subnormals or values near overflow: NumPy's
             # BLAS and Eigen add in different orders, so inf - inf -> NaN, or an intermediate
             # overflow, can happen on one side only. Both are correct; listed, never hidden.
@@ -2069,7 +2115,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                            default=None)
                 if case is None:
                     continue
-                fn = getattr(pymods[module], fc.name)
+                fn = getattr(pymods[module], fc.py_name or fc.name)
                 fc.py_ns = _bench_python(fn, _call_args(case.args, sigs[fc.name]))
                 enc = " ".join(_encode(v, p.type) for v, p in zip(case.args, sigs[fc.name].params))
                 r = subprocess.run([str(exe)], input=f"BENCH {fc.key} {enc}\n", capture_output=True, text=True,
@@ -2086,7 +2132,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         if result.program is not None:  # a program: run it both ways and compare what it prints
             src = build / f"{module}.cpp"
             src.write_text(result.program, encoding="utf-8")
-            for h in (RUNTIME_HEADER, PRINT_HEADER):
+            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER):
                 shutil.copy(h, build / h.name)
             prog_system = list(system)
             if "qtrans_arrays.hpp" in result.program or "qtrans_random.hpp" in result.program:

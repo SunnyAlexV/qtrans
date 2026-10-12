@@ -62,7 +62,7 @@ strong evidence, but no finite set of cases can rule out a difference elsewhere.
   `"...".format()`, `%` formatting and `round(x, n)` write exactly what Python writes: floats as
   Python's shortest repr, format specs by CPython's rules, arrays laid out as NumPy lays them out,
   NumPy scalars as `np.float64(...)`. Functions written without type hints take their types
-  from how the file calls them. `qtrans verify` runs the file with Python and the program it
+  from how the file calls them; lists become `std::vector`s; objects print as Python prints them. `qtrans verify` runs the file with Python and the program it
   became, and compares what each printed, character for character, and the exit status.
   See [Programs](#programs-a-script-becomes-a-c-program).
 
@@ -158,7 +158,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (449 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (471 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -329,13 +329,31 @@ x     |1234.568|42 2.67
   type every call in the file passes it (and its default's), a return without one the type of
   what the body returns, and the report says so (`types from how the file calls it: S: float,
   K: float, -> float`). A function that never returns a value is `-> None`. Where the calls
-  disagree (`half(7)` and `half(7.0)`: Python computes `7 // 2` and `7.0 // 2` differently, a
-  C++ parameter has one type) it is refused with both lines named; a function no call types is
-  refused, with the hint to annotate it.
+  disagree (`half(7)` and `half(7.0)`: Python computes `7 // 2` and `7.0 // 2` differently),
+  there is one C++ version for each kind of call, overloads of one name (`long long
+  half(long long x)`, `double half(double x)`), each verified on its own and bound to Python as
+  one function. A function no call types is refused, with the hint to annotate it.
 - A variable that starts as an int and later holds floats (`total = 0`, then `total += x`) is
   a `double`; Python prints it as `0` until the first float arrives, as a float after. Where
-  printing it could show the int, it is refused with the hint `total = 0.0` (where the loop
-  surely ran, over a literal list or `range(3)`, it is printed).
+  that can show, a flag sits beside it, `bool total_is_int`, set where Python's type changes,
+  and `qt::py::str(total, total_is_int)` prints it as Python would (where the float surely came
+  first, over a literal list or `range(3)`, there is no flag). The same for `sum(xs)` of a list
+  that may be empty (the int 0). A function returning `0` on one path and a float on another
+  is still refused where its result is printed: the hint is `return 0.0`.
+- Lists of floats, ints or strings are `std::vector`s: literals, `[]` typed by what is
+  appended, `append`/`extend`/`insert`/`pop`/`index`/`count`/`copy`/`sort`/`reverse`/`clear`,
+  `len`, `sum` (CPython's compensated float sum from 3.12), `min`, `max`, `sorted`,
+  `list(range(n))`, indexes (negative ones, IndexError) and slices with Python's rules, `+`,
+  `*`, `in`, loops, list comprehensions, `list[float]` parameters and returns, module-level
+  list constants, and printing as Python prints them. A list holding several types (`[1, 2.5]`)
+  or lists of lists are refused, and so is any sharing a copy would break: `b = a` where
+  either is then changed, a function changing a list passed to it, a loop changing what it
+  goes through (the hints: `list(a)` for a copy).
+- Objects print as Python prints them: a dataclass or NamedTuple as `Option(strike=100.0,
+  expiry=0.5, kind='call')` (fields with `repr=False` left out, nested objects included), a
+  class with `__repr__` / `__str__` through those methods, translated. Where a field may hold a
+  NumPy number (its repr would be `np.float64(...)`) it is refused with the line that puts it
+  there; a plain class without `__repr__` is refused, since Python shows its memory address.
 - Nothing is left out quietly: a top-level line that isn't translated says why, at its line,
   in the report, `qtrans explain` and `qtrans live`. Using a function before the line that
   defines it is refused (Python raises `NameError` there).
@@ -1065,12 +1083,15 @@ Each is listed in the per-module report next to the functions it affects.
 
 - **Types:** `float`, `int`, `bool`, `str`, `Vec`, `Mat`, `np.random.Generator`, `tuple[...]`
   of those, `X | None` (also `Optional[X]`) for a number or array, `@dataclass` and `NamedTuple`
-  classes, and `-> None`.
-  Parameters and returns are annotated, or typed from how the file calls the function; locals
-  are inferred.
+  classes, `list[...]` of floats, ints or strings, and `-> None`.
+  Parameters and returns are annotated, or typed from how the file calls the function (one
+  version per kind of call where calls differ); locals are inferred.
 - **Programs:** top-level code and `if __name__ == "__main__":` as `int main()`; `print`,
   f-strings, `str`, `repr`, `format`, `"...".format`, `%` formatting, `round(x, n)`, `sys.exit`,
-  exception messages built with any of them.
+  exception messages built with any of them; printing objects (dataclass repr, `__repr__`,
+  `__str__`).
+- **Lists:** `list[float]`, `list[int]`, `list[str]` as `std::vector` (see
+  [Programs](#programs-a-script-becomes-a-c-program) for what is supported and refused).
 - **Statements:** assignment (including tuple unpacking, swaps, `a[i] = x`, `a[i:j] = v`,
   `A[i] = row`, `A[:, j] = col`), augmented assignment, `if`/`elif`/`else`, `while`,
   `for` over `range(...)`, a `Vec` or a literal list, `break`, `continue`, `return`, `raise` with a
@@ -1156,7 +1177,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               449 tests: generated text, refusals, compiled semantics, every example,
+tests/               471 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1184,9 +1205,9 @@ run_examples.py      press-Run entry point
    `qtrans explain` (Python and C++ side by side, with reasons), `inspect` and `doctor`
    ([Python and C++ side by side](#python-and-c-side-by-side)). **0.10 so far**: `qtrans live`, the
    editor with the C++ updating as you type; programs, with Python's printing reproduced
-   exactly, and types taken from how a script calls its functions
-   ([Programs](#programs-a-script-becomes-a-c-program)). **Next**: lists; the editor inside VS
-   Code; traceable headers (source hash, Python line references, CMake); a reproducible
+   exactly, types taken from how a script calls its functions, lists, and objects printed
+   ([Programs](#programs-a-script-becomes-a-c-program)). **Next**: `enumerate`/`zip` loops and
+   dictionaries; the editor inside VS Code; traceable headers (source hash, Python line references, CMake); a reproducible
    benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the

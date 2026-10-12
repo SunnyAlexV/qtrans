@@ -7,6 +7,9 @@
 #pragma once
 
 #include <cmath>
+#include <vector>
+#include <string>
+#include "qtrans_list.hpp"  // lists, and print(), str(), repr(), format() as Python writes them
 
 namespace bl_config {
 
@@ -25,5 +28,6 @@ inline const double DEFAULT_TRAIN_FRAC = 0.45;  // leaves a long enough out-of-s
 inline const double DEFAULT_VIEW_CONFIDENCE = 75.0;  // Idzorek confidence: tilt 75% of the way from market to view
 inline const double DEFAULT_VOL_TARGET_PCT = 12.0;  // absolute-mode target, when the user picks a fixed number
 inline const long long DEFAULT_VOL_TARGET_FRAC_PCT = 75;  // relative-mode default: run at 75% of the book's own risk
+inline const std::vector<std::string> VIEW_TYPES = {"Absolute", "Relative"};
 
 }  // namespace bl_config

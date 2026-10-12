@@ -40,4 +40,4 @@ These only matter on inputs where Python would raise an exception or overflow.
 
 ## Module-level notes
 
-- line 96: `_GRID` not translated: lists are not supported in stage 1
+- line 96: `_GRID` not translated: a list of tuple[float, float, float, float, float, float] values is not supported

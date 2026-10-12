@@ -24,6 +24,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .report import FunctionReport
 from .translator import PROGRAM, VERSION
 
 # (pattern in the C++ of a row, kind, why). The pattern is what the reason is about, so a reason
@@ -143,6 +144,24 @@ RULES = [
      "round() of a NumPy float64 is np.round: x times 10^n, rounded half to even, divided by 10^n, "
      "which differs from Python's round now and then (round(np.float64(1.85), 1) is 1.8)"),
     (r"std::to_string\(", "printing", "an int in decimal, as Python writes it"),
+    (r"\b\w+_is_int\b", "int or float",
+     "this variable holds an int in some assignments and a float in others: the flag beside it says "
+     "which Python holds now, so it prints as Python prints it (0, or 0.5)"),
+    (r"qt::py::item\(", "lists", "a list index: negative counts from the end, out of range raises IndexError, "
+                                "as in Python"),
+    (r"qt::py::slice\(", "lists", "a list slice with Python's rules: ends clip, negatives count from the end, "
+                                 "any step; a new list"),
+    (r"qt::py::sum(_left)?\(", "lists",
+     "sum() as CPython adds: from the int 0, floats compensated (Neumaier) from Python 3.12, left to right "
+     "before"),
+    (r"qt::py::(min|max)\(", "lists", "min() / max() of a list: the first element no later one beats, as "
+                                     "Python picks; ValueError when empty"),
+    (r"qt::py::(sorted|sort)\(", "lists", "a stable sort, as Python's (equal elements keep their order)"),
+    (r"qt::py::contains\(", "lists", "`x in xs`: compared with =="),
+    (r"\[&\] \{", "lists", "a list comprehension: a small function run on the spot builds the list, its loop "
+                          "variable local to it, as in Python 3"),
+    (r"const std::vector<[^>]*>&", "lists", "a list is passed by const reference: the function never changes "
+                                           "it (one that would is refused, as the caller's list would change in Python)"),
     (r"std::cerr <<", "printing", "print(..., file=sys.stderr)"),
 ]
 _COMPILED = [(re.compile(p), k, w) for p, k, w in RULES]
@@ -312,10 +331,30 @@ def explain_result(result, source: str, filename: str = "<input>") -> ModuleView
                     last -= 1
         key = node.name if owner is None and not is_class else None
         rep = reports.get(qual) if is_class else reports.get(node.name) if owner is None else reports.get(f"class {owner.name}")
+        versions = [r for n, r in reports.items() if owner is None and not is_class and n.startswith(node.name + "(")]
+        if rep is None and versions:  # one C++ version per kind of call: shown together
+            bad = next((r for r in versions if not r.translated), None)
+            rep = bad or FunctionReport(node.name, node.lineno, True, notes=[n for r in versions for n in r.notes])
         translated = bool(rep and rep.translated) and any(
             s is not None and node.lineno <= s[0] <= last for s in line_map)
         notes = (result.line_notes or {}).get(node.name if owner is None else f"{owner.name}.{node.name}", []) \
             if translated else []
+        if translated and versions:
+            notes = [x for n, v in (result.line_notes or {}).items() if n.startswith(node.name + "(") for x in v]
+        if translated and versions:
+            # one view per version, each with only its own C++ (the k-th definition of the name)
+            starts = [i for i, l in enumerate(header_lines)
+                      if re.match(rf"inline .*\b{re.escape(node.name)}\(", l) and l.rstrip().endswith("{")]
+            for k, vrep in enumerate(versions):
+                if k >= len(starts):
+                    break
+                end = next((j for j in range(starts[k], len(header_lines)) if header_lines[j] == "}"), len(header_lines) - 1)
+                vmap = [s if starts[k] <= i <= end else None for i, s in enumerate(line_map)]
+                vnotes = (result.line_notes or {}).get(vrep.name, [])
+                views.append(FunctionView(vrep.name, first, last, True,
+                                          _rows_for(src_lines, header_lines, vmap, first, last, vnotes),
+                                          notes=list(vrep.notes)))
+            continue
         if translated:
             rows = _rows_for(src_lines, header_lines, line_map, first, last, notes)
             view = FunctionView(qual, first, last, True, rows, notes=list(rep.notes) if rep else [])

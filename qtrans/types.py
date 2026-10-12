@@ -8,6 +8,7 @@ admits the types quant pricing code actually uses for scalars:
     int      long long   (64-bit; Python ints are unbounded, see README)
     float    double      (both are IEEE-754 binary64, so arithmetic agrees bit for bit)
     tuple[...]  std::tuple<...>   (for functions returning several values, e.g. Greeks)
+    list[...]   std::vector<...>  (a list of floats, ints or strings)
     Vec      qt::Vec     (Eigen::ArrayXd; 1-D float64 array)            stage 2
     Mat      qt::Mat     (row-major Eigen::ArrayXXd; 2-D float64 array) stage 2
     None     void        (return type only)
@@ -135,6 +136,22 @@ class StructType:
 
 
 @dataclass(frozen=True)
+class ListType:
+    """A Python list of one element type (float, int or str) as std::vector. elem None: an
+    empty list whose element type isn't known yet (`xs = []`, then xs.append(2.5))."""
+    elem: object
+
+    def cpp(self) -> str:
+        return f"std::vector<{self.elem.cpp() if self.elem is not None else 'double'}>"
+
+    def zero(self) -> str:
+        return "{}"
+
+    def __str__(self) -> str:
+        return f"list[{self.elem if self.elem is not None else '?'}]"
+
+
+@dataclass(frozen=True)
 class NoneValueType:
     """The value None, before it is stored anywhere (it then becomes part of an OptionalType)."""
 
@@ -204,6 +221,11 @@ def join(a, b):
     if isinstance(a, TupleType) and isinstance(b, TupleType) and len(a.elts) == len(b.elts):
         elts = tuple(join(x, y) for x, y in zip(a.elts, b.elts))
         return None if None in elts else TupleType(elts)
+    if isinstance(a, ListType) and isinstance(b, ListType):
+        # no widening: a list holding ints and floats keeps each as it is in Python (prints 1, 2.5)
+        if a.elem is None or b.elem is None:
+            return a if b.elem is None else b
+        return a if a.elem == b.elem else None
     return None
 
 
@@ -221,6 +243,8 @@ def assignable(target, value) -> bool:
         return _RANK[value.name] <= _RANK[target.name]
     if isinstance(target, (ArrayType, RngType)) or isinstance(value, (ArrayType, RngType)):
         return False
+    if isinstance(target, ListType) and isinstance(value, ListType):
+        return value.elem is None or value.elem == target.elem
     if isinstance(target, TupleType) and isinstance(value, TupleType):
         return len(target.elts) == len(value.elts) and all(
             assignable(t, v) for t, v in zip(target.elts, value.elts)

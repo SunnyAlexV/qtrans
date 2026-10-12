@@ -317,3 +317,14 @@ def test_what_a_compiled_function_prints_goes_to_python_stdout(built, tmp_path, 
         r = mod.greet(3, 2.5)
         print("after")
     assert r == 7.5 and out.getvalue() == "before\nhello 3 0.8333333333333334\nafter\n" and err.getvalue() == "2.50\n"
+
+
+def test_versions_of_one_function_are_one_python_function(built, tmp_path):
+    """Called with ints and with floats in the file: one compiled version per kind, bound as
+    overloads of one name, and an int argument reaches the int version (half(7) is 3, an int)."""
+    f = tmp_path / "versions.py"
+    f.write_text("def half(x):\n    return x // 2\n\n\ndef use() -> float:\n    return half(7) + half(7.5)\n",
+                 encoding="utf-8")
+    mod = built(f).load()
+    assert repr(mod.half(7)) == "3" and repr(mod.half(7.0)) == "3.0" and repr(mod.half(-7.5)) == "-4.0"
+    assert _check(built, f, n=30).ok

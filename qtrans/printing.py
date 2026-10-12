@@ -24,7 +24,8 @@ from dataclasses import dataclass
 from .core import P_ADD, P_ATOM, Expr, cpp_string, wrap
 from .errors import Unsupported
 from .origins import NP, PY
-from .types import BOOL, FLOAT, INT, NONE, RNG, STR, VOID, MaskType, OptionalType, Scalar, StructType, TupleType, is_array
+from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
+                    TupleType, is_array)
 
 _SAMPLE = {"float": 1.5, "int": 7, "bool": True}  # a value of each type, to try a format spec on
 _PERCENT = re.compile(r"%(?:\((\w*)\))?([-+ 0#]*)(\*|\d+)?(?:\.(\*|\d*))?[hlL]?([diouxXeEfFgGcrsa%])")
@@ -65,6 +66,21 @@ def _may_throw(code: str) -> bool:
     return bool(re.search(r"[\w:]\(", _SAFE_CALL.sub(" (", code)))
 
 
+def _nonempty(node) -> bool:
+    """A list expression that surely has an element: [a, ...], or one joined (+) with it."""
+    if isinstance(node, ast.List):
+        return bool(node.elts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _nonempty(node.left) or _nonempty(node.right)
+    if isinstance(node, ast.IfExp):
+        return _nonempty(node.body) and _nonempty(node.orelse)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):  # [x] * 3
+        for a, b in ((node.left, node.right), (node.right, node.left)):
+            if _nonempty(a) and isinstance(b, ast.Constant) and isinstance(b.value, int) and b.value > 0:
+                return True
+    return False
+
+
 def _stream_lit(text):
     return {"\n": r"'\n'", " ": "' '"}.get(text, cpp_string(text))
 
@@ -78,6 +94,48 @@ class TextOps:
         return self.mod.origins.function(fdef, getattr(self, "sig", None)).of(node)
 
     # --- a value as text ----------------------------------------------------------------
+    def struct_text(self, node, e, kind) -> Piece:
+        """str(obj) / repr(obj): the class's own __str__ / __repr__ (translated as methods), or the
+        repr a dataclass or NamedTuple gets (Point(x=1.0, y=2.0)), generated where it is used."""
+        from .classes import auto_repr
+        info = self.mod.classes.get(e.type.name)
+        if info is None:
+            raise Unsupported(node, f"showing a {e.type} is not supported")
+        for method in (["__str__", "__repr__"] if kind == "str" else ["__repr__"]):
+            if method in info.methods:
+                key = info.methods[method].key
+                if key in self.mod.rejected:
+                    raise Unsupported(node, f"{info.name}.{method} could not be translated: "
+                                            f"{self.mod.rejected[key].message}")
+                c = f"{wrap(e, P_ATOM)}.{'str' if method == '__str__' else 'repr'}()"
+                return Piece(code=c, stream=c, raises=True)
+        if not auto_repr(info):
+            raise Unsupported(node, f"Python shows a {info.name} (a class with no __repr__) by its memory address, "
+                                    "which differs on every run", f"give {info.name} a __repr__, or print its fields")
+        self._need_repr(node, info)
+        c = f"{wrap(e, P_ATOM)}.repr()"
+        return Piece(code=c, stream=c)
+
+    def _need_repr(self, node, info, seen=None):
+        """The dataclass repr of info (and of the dataclasses inside it) is generated, if it can be exact."""
+        from .classes import auto_repr
+        seen = seen if seen is not None else set()
+        if info.name in seen:
+            return
+        seen.add(info.name)
+        if "__repr__" not in info.methods:
+            problem = self.mod.struct_repr_problem(info)
+            if problem:
+                raise Unsupported(node, problem[1], "convert it with float(...) where it goes in")
+            self.mod.__dict__.setdefault("repr_needed", set()).add(info.name)
+        for f in info.fields:
+            if f.repr and isinstance(f.type, StructType):
+                inner = self.mod.classes[f.type.name]
+                if "__repr__" not in inner.methods and not auto_repr(inner):
+                    raise Unsupported(node, f"field '{f.name}' holds a {inner.name}, which Python shows by its memory "
+                                            "address", f"give {inner.name} a __repr__")
+                self._need_repr(node, inner, seen)
+
     def _refuse_text(self, node, e, what):
         src = ast.unparse(node)
         if isinstance(e.type, StructType):
@@ -89,6 +147,15 @@ class TextOps:
             raise Unsupported(node, f"{what} of a boolean array is not translated yet",
                               "print the array itself, or .sum() / .any()")
         raise Unsupported(node, f"{what} of a {e.type} value is not supported")
+
+    def _flag_cond(self, node, e):
+        """The flag condition for a float value that may be a Python int, if it has one."""
+        if not isinstance(node, ast.AST):
+            return None
+        cond = self.int_cond(node)
+        if not isinstance(cond, str) or cond == "true":
+            return None
+        return cond
 
     def _int_or_float(self, node, e, what):
         """A float in C++ that may be a Python int: a local that starts as `total = 0` and later
@@ -108,7 +175,7 @@ class TextOps:
                 self._refuse_int(node, what, f"{node.func.id}() returns an int as element {hit} on some path")
         for n in nodes:
             why = self.maybe_int(n)
-            if why:
+            if why and not isinstance(self.int_cond(n), str):
                 self._refuse_int(node, what, why)
 
     def _refuse_int(self, node, what, why):
@@ -118,18 +185,64 @@ class TextOps:
                                 "Python shows as 0 where the C++ double shows 0.0",
                           f"{start}, or format it with a float spec (:.2f, :g)")
 
+    def int_cond(self, node):
+        """Whether Python holds an int in this value, as C++: "true", None (a float, surely), a
+        condition on the flags of int-or-float locals ("total_is_int"), or False when it depends
+        on the run in a way that can't be written down (a function that returns 0 on one path)."""
+        flagged = getattr(self, "flagged", set())
+        t = self._quiet_type(node)
+        if t in (INT, BOOL):
+            return "true"
+        if t != FLOAT:
+            return None
+        if isinstance(node, ast.Name):
+            if node.id in flagged:
+                return self.flag_name(node.id)
+            return False if self.maybe_int(node) else None
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Div):
+                return None
+            a, b = self.int_cond(node.left), self.int_cond(node.right)
+            if a is False or b is False:
+                return False
+            if a is None or b is None:
+                return None
+            if a == "true":
+                return b
+            if b == "true":
+                return a
+            return f"{a} && {b}"
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            return self.int_cond(node.operand)
+        if self._empty_sum(node):  # sum([]) is the int 0
+            return f"{self.ident(node.args[0].id)}.empty()"
+        return False if self.maybe_int(node) else None
+
+    def _empty_sum(self, node) -> bool:
+        """sum(xs) of a list of floats, xs a variable: the int 0 when xs is empty, a float otherwise."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "sum"
+                and len(node.args) == 1 and isinstance(node.args[0], ast.Name) and not self.is_variable("sum")
+                and not _nonempty(node.args[0])):
+            return False
+        t = self._quiet_type(node.args[0])
+        return isinstance(t, ListType) and t.elem == FLOAT
+
     def maybe_int(self, node):
         """Why a value the C++ holds as a double may be a Python int, or None if it can't be."""
         widened = getattr(self, "widened", set())
         maybe = getattr(self.mod, "maybe_int", set())
         if isinstance(node, ast.Name):
-            if node.id in widened and not self._surely_float(node.id):
+            if node.id in widened and node.id not in getattr(self, "flagged", ()) and not self._surely_float(node.id):
                 return f"'{node.id}' is assigned an int, or a value that can be one"
             return None
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not self.is_variable(node.func.id):
             f = node.func.id
             if (f, None) in maybe:
                 return f"{f}() returns an int on some path"
+            if f == "sum" and node.args and not _nonempty(node.args[0]):
+                t = self._quiet_type(node.args[0])
+                if isinstance(t, ListType) and t.elem == FLOAT:
+                    return "sum() of an empty list is the int 0"
             if f == "abs" and node.args:
                 return self.maybe_int(node.args[0])
             if f in ("min", "max"):
@@ -275,6 +388,10 @@ class TextOps:
         if t == FLOAT:
             if isinstance(e.value, float):
                 return _lit(repr(e.value))
+            cond = self._flag_cond(node, e)
+            if cond:  # an int or a float in Python, as the run went: written as the one it is
+                c = f"qt::py::str({e.code}, {cond})"
+                return Piece(code=c, stream=c)
             c = f"qt::py::str({e.code})"
             return Piece(code=c, stream=c)
         if t == BOOL:
@@ -283,8 +400,10 @@ class TextOps:
         if isinstance(t, OptionalType) and isinstance(t.inner, Scalar) or is_array(t):
             c = f"qt::py::str({e.code})"
             return Piece(code=c, stream=c)
-        if isinstance(t, TupleType):
+        if isinstance(t, TupleType) or isinstance(t, ListType):
             return self.repr_piece(node, e)
+        if isinstance(t, StructType):
+            return self.struct_text(node, e, "str")
         self._refuse_text(node, e, "printing")
 
     def repr_piece(self, node, e=None) -> Piece:
@@ -313,6 +432,23 @@ class TextOps:
             return Piece(code=c, stream=c)
         if is_array(t):
             c = f"qt::py::repr({e.code})"
+            return Piece(code=c, stream=c)
+        if isinstance(t, StructType):
+            return self.struct_text(node, e, "repr")
+        if isinstance(t, ListType):
+            if e.value == []:
+                return _lit("[]")
+            numpy = False
+            if t.elem in (FLOAT, INT):
+                o = self.origin(node)
+                eo = o[1] if isinstance(o, tuple) and o[0] == "list" else None
+                if eo not in (PY, NP):
+                    raise Unsupported(node, self._origin_message(node, "the list's elements"),
+                                      "convert them with float(...) / int(...) as they go in")
+                numpy = eo == NP
+                if t.elem == FLOAT and self.maybe_int(node):
+                    raise Unsupported(node, "an element of the list may be a Python int", "0.0 rather than 0")
+            c = f"qt::py::repr({e.code}{', true' if numpy else ''})"
             return Piece(code=c, stream=c)
         if isinstance(t, TupleType):
             o = self.origin(node)
@@ -367,6 +503,9 @@ class TextOps:
             spec_code = self.join_code(spec)
         arg = self.as_string(e) if t == STR else self.as_type(e, t) if isinstance(t, Scalar) else e
         c = f"qt::py::format({arg.code}, {spec_code})"
+        cond = self._flag_cond(node, e) if t == FLOAT and not (isinstance(spec, str) and spec[-1:] in tuple("eEfFgG%")) else None
+        if cond:
+            c = f"qt::py::format({arg.code}, {spec_code}, {cond})"
         # None with a spec raises TypeError, and a spec made at run time may be one Python rejects
         raises = isinstance(t, OptionalType) or not isinstance(spec, str) or _may_throw(arg.code)
         if raises:
