@@ -99,6 +99,16 @@ def main(argv=None) -> int:
     lv.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
     lv.add_argument("--no-browser", action="store_true", help="don't open the browser, just print the address")
 
+    ex = sub.add_parser("export", help="a C++ package: CMake target, headers, programs and golden tests (no Python needed)")
+    ex.add_argument("files", nargs="+", help="Python files, or one folder")
+    ex.add_argument("-o", "--out", required=True, help="the package folder")
+    ex.add_argument("--name", default=None, help="the CMake target / package name (default: the first file's)")
+    ex.add_argument("--cases", type=int, default=50, help="golden cases per function (default 50)")
+    ex.add_argument("--seed", type=int, default=0)
+    ex.add_argument("--no-golden", action="store_true", help="don't verify and record golden tests")
+    ex.add_argument("--no-build", action="store_true", help="don't build and test the package with CMake here")
+    ex.add_argument("--cxx", default=None, help="C++ compiler for the verification")
+
     ov = sub.add_parser("override", help="your own C++ for a function: start it, --accept it, --remove it, --list")
     ov.add_argument("file", help="the Python file")
     ov.add_argument("function", nargs="?", default=None, help="the function (omit with --list)")
@@ -107,6 +117,17 @@ def main(argv=None) -> int:
     ov.add_argument("--list", action="store_true", help="every override of the file, and whether it is up to date")
 
     args = ap.parse_args(argv)
+    if args.cmd == "export":
+        from .export import export
+        try:
+            lines = export(_inputs(args.files), args.out, name=args.name, cases=args.cases, seed=args.seed,
+                           golden=not args.no_golden, build=not args.no_build, compiler=args.cxx)
+        except RuntimeError as e:
+            _print(f"qtrans export: {e}")
+            return 1
+        for line in lines:
+            _print(line)
+        return 1 if any("FAILED" in line for line in lines) else 0
     if args.cmd == "override":
         from .overrides import OverrideError, command
         try:

@@ -67,6 +67,10 @@ strong evidence, but no finite set of cases can rule out a difference elsewhere.
   `qtrans verify` runs the file with Python and the program it became, and compares what each
   printed, character for character, and the exit status.
   See [Programs](#programs-a-script-becomes-a-c-program).
+- **0.10, export:** `qtrans export` writes a CMake package (target, install rules, package
+  config) whose tests check the C++ against Python's own recorded results, with no Python
+  needed; the floating-point flags exactness depends on travel with the target, and fast-math
+  is refused at compile time. See [Export](#export-a-c-package-with-its-own-tests).
 - **0.10, your own C++:** a C++ engineer can replace any function with hand-written C++ (or
   write one qtrans can't translate). It is kept across re-translations, checked against the
   Python and against qtrans's own translation on the same inputs, and flagged the moment the
@@ -165,7 +169,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (527 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (532 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -698,6 +702,39 @@ and they become macros defined in the header for GCC, Clang and MSVC (where `QT_
 nothing). Hints that could change a result are refused with the reason, at their line:
 `fast-math`, `simd` / `vectorize` and `parallel` (sums in another order), `ivdep`, `restrict`;
 so are unknown ones, since a typo shouldn't be ignored quietly.
+
+## Export: a C++ package with its own tests
+
+`qtrans export pricing.py -o pricing_cpp` (or a folder, for a project) writes what a C++ team
+drops into their build, and builds and tests it with CMake before it says it is done:
+
+```
+pricing_cpp/
+  CMakeLists.txt        header-only target qtrans::pricing, install rules, package config
+  include/pricing/      the generated headers and the qtrans runtime headers they include
+  src/                  a script's program (its int main()), one executable each
+  tests/golden.txt      Python's own results on the verify inputs, for ctest
+  reports/              what translated, what didn't and why
+```
+
+- **Exactness travels with the target.** C++17, and floating-point arithmetic kept as written:
+  `-ffp-contract=off` (`/fp:precise` on MSVC), so a consumer's build can't fuse `a*b + c` into
+  one rounding and drift from Python. Every generated header also refuses to compile under
+  fast-math (`-ffast-math`, `/fp:fast`), with the reason.
+- **Golden tests that need no Python.** `qtrans verify` runs first; every case it found matching
+  is recorded with Python's result as exact hex floats, and `ctest` checks the C++ against them
+  on whatever machine and compiler it runs, with the tolerance verify used. A program's exact
+  output and exit status are recorded too, and compared character for character. Cases verify
+  called ill-conditioned or a known difference are left out, and the file says how many.
+- `add_subdirectory(pricing_cpp)` or `find_package(pricing)` after `cmake --install`; Eigen is
+  found where the package is used (its CMake package, or `-DPRICING_EIGEN_DIR=<folder>`).
+- Each header names the Python it came from and its SHA-256; what isn't in the package is listed,
+  with the reason, when the export runs.
+
+The Black-Litterman app's four modules export as one package: 1,099 cases of Python's results
+recorded, built with CMake, and all 1,099 pass `ctest`; installed, another CMake project uses it
+through `find_package(bl_app)` (`python tools/export_bl_app.py`; the functions that don't
+translate yet are listed by the export, each with its reason).
 
 ## Projects: several modules
 
@@ -1254,6 +1291,7 @@ qtrans/
   explain.py         Python next to its C++, row by row, with reasons (text, HTML, JSON)
   overrides.py       your own C++ for a function: the overrides file, fingerprints, qtrans override
   hints.py           speed hints written in the Python (# qtrans: unroll 4), as portable macros
+  export.py          qtrans export: the CMake package and its golden tests
   live.py, live_page.html  qtrans live: the editor page and its local server
   inspect_.py, doctor.py   what qtrans will make of a file; whether a machine is ready
   bind.py            pybind11 bindings: generate, build, check against Python
@@ -1267,7 +1305,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               527 tests: generated text, refusals, compiled semantics, every example,
+tests/               532 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1300,9 +1338,11 @@ run_examples.py      press-Run entry point
    Your own C++ for a function, verified against the Python and against qtrans's translation
    on the same inputs, kept across re-translations and flagged when the Python changes; speed
    hints in the Python ([Your own C++](#your-own-c-for-a-function)).
-   **Next**: CMake export; then lists of tuples,
-   string methods, `key=`; the editor inside VS Code; traceable headers (source hash, Python
-   line references); a reproducible benchmark protocol.
+   `qtrans export`: a CMake package with golden tests that need no Python
+   ([Export](#export-a-c-package-with-its-own-tests)).
+   **Next**: lists of tuples,
+   string methods, `key=`; the editor inside VS Code; Python line references in the headers;
+   a reproducible benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the
    supported subset. Not planned: pandas, all of Python, GPU backends.
