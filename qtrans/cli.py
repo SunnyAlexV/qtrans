@@ -65,6 +65,8 @@ def main(argv=None) -> int:
                    help="stress: also inf, NaN, subnormals, the largest doubles and longer arrays")
     v.add_argument("--cxx", default=None, help="C++ compiler to use")
     v.add_argument("--build", default=None, help="folder for the generated driver and binary")
+    v.add_argument("--strict", action="store_true",
+                   help="fail when your own C++ for a function was written for an earlier version of the Python")
 
     b = sub.add_parser("bind", help="compile the C++ into a Python module, <module>_cpp (needs pybind11)")
     b.add_argument("files", nargs="+", help="Python files, or one folder")
@@ -97,7 +99,22 @@ def main(argv=None) -> int:
     lv.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
     lv.add_argument("--no-browser", action="store_true", help="don't open the browser, just print the address")
 
+    ov = sub.add_parser("override", help="your own C++ for a function: start it, --accept it, --remove it, --list")
+    ov.add_argument("file", help="the Python file")
+    ov.add_argument("function", nargs="?", default=None, help="the function (omit with --list)")
+    ov.add_argument("--accept", action="store_true", help="check it against the Python and record that it agrees")
+    ov.add_argument("--remove", action="store_true", help="go back to qtrans's translation")
+    ov.add_argument("--list", action="store_true", help="every override of the file, and whether it is up to date")
+
     args = ap.parse_args(argv)
+    if args.cmd == "override":
+        from .overrides import OverrideError, command
+        try:
+            return command(args.file, args.function, accept=args.accept, remove=args.remove, show=args.list,
+                           out=_print)
+        except OverrideError as e:
+            _print(f"qtrans override: {e}")
+            return 1
     if args.cmd == "live":
         from .live import serve
         return serve(args.file, port=args.port, open_browser=not args.no_browser)
@@ -154,7 +171,7 @@ def main(argv=None) -> int:
         return 0 if not any(project.modules[m].report.rejected for m in project.requested) else 1
     report = verify_project(inputs, n_random=args.cases, seed=args.seed, rtol=args.rtol, atol=args.atol,
                             bench=args.bench, compiler=args.cxx, build_dir=args.build, all_modules=args.all,
-                            profile=args.profile)
+                            profile=args.profile, strict=args.strict)
     print(report.to_text())
     return 0 if report.ok else 1
 

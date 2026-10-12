@@ -23,6 +23,8 @@ from .errors import Unsupported
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
 from . import loops
+from . import overrides as ovr
+from . import hints as hints_
 from .functions import FunctionTranslator, is_docstring, python_reads, source_mark, strip_marks, subscript_root, target_leaves, view_root
 from .origins import Origins
 from .report import FunctionReport, ModuleReport
@@ -228,15 +230,41 @@ def _used_params(fdef, body_lines, sig) -> set:
     return {p.name for p in sig.params if p.name in loads and read_in_cpp(p.cpp)}
 
 
+USE_OVERRIDES = [True]  # off while verify builds qtrans's own translation to compare against
+
+
+class overrides_off:
+    """with overrides_off(): translate as if there were no <module>_overrides.hpp."""
+
+    def __enter__(self):
+        self.saved = USE_OVERRIDES[0]
+        USE_OVERRIDES[0] = False
+
+    def __exit__(self, *exc):
+        USE_OVERRIDES[0] = self.saved
+
+
 class ModuleTranslator:
-    def __init__(self, source: str, module_name: str, filename: str = "<input>", deps: dict | None = None):
+    def __init__(self, source: str, module_name: str, filename: str = "<input>", deps: dict | None = None,
+                 overrides_text: str | None = None):
         """deps: the already-translated modules of the project (name -> ModuleTranslator) that
-        this one may import from; see project.py."""
+        this one may import from; see project.py. overrides_text: the overrides file's text
+        (default: <module>_overrides.hpp next to the file, if there is one; see overrides.py)."""
         self.source = source
+        self.overrides = None
+        self.overrides_error = None
+        if USE_OVERRIDES[0]:
+            try:
+                self.overrides = ovr.parse(overrides_text, ovr.path_for(filename if not filename.startswith("<")
+                                                                        else f"{module_name}.py")) \
+                    if overrides_text is not None else ovr.load(filename)
+            except ovr.OverrideError as e:
+                self.overrides_error = str(e)
         self.module_name = module_name
         self.filename = filename
         self.tree = loops.rewrite(ast.parse(source, filename))  # enumerate / zip loops -> index loops
         self.full_comments, self.inline_comments = _collect_comments(source)
+        self.hints, self.hint_problems = hints_.collect(self.tree, self.full_comments, self.inline_comments)
         self.imports: dict = {}
         self.array_users: dict = {}  # function -> whether its translation used any array value
         self.line_notes: dict = {}   # function -> [((first, last) Python lines, key, text)] (for explain)
@@ -1589,6 +1617,27 @@ class ModuleTranslator:
                     progress = True
                     continue
                 tr = FunctionTranslator(self, f, self.sigs[name])
+                ov = self._override(name)
+                if ov is not None:
+                    why = ovr.head_mismatch(ov.head, "inline " + self.cpp_signature(self.sigs[name], defaults=False))
+                    if why is not None:
+                        self.rejected[name] = Unsupported(
+                            f, f"your C++ for {name}() ({self.overrides.path.name}, line {ov.line}) doesn't fit the "
+                               f"Python's signature: {why}",
+                            "its head must be: inline " + self.cpp_signature(self.sigs[name], defaults=False))
+                        progress = True
+                        continue
+                    try:
+                        tr.translate()  # what the Python does (it changes an argument, prints, ...) still counts
+                        self.array_users[name] = tr.used_arrays
+                        qtrans_could = None
+                    except Unsupported as e:
+                        qtrans_could = e
+                        self.array_users[name] = False
+                    bodies[name] = list(ov.body)
+                    self.line_notes[name] = []
+                    notes[name] = [self._override_note(ov, qtrans_could)]
+                    continue
                 try:
                     bodies[name] = tr.translate()
                     self.array_users[name] = tr.used_arrays
@@ -1617,7 +1666,59 @@ class ModuleTranslator:
             bodies, notes, general = {}, {}, {}  # retranslate: a call may now point at a rejected function
         return bodies, notes, general
 
+    def _override(self, name):
+        """The user's own C++ for this function, if the overrides file has a block for it."""
+        if self.overrides is None or name not in self.overrides.blocks:
+            return None
+        return self.overrides.blocks[name]
+
+    def fingerprint(self, name) -> str:
+        dep_sources = {m: t.source for m, t in self.deps.items()}
+        imported = {local: (owner, there) for local, (owner, there, _kind) in self.imported.items()}
+        return ovr.fingerprint(self.source, name, imported, dep_sources)
+
+    def _override_note(self, ov, qtrans_could) -> str:
+        ov.current = self.fingerprint(ov.name)
+        ov.status = "up to date" if ov.fingerprint == ov.current else \
+            "not yet accepted" if ov.fingerprint is None else "out of date"
+        ov.qtrans_could = None if qtrans_could is None else qtrans_could.message
+        where = f"{self.overrides.path.name}, line {ov.line}"
+        if ov.status == "up to date":
+            text = f"your own C++ ({where}), checked against this Python"
+        elif ov.fingerprint is None:
+            text = (f"your own C++ ({where}) has no python= fingerprint: run `qtrans verify`, then "
+                    f"`qtrans override --accept {Path(self.filename).name} {ov.name}`")
+        else:
+            text = (f"OUT OF DATE: your own C++ ({where}) was written for an earlier version of this Python "
+                    f"(or of what it calls); it is still used, and `qtrans verify` checks it: once it passes, "
+                    f"`qtrans override --accept {Path(self.filename).name} {ov.name}`")
+        if qtrans_could is not None:
+            text += f" -- qtrans can't translate this function itself ({qtrans_could.message})"
+        return text
+
+    def _check_overrides(self):
+        """Blocks that name nothing overridable are reported, not silently ignored."""
+        if self.overrides_error:
+            self.report.module_notes.append(f"the overrides file can't be used: {self.overrides_error}")
+        if self.overrides is None:
+            return
+        for name, ov in self.overrides.blocks.items():
+            variants = getattr(self, "variants", {})
+            if name in variants:
+                self.report.module_notes.append(
+                    f"{self.overrides.path.name}, line {ov.line}: {name}() has one C++ version per kind of call "
+                    "here; annotate its parameters so it has one, then the override is used")
+            elif name not in self.fdefs or (name in self.sigs and self.sigs[name].owner):
+                self.report.module_notes.append(
+                    f"{self.overrides.path.name}, line {ov.line}: a block for {name}(), which is not a "
+                    "function of this module: not used")
+
+    def _hinted(self, head, f) -> str:
+        return hints_.def_head(head, self.hints.get(f.lineno, {}))
+
     def _finish(self, bodies, notes, general):
+        self._check_overrides()
+        self.report.module_notes += self.hint_problems
         for info in self.classes.values():
             if info.external:
                 continue
@@ -1658,13 +1759,25 @@ class ModuleTranslator:
             pmap = pmap[:-1]
         notes = {n: v for n, v in self.line_notes.items() if n in bodies or (n == PROGRAM and program)}
         uses_arrays = "qtrans_arrays.hpp" in header or uses_random  # the header's needs (the program's: its text)
-        return TranslationResult(self.module_name, header, self.report, sigs, "qt::" in header + (program or ""),
+        result = TranslationResult(self.module_name, header, self.report, sigs, "qt::" in header + (program or ""),
                                  uses_arrays, uses_random, live, self.ns,
                                  list(self.project_deps), self.line_map[:-1] if header.endswith("\n") else self.line_map,
                                  notes, program, pmap,
                                  self._main_spans(),
                                  bool(sigs or live or any(not c.external for c in self.constants.values())),
                                  frozenset(n for n in bodies if n.split("(")[0] in self.printing))
+        # the functions that are the user's own C++: name -> overrides.Override (status, line, ...)
+        result.overrides = {n: self.overrides.blocks[n] for n in bodies if self._override(n) is not None}
+        result.overrides_file = self.overrides.path if self.overrides is not None else None
+        result.bodies = dict(bodies)  # name -> its C++ body lines (for `qtrans override`)
+        result.heads = {n: "inline " + self.cpp_signature(self.sigs[n], defaults=False)
+                        for n in self.fdefs if n in self.sigs and not self.sigs[n].owner}
+        result.rejections = {n: e.message for n, e in self.rejected.items()}
+        result.fingerprint_of = self.fingerprint
+        for fr in self.report.functions:
+            if fr.name in result.overrides:
+                fr.override = result.overrides[fr.name].status
+        return result
 
     def _main_spans(self) -> tuple:
         """The Python lines of the program: the `if __name__ == "__main__":` line, then each statement."""
@@ -1918,7 +2031,11 @@ class ModuleTranslator:
         if self.doc:
             out.append("//")
             out += [("// " + line).rstrip() for line in self.doc.splitlines()]
-        out += ["#pragma once", "", "@@INCLUDES@@", "", f"namespace {ns} {{", ""]
+        out += ["#pragma once", "", "@@INCLUDES@@", ""]
+        overridden = [n for n in self.fdefs if n in bodies and self._override(n) is not None]
+        if overridden and self.overrides.preamble:
+            out += [f"// from {self.overrides.path.name}"] + list(self.overrides.preamble) + [""]
+        out += [f"namespace {ns} {{", ""]
 
         own_constants = [c for c in self.constants.values() if not c.external]
         if own_constants:
@@ -1933,7 +2050,7 @@ class ModuleTranslator:
         for info in live:
             out += self.render_struct(info, bodies)
         names = [n for n in self.fdefs if n in bodies and not self.sigs[n].owner]
-        forward = len(names) > 1 or (live and names)
+        forward = len(names) > 1 or (live and names) or bool(overridden)  # overrides: defaults go here
         if forward:
             out.append("// Declarations (so functions can call each other in any order).")
             for n in names:
@@ -1953,9 +2070,23 @@ class ModuleTranslator:
             if sig.doc:
                 d = f.body[0]
                 out += [("/// " + line).rstrip() + source_mark(d.lineno, d.end_lineno) for line in sig.doc.splitlines()]
+            ov = self._override(n)
+            if ov is not None:  # the user's own C++, in place of the translation
+                mark = source_mark(first, f.end_lineno)
+                out.append(f"// your C++ ({self.overrides.path.name}): {ov.status or 'used'}; "
+                           "`qtrans verify` checks it against the Python" + mark)
+                out += [c.rstrip() + mark for c in ov.comments if c.strip()]
+                head = ovr.without_defaults(ov.head)
+                if not re.match(r"^\s*(\[\[.*?\]\]\s*)*(inline|constexpr|static)\b", head):
+                    head = "inline " + head  # in a header, a function must be inline
+                out += [l + mark for l in (head + " {").split("\n")]
+                out += [l + mark for l in ov.body]
+                out.append("}" + mark)
+                out.append("")
+                continue
             used = _used_params(f, bodies[n], sig)
-            out.append("inline " + self.cpp_signature(sig, defaults=not forward, used_params=used) + " {"
-                       + source_mark(first, head_end))
+            out.append(self._hinted("inline " + self.cpp_signature(sig, defaults=not forward, used_params=used), f)
+                       + " {" + source_mark(first, head_end))
             out += bodies[n]
             out.append("}" + source_mark(f.end_lineno, f.end_lineno))
             out.append("")
@@ -1965,7 +2096,10 @@ class ModuleTranslator:
         if self.main_lines is not None:
             empty = not own_constants and not live and not names
             self.program_text, self.program_map = strip_marks(self._program(out, empty, bodies))
-        text, self.line_map = strip_marks(text.replace("@@INCLUDES@@", "\n".join(self._includes(text, bodies))))
+        incs = self._includes(text, bodies)
+        if re.search(r"\bQT_(UNROLL|FORCE_INLINE|NOINLINE|HOT|COLD|LIKELY|UNLIKELY)\b", text):
+            incs += [""] + hints_.MACROS.split("\n")
+        text, self.line_map = strip_marks(text.replace("@@INCLUDES@@", "\n".join(incs)))
         return text
 
     def _includes(self, text, bodies) -> list:

@@ -225,6 +225,7 @@ class FunctionView:
     notes: list = field(default_factory=list)
     params: list = field(default_factory=list)  # [{name, python, cpp, mode, why}]
     spans: list = field(default_factory=list)   # the program: its lines, between the definitions
+    override: str | None = None  # your own C++ is used here: its status ("up to date", ...)
 
 
 @dataclass
@@ -362,7 +363,8 @@ def explain_result(result, source: str, filename: str = "<input>") -> ModuleView
             continue
         if translated:
             rows = _rows_for(src_lines, header_lines, line_map, first, last, notes)
-            view = FunctionView(qual, first, last, True, rows, notes=list(rep.notes) if rep else [])
+            view = FunctionView(qual, first, last, True, rows, notes=list(rep.notes) if rep else [],
+                                override=getattr(rep, "override", None))
             sig = result.signatures.get(key) if key else None
             if sig is not None:
                 view.params = _params(sig, node)
@@ -488,7 +490,8 @@ def to_text(view: ModuleView, width: int = 0) -> str:
     out = [f"qtrans explain: {view.file} ({n} function{'s' if n != 1 else ''})", ""]
     module = [FunctionView("module", 0, 0, True, view.module_rows)] if view.module_rows else []
     for f in module + view.functions:
-        status = "translated" if f.translated else f"NOT TRANSLATED: {f.reason}"
+        status = (f"your C++, {f.override}" if f.override else "translated") if f.translated \
+            else f"NOT TRANSLATED: {f.reason}"
         out.append(f"── {f.name}" + (f" (lines {f.first}-{f.last}): {status}" if f.first else ""))
         if not f.translated and f.hint:
             out.append(f"   hint: {f.hint}")

@@ -2177,7 +2177,11 @@ class FunctionTranslator(ExprTranslator):
             for b in live:
                 self.emit_stmt(b)
             return
-        self.emit(f"if ({cond.code}) {{")
+        how = self.mod.hints.get(s.lineno, {})
+        test = cond.code
+        if "likely" in how or "unlikely" in how:
+            test = f"QT_{'LIKELY' if 'likely' in how else 'UNLIKELY'}({cond.code})"
+        self.emit(f"if ({test}) {{")
         self._block(s.body)
         orelse = s.orelse
         while len(orelse) == 1 and isinstance(orelse[0], ast.If):
@@ -2212,13 +2216,20 @@ class FunctionTranslator(ExprTranslator):
             self._block(h.body)
         self.emit("}")
 
+    def _unroll(self, s):
+        n = self.mod.hints.get(s.lineno, {}).get("unroll")
+        if n:
+            self.emit(f"QT_UNROLL({n})")  # (the `# qtrans: unroll` comment itself follows it)
+
     def s_While(self, s):
+        self._unroll(s)
         cond = self.cond(s.test)
         self.emit(f"while ({cond.code}) {{")
         self._block(s.body)
         self.emit("}")
 
     def s_For(self, s):
+        self._unroll(s)
         it = s.iter
         lit = self._literal_items(it)
         if lit is not None:  # over a literal list: a range-for over the same values

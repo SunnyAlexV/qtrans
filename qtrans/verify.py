@@ -250,6 +250,9 @@ class FunctionCheck:
     py_name: str = ""  # the Python function (a version, "half(float)", names its function "half")
     shape_plans: list = field(default_factory=list)  # the non-square shapes it was tried on
     timeouts: int = 0  # cases left out because Python didn't finish one in time
+    override: object = None    # your own C++ is checked here: its overrides.Override
+    reference: object = None   # qtrans's own translation, on the very same inputs (a FunctionCheck)
+    vs_reference: tuple = ()   # (cases where both returned, bit-identical among them, max ULP apart)
 
     @property
     def max_rel_err(self):
@@ -276,14 +279,47 @@ class VerifyReport:
     atol: float
     environment: str = ""
     program: ProgramCheck | None = None  # a program (top-level code): its run against the compiled one
+    strict: bool = False  # an override written for an earlier version of the Python fails the check
 
     @property
     def mismatches(self):
         return [c for f in self.functions for c in f.cases if c.outcome == "mismatch"]
 
     @property
+    def stale_overrides(self):
+        return [f.name for f in self.functions if f.override is not None and f.override.status != "up to date"]
+
+    @property
     def ok(self):
-        return not self.mismatches and (self.program is None or self.program.ok)
+        return not self.mismatches and (self.program is None or self.program.ok) and \
+            not (self.strict and self.stale_overrides)
+
+    def _override_rows(self, f, bench) -> list:
+        """Under an overridden function: that it is your C++, its status, and how qtrans's own
+        translation did on the same inputs (and how far apart the two C++ versions are)."""
+        ov = f.override
+        out = [f"    - your C++ ({ov.status}, {getattr(self.translation, 'overrides_file', None).name}, line {ov.line})"]
+        r = f.reference
+        if r is None:
+            why = getattr(ov, "qtrans_could", None)
+            out.append("      qtrans can't translate this function itself" + (f" ({why})" if why else "")
+                       + ": only your C++ is checked")
+            return out
+        row = (f"    {'qtrans translation':<24}{len(r.cases):>6}{r.count('match'):>7}{r.count('illcond'):>9}"
+               f"{r.count('known'):>7}{r.count('mismatch'):>9}{r.max_rel_err:>13.1e}"
+               f"{r.max_ulps if r.max_ulps < 10**7 else float(r.max_ulps):>9{'' if r.max_ulps < 10**7 else '.1e'}}")
+        if bench and r.cpp_ns and f.cpp_ns:
+            row += f"{r.py_ns:>11.0f}{r.cpp_ns:>9.1f}{r.py_ns / r.cpp_ns:>9.0f}x"
+        out.append(row)
+        if f.vs_reference:
+            both, same, ulps = f.vs_reference
+            text = f"      your C++ against qtrans's, on the same inputs: {same} of {both} bit-identical"
+            if same < both:
+                text += f", at most {ulps} ULP apart"
+            if bench and r.cpp_ns and f.cpp_ns:
+                text += f"; yours takes {f.cpp_ns / r.cpp_ns:.2f}x the time"
+            out.append(text)
+        return out
 
     def to_text(self) -> str:
         t = self.translation.report
@@ -309,6 +345,8 @@ class VerifyReport:
             if f.rtol != self.rtol or f.atol != self.atol:
                 row += f"   (QTRANS_TOLERANCE: rtol={f.rtol:g})"
             lines.append(row)
+            if f.override is not None:
+                lines += self._override_rows(f, bench)
         if self.mismatches:
             lines += ["", "  First mismatches:"]
             for c in self.mismatches[:10]:
@@ -376,6 +414,14 @@ class VerifyReport:
             lines += ["", "  Compiler warnings in generated code:"] + [f"    {w}" for w in self.warnings[:10]]
         bad = len(self.mismatches) + (0 if self.program is None or self.program.ok else 1)
         result = "PASS (no mismatches)" if self.ok else f"FAIL ({bad} mismatches)"
+        stale = self.stale_overrides
+        if stale:
+            names = ", ".join(f"{n}()" for n in stale)
+            if self.strict and not bad:
+                result = f"FAIL (--strict): your C++ for {names} was written for an earlier version of the Python"
+            else:
+                result += f"; your C++ for {names} was written for an earlier version of the Python"
+            result += f" (accept it with `qtrans override --accept {Path(self.file).name} NAME`)"
         skipped = [f.name for f in t.rejected]
         if skipped and self.ok:
             checked = len(self.functions) + (self.program is not None)
@@ -1858,10 +1904,11 @@ def python_flips(fn, case, sig, rng, trials=3, normwise_too=False) -> bool:
 
 # --- main entry point ----------------------------------------------------------------------------
 def verify_file(path, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
-                compiler=None, build_dir=None, eigen=None, profile="strict") -> VerifyReport:
+                compiler=None, build_dir=None, eigen=None, profile="strict", strict=False) -> VerifyReport:
     """Translate, compile and check one module. The project modules it imports are translated
     and compiled with it (their own functions are checked by verifying them)."""
-    rep = verify_project([path], n_random, seed, rtol, atol, bench, compiler, build_dir, eigen, profile=profile)
+    rep = verify_project([path], n_random, seed, rtol, atol, bench, compiler, build_dir, eigen, profile=profile,
+                         strict=strict)
     return rep.modules[Path(path).resolve().stem]
 
 
@@ -1954,7 +2001,56 @@ def project_lapack_functions(project) -> set:
 
 def verify_project(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
                    compiler=None, build_dir=None, eigen=None, all_modules=False,
-                   profile="strict") -> ProjectVerifyReport:
+                   profile="strict", strict=False) -> ProjectVerifyReport:
+    """See _verify_once. Where a function is your own C++ (<module>_overrides.hpp), it is what
+    is checked against the Python; qtrans's own translation of it (when it has one) is then
+    checked too, on exactly the same inputs, and the two C++ versions compared with each other.
+    strict=True: an override written for an earlier version of the Python fails the check."""
+    global _REPLAY
+    rep = _verify_once(paths, n_random, seed, rtol, atol, bench, compiler, build_dir, eigen, all_modules, profile)
+    replay = {}
+    for m, r in rep.modules.items():
+        r.strict = strict
+        for f in r.functions:
+            ov = getattr(r.translation, "overrides", {}).get(f.name)
+            if ov is not None:
+                f.override = ov
+                if getattr(ov, "qtrans_could", None) is None:
+                    replay[(m, f.name)] = [(c.args, c.source) for c in f.cases]
+    if not replay:
+        return rep
+    from .translator import overrides_off
+    base = Path(build_dir) if build_dir else Path(tempfile.mkdtemp(prefix="qtrans_"))
+    _REPLAY = replay
+    try:
+        with overrides_off():
+            ref = _verify_once(paths, n_random, seed, rtol, atol, bench, compiler, base / "qtrans_translation",
+                               eigen, all_modules, profile)
+    finally:
+        _REPLAY = None
+    for m, r in rep.modules.items():
+        theirs = {f.name: f for f in ref.modules[m].functions} if m in ref.modules else {}
+        for f in r.functions:
+            rf = theirs.get(f.name)
+            if f.override is None or rf is None:
+                continue
+            f.reference = rf
+            sig = r.translation.signatures[f.name]
+            both = same = ulps = 0
+            for a, b in zip(f.cases, rf.cases):
+                if not (isinstance(a.cpp, tuple) and isinstance(b.cpp, tuple) and a.cpp[:1] == b.cpp[:1] == ("ok",)):
+                    continue
+                both += 1
+                eq, _, u = _compare_values(b.cpp[1], a.cpp[1], sig.ret, 0.0, 0.0)
+                same += bool(eq)
+                ulps = max(ulps, u)
+            f.vs_reference = (both, same, ulps)
+    return rep
+
+
+def _verify_once(paths, n_random=200, seed=0, rtol=1e-10, atol=1e-13, bench=False,
+                 compiler=None, build_dir=None, eigen=None, all_modules=False,
+                 profile="strict") -> ProjectVerifyReport:
     """Translate the given files (and the project modules they import), compile one driver for
     all of them, and check the functions of the given files (all_modules=True: of every module).
 
@@ -1999,6 +2095,9 @@ def _worker_specs(project, pymods):
     return specs
 
 
+_REPLAY = None  # (module, function) -> [(args, source)]: check only these, on exactly these inputs
+
+
 def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, bench, compiler, eigen):
     single = len(project.modules) == 1
     rng = np.random.default_rng(seed)
@@ -2014,13 +2113,19 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 continue  # nothing to compare
             tol = tolerances.get(name, rtol)
             f_rtol, f_atol = (tol, atol) if isinstance(tol, (int, float)) else tuple(tol)
+            if _REPLAY is not None and (module, name) not in _REPLAY:
+                continue
             fc = FunctionCheck(name, rtol=f_rtol, atol=f_atol)
             fc.key = name if single else f"{module}:{name}"
             fc.module = module
             fc.py_name = sig.name
             fn = getattr(pymod, sig.name)
+            if _REPLAY is not None:
+                fc.cases = [Case(name, args, src) for args, src in _REPLAY[(module, name)]]
+                fc.shape_plans = []
+
             defaults = [p.default for p in inspect.signature(fn).parameters.values()]
-            for args in given.get(sig.name, []):
+            for args in (given.get(sig.name, []) if _REPLAY is None else []):
                 args = list(args)
                 if getattr(sig, "overloaded", False) and any(
                         isinstance(v, bool) != (p.type == BOOL) or (isinstance(v, int) and not isinstance(v, bool)) != (p.type == INT)
@@ -2037,9 +2142,9 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                                      f"{name}() takes {len(sig.params)}")
                 args = tuple(_py_value(a, p.type) for a, p in zip(args, sig.params))
                 fc.cases.append(Case(name, args, "given"))
-            plans = shape_plans(fn, sig, rng)
+            plans = shape_plans(fn, sig, rng) if _REPLAY is None else []
             fc.shape_plans = plans
-            for _ in range(n_random):
+            for _ in range(n_random if _REPLAY is None else 0):
                 try:
                     args = random_args(rng, sig, plans)
                 except _CantBuild:

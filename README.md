@@ -62,9 +62,16 @@ strong evidence, but no finite set of cases can rule out a difference elsewhere.
   `"...".format()`, `%` formatting and `round(x, n)` write exactly what Python writes: floats as
   Python's shortest repr, format specs by CPython's rules, arrays laid out as NumPy lays them out,
   NumPy scalars as `np.float64(...)`. Functions written without type hints take their types
-  from how the file calls them; lists become `std::vector`s; objects print as Python prints them. `qtrans verify` runs the file with Python and the program it
-  became, and compares what each printed, character for character, and the exit status.
+  from how the file calls them; lists become `std::vector`s, dicts an insertion-ordered
+  `qt::py::dict`, `enumerate` / `zip` loops index loops; objects print as Python prints them.
+  `qtrans verify` runs the file with Python and the program it became, and compares what each
+  printed, character for character, and the exit status.
   See [Programs](#programs-a-script-becomes-a-c-program).
+- **0.10, your own C++:** a C++ engineer can replace any function with hand-written C++ (or
+  write one qtrans can't translate). It is kept across re-translations, checked against the
+  Python and against qtrans's own translation on the same inputs, and flagged the moment the
+  Python it was written for changes. Speed hints (`# qtrans: unroll 4`) go in the Python, and
+  only those that can't change a number are accepted. See [Your own C++](#your-own-c-for-a-function).
 
 ```python
 def black_litterman(cov: Mat, w_mkt: Vec, P: Mat, Q: Vec, omega_diag: Vec,
@@ -158,7 +165,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (506 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (527 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -644,6 +651,54 @@ What it turned up, beyond the missing features:
 6. **The benchmark could time an empty array** (the first random case) and report a
    meaningless speed-up. It now times a hand-picked case, or the largest random one.
 
+## Your own C++ for a function
+
+The Python stays the one source of truth; a C++ engineer can still hand-tune a function, or
+write one qtrans can't translate (a call to `scipy.optimize`, say). The C++ lives next to the
+Python, in `<module>_overrides.hpp`, one block per function:
+
+```cpp
+// qtrans: override annuity  python=104b37dbb7cb  accepted=2026-10-12
+inline double annuity(long long n) {
+    double total = 0.0;
+    for (long long t = 1; t <= n; ++t) total += std::exp(-RATE * static_cast<double>(t));
+    return total;
+}
+// qtrans: end annuity
+```
+
+- `qtrans override pricing.py annuity` writes the first version: qtrans's own translation, to
+  edit (or, where qtrans can't translate the function, a stub with the Python beside it).
+- `qtrans translate` puts your C++ in place of the translation, in the same self-contained
+  header (lines above the first block, such as `#include <immintrin.h>` or helpers, go in first),
+  and re-translating never touches it. The report marks it `[your C++]`.
+- `qtrans verify` checks your C++ against the Python like any other function, then runs
+  qtrans's own translation on exactly the same inputs and compares the two C++ versions:
+  "100 of 100 bit-identical" or "at most 3 ULP apart", and with `--bench` the time of each
+  (hand-tuning is a trade of the two; both are shown).
+- Its head (return type, name, parameter types) must be the one the Python's annotations give;
+  a different one is refused with the head qtrans expects. Parameter names are yours, defaults
+  are written once, in the declaration.
+- Each block records a fingerprint of the Python it was written for: the function's syntax tree
+  (a comment, spacing or docstring edit doesn't count) together with everything it reaches in
+  the project, the functions it calls and the constants and classes they read. When a researcher
+  changes any of that, the block is **out of date**: still used, still verified, and flagged in
+  every report until `qtrans override --accept pricing.py annuity`, which runs verify first and
+  refuses if your C++ no longer agrees with the Python. `qtrans verify --strict` fails while an
+  override is out of date (for CI). `--list` shows every block's status, `--remove` goes back to
+  qtrans's translation. A block for a function that doesn't exist, or an unclosed block, is
+  reported, never ignored.
+- The Python bindings (`qtrans bind`), `qtrans explain` and `qtrans live` use and label it too.
+
+**Speed hints, written in the Python.** A comment on a loop, `if` or `def` (or on its own line
+just above it) steers the compiler: `# qtrans: unroll 4` on a loop, `# qtrans: inline`,
+`noinline`, `hot` or `cold` on a def, `# qtrans: likely` / `unlikely` on an if. None of them can
+change a number (unrolling repeats the body without reordering its floating-point operations),
+and they become macros defined in the header for GCC, Clang and MSVC (where `QT_UNROLL` does
+nothing). Hints that could change a result are refused with the reason, at their line:
+`fast-math`, `simd` / `vectorize` and `parallel` (sums in another order), `ivdep`, `restrict`;
+so are unknown ones, since a typo shouldn't be ignored quietly.
+
 ## Projects: several modules
 
 Real code is split across files. Give qtrans the files (or their folder) and it follows their
@@ -1115,6 +1170,8 @@ Each is listed in the per-module report next to the functions it affects.
   f-strings, `str`, `repr`, `format`, `"...".format`, `%` formatting, `round(x, n)`, `sys.exit`,
   exception messages built with any of them; printing objects (dataclass repr, `__repr__`,
   `__str__`).
+- **Your own C++** for any function, verified and kept across re-translations, and speed hints
+  in the Python ([Your own C++](#your-own-c-for-a-function)).
 - **Lists and dicts:** `list[float]`, `list[int]`, `list[str]` as `std::vector`; `dict[str, float]`
   and the like as `qt::py::dict`, in insertion order (see
   [Programs](#programs-a-script-becomes-a-c-program) for what is supported and refused).
@@ -1195,6 +1252,8 @@ qtrans/
   core.py, types.py, library.py, report.py, typing.py (Vec, Mat)
   verify.py          compile, run, compare (incl. conditioning), benchmark
   explain.py         Python next to its C++, row by row, with reasons (text, HTML, JSON)
+  overrides.py       your own C++ for a function: the overrides file, fingerprints, qtrans override
+  hints.py           speed hints written in the Python (# qtrans: unroll 4), as portable macros
   live.py, live_page.html  qtrans live: the editor page and its local server
   inspect_.py, doctor.py   what qtrans will make of a file; whether a machine is ready
   bind.py            pybind11 bindings: generate, build, check against Python
@@ -1208,7 +1267,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               506 tests: generated text, refusals, compiled semantics, every example,
+tests/               527 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1238,8 +1297,10 @@ run_examples.py      press-Run entry point
    editor with the C++ updating as you type; programs, with Python's printing reproduced
    exactly, types taken from how a script calls its functions, lists, `enumerate`/`zip` loops,
    generators, dicts, and objects printed ([Programs](#programs-a-script-becomes-a-c-program)).
-   **Next**: your own C++ for a function, verified against the Python and kept across
-   re-translations, with tuning hints written in the Python; CMake export; then lists of tuples,
+   Your own C++ for a function, verified against the Python and against qtrans's translation
+   on the same inputs, kept across re-translations and flagged when the Python changes; speed
+   hints in the Python ([Your own C++](#your-own-c-for-a-function)).
+   **Next**: CMake export; then lists of tuples,
    string methods, `key=`; the editor inside VS Code; traceable headers (source hash, Python
    line references); a reproducible benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,

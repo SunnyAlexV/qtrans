@@ -323,7 +323,9 @@ function renderWhy() {
       <p class="msg">line ${f.line}: ${esc(f.reason || "")}</p>${f.hint ? `<p class="hint">hint: ${esc(f.hint)}</p>` : ""}`; return;
   }
   const r = rowInfo[rowOfLine(n)];
-  const title = f ? `${esc(f.name)} <span class="chip ok">translated</span>` : (r ? "Module" : "");
+  const title = f ? (f.override
+      ? `${esc(f.name)} <span class="chip ${f.override === "up to date" ? "ok" : "warn"}">your C++ · ${esc(f.override)}</span>`
+      : `${esc(f.name)} <span class="chip ok">translated</span>`) : (r ? "Module" : "");
   let html = title ? `<h3>${title}</h3>` : "";
   if (r && r.reasons.length) html += "<ul>" + r.reasons.map(x => `<li><span class="kind">${esc(x.kind)}</span><span>${esc(x.text)}</span></li>`).join("") + "</ul>";
   else if (r) html += `<p class="hint">A direct translation: nothing here needs explaining.</p>`;

@@ -14,6 +14,7 @@ class FunctionReport:
     reason_line: int | None = None
     hint: str | None = None
     notes: list = field(default_factory=list)
+    override: str | None = None  # your own C++ is used: "up to date", "out of date", "not yet accepted"
 
 
 @dataclass
@@ -47,7 +48,7 @@ class ModuleReport:
         if self.translated:
             out += ["## Translated", ""]
             for f in self.translated:
-                out.append(f"- `{f.name}` (line {f.lineno})")
+                out.append(f"- `{f.name}` (line {f.lineno})" + (f": your own C++, {f.override}" if f.override else ""))
                 for n in f.notes:
                     out.append(f"  - {n}")
             out.append("")
@@ -77,7 +78,9 @@ class ModuleReport:
     def to_text(self) -> str:
         lines = [f"qtrans: {self.filename}: {self.summary()}"]
         for f in self.functions:
-            if f.translated:
+            if f.translated and f.override:
+                lines.append(f"  [your C++] {f.name}  ({f.override})")
+            elif f.translated:
                 lines.append(f"  [ok]       {f.name}")
             else:
                 where = f.reason_line or f.lineno

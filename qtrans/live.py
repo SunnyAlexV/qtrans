@@ -111,6 +111,9 @@ def translate_text(text: str, path: Path) -> dict:
     try:
         target = work / path.name
         target.write_text(source, encoding="utf-8")
+        from .overrides import path_for
+        if path_for(path).is_file():  # your own C++ for some functions, as it is on disk
+            shutil.copy(path_for(path), path_for(target))
         todo, seen = [target], set()
         while todo:  # the project modules it imports, as they are on disk
             f = todo.pop()
@@ -134,7 +137,7 @@ def translate_text(text: str, path: Path) -> dict:
     funcs = []
     for f in view.functions:
         funcs.append({
-            "name": f.name, "first": f.first, "last": f.last, "translated": f.translated,
+            "name": f.name, "first": f.first, "last": f.last, "translated": f.translated, "override": f.override,
             "spans": [list(x) for x in f.spans] or [[f.first, f.last]],
             "reason": f.reason, "line": f.line, "hint": f.hint,
             "rows": [{"first": r.py_first, "last": r.py_last,
