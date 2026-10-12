@@ -114,3 +114,14 @@ jobs:
       - name: Check examples/RESULTS.md reproduces (reference only)
         if: matrix.reference
         run: python run_examples.py --check
+
+      - name: Check numpy.linalg one operation at a time (backward stability, errors, agreement)
+        run: python -m tools.linalg_check --per-band 4 --out linalg_check.md
+
+      - name: Upload the linalg check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linalg-check-${{ strategy.job-index }}
+          path: linalg_check.md
+          if-no-files-found: ignore

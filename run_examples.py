@@ -78,6 +78,7 @@ def main(check=False):
               "`-std=c++17 -O2 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wdouble-promotion "
               "-ffp-contract=off`; warnings in generated code: "
               f"{sum(len(r.warnings) for r in {id(r): r for _, _, r in rows}.values())}.",
+              "", _audit_line(rows),
               "", f"Platform: {rows[0][2].environment}. Results using the C library's or NumPy's own "
               "`exp`, `log`, `pow` or `erf` (and the ULP counts and speeds) hold for this platform; "
               "other platforms' results are in CI (`.github/workflows/tests.yml`)."]
@@ -87,6 +88,19 @@ def main(check=False):
     results.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Results table written to {results}")
     return 0
+
+
+def _audit_line(rows) -> str:
+    """The linear-algebra audit over every example (see qtrans_arrays.hpp)."""
+    cases = [(f, c) for _, f, _ in rows for c in f.cases if c.audit is not None and c.audit[0] > 0]
+    if not cases:
+        return "numpy.linalg audit: no example calls numpy.linalg."
+    f, c = max(cases, key=lambda t: t[1].audit[1])
+    ops = sum(c.audit[0] for _, c in cases)
+    return (f"**numpy.linalg audit:** {len(cases):,} cases ran {ops:,} `numpy.linalg` operations (each measures its "
+            f"residual against the bound for a backward-stable algorithm); the largest was {c.audit[1]:.3f} of "
+            f"its bound ({c.audit[2]}, in `{f.name}`). Unstable results: "
+            f"{sum(1 for _, c in cases if c.unstable)}.")
 
 
 def _check(lines, results, out, committed) -> int:

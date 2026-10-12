@@ -140,7 +140,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (380 tests).
+`python -m pytest` (385 tests).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -619,12 +619,100 @@ an array field to an array *equal* to the old one, the compiled side keeps the o
      near-overflow inputs, where NumPy's BLAS/LAPACK and Eigen add in different orders, so
      `inf - inf` gives NaN on one side only, or an intermediate overflows on one side only.
      Both are correct; listed, not counted as mismatches. Scalar code gets no such allowance.
-   - **mismatch**: anything else. A correct translation has none.
+   - **mismatch**: anything else, or a `numpy.linalg` operation in the call whose residual
+     exceeds its backward-stability bound ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)).
+     A correct translation has none.
 
 Module-level settings the verifier reads (the translator ignores names starting `QTRANS_`):
 `QTRANS_CASES = {"f": [(args...), ...]}` (trailing defaults may be omitted, arrays as NumPy
 arrays) and `QTRANS_TOLERANCE = {"f": 1e-8}` for an algorithm that guarantees less than 1e-10.
 No example needs `QTRANS_TOLERANCE`, and every hand-picked case is an outright match.
+
+## Linear algebra, checked by what it guarantees
+
+Comparing an answer with NumPy's only works when the problem is well conditioned. For a
+matrix with condition number 1e12, two correct `solve`s can differ in the fourth digit, and
+eigenvectors are only defined up to sign. So every `numpy.linalg` operation qtrans translates
+is also judged by its defining property, the way numerical analysis judges LAPACK (N. Higham,
+*Accuracy and Stability of Numerical Algorithms*, 2nd ed.; u = 2^-53 is the unit roundoff):
+
+| operation | what is measured | bound |
+|---|---|---|
+| `solve` | the residual B − AX, componentwise via the LU factors (Theorem 9.4) | γ₃ₙ ‖\|L\|\|U\|\|X\|‖, plus the rounding of computing B − AX |
+| `inv` | AX − I, the same way | the same |
+| `det` (and the LU of `solve`, `inv`) | PA − LU (Theorem 9.3) | 2γₙ ‖\|L\|\|U\|‖ + u‖A‖ |
+| `cholesky` | A − LLᵀ (Theorem 10.3) | (γₙ₊₁ + γₙ) ‖\|L\|\|Lᵀ\|‖ + u‖A‖ |
+| `eigh` / `eigvalsh` | AV − V diag(w), VᵀV − I, ascending order | p(n)·u‖A‖ and p(n)·u, p(n) = 10n |
+| `pinv` | the four Penrose conditions (AXA = A, XAX = X, AX and XA symmetric), each scaled; AXA = A up to the singular values `rcond` drops | p(n)·u |
+
+γₖ = ku/(1 − ku). The first four are rigorous bounds, evaluated for the very matrices at hand,
+so a ratio above 1 can only be a bug. For `eigh` and `pinv` the literature gives a "modest
+constant p(n)" without a value; 10n is qtrans's choice, and the worst ratio measured below is
+about half of it. A ratio of at most 1 means the result is the exact answer for a matrix within
+rounding of the input. That is what LAPACK guarantees too, and it holds when the C++ and
+NumPy disagree. (For LU it is relative to |L||U|: on Wilkinson's matrix, where partial pivoting
+grows entries by 2^(n−1), the bound grows with it, for LAPACK as for Eigen.)
+
+**In every verification.** `qtrans verify` compiles its driver with `-DQTRANS_LINALG_AUDIT`:
+each of these operations, wherever it is called (an intermediate `solve` inside a longer
+function too), measures its residual against its bound, and a call where any operation exceeds
+it fails, as a mismatch would, even if the values agree with NumPy. The audit only reads: the
+headers qtrans writes for you leave it out (the macro is off), so they carry no cost. The
+report says how many operations were audited, the largest ratio, and how many of the
+`ill-cond` and `edge` cases had every operation within its bound. Over the examples:
+1,718 cases ran 4,339 operations, the largest ratio 0.528 (`eigh`, VᵀV − I, in `posterior_sigma`), none unstable (also in [`examples/RESULTS.md`](examples/RESULTS.md)). The bindings check
+reuses the same C++ functions, so it isn't audited separately.
+
+**Operation by operation.** `python -m tools.linalg_check --per-band 4` builds 2,549
+matrices: sizes 0 to 50; condition numbers from 1 to 1e18 by construction (U diag(s) Vᵀ, the
+singular values spread geometrically or one of them small); rows and columns scaled from 1e-8
+to 1e8; Hilbert and Wilkinson matrices; rank-deficient and exactly singular ones; symmetric
+with repeated, negative and zero eigenvalues; rectangular ones for `pinv`; empty, 1×1, zero,
+1e-300 and 1e300. It runs each operation on all of them, in C++ with the audit and in NumPy,
+and checks three things. The worst ratio of residual to bound, by the matrix's condition number:
+
+| operation | matrices | audited | cond < 1e4 | cond 1e4 .. 1e10 | cond >= 1e10 | singular to working precision | worst overall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `solve` | 479 | 463 | 0.266 | 0.096 | 0.085 | 0.081 | 0.266 |
+| `inv` | 479 | 463 | 0.143 | 0.056 | 0.085 | 0.081 | 0.143 |
+| `det` | 479 | 476 | 0.113 | 0.045 | 0.085 | 0.081 | 0.113 |
+| `cholesky` | 314 | 254 | 0.497 | 0.301 | 0.215 | 0.214 | 0.497 |
+| `eigh` | 314 | 312 | 0.386 | 0.492 | 0.490 | 0.445 | 0.492 |
+| `pinv` | 484 | 483 | 0.170 | 0.101 | 0.313 | 0.279 | 0.313 |
+
+Errors: the C++ raises `LinAlgError` (or a shape error) exactly where NumPy does, except where
+the matrix is singular to working precision (smallest singular value at most n·2u times the
+largest; for `cholesky`, smallest eigenvalue at most n·2u times the largest in size). There an
+exactly-zero pivot, or a non-positive one, is a matter of rounding, and LAPACK and Eigen, adding
+in different orders, can decide differently. And agreement as far as the conditioning allows:
+`solve` and `inv` differ from NumPy by at most (‖R_C++‖ + ‖R_NumPy‖)/σ_min(A), R the two
+residuals (X − X_exact = A⁻¹R exactly, so this is rigorous up to computing R); `det` is
+compared with a 50-digit [mpmath](https://mpmath.org) determinant, within exp(‖A⁻¹‖‖E‖) − 1 for
+its LU backward error E; eigenvalues differ by at most what the two residuals allow (first
+order); for `cholesky` and `pinv` the difference is reported against the first-order bound
+κ(A)(η_C++ + η_NumPy), not judged:
+
+| operation | same error / both return | one side raises, matrix singular to working precision | unexplained | compared | worst difference / allowed |
+|---|---:|---:|---:|---:|---:|
+| `solve` | 472 | 7 | 0 | 362 | 0.520 |
+| `inv` | 472 | 7 | 0 | 362 | 0.104 |
+| `det` | 479 | 0 | 0 | 299 | 0.054 |
+| `cholesky` | 306 | 8 | 0 | 249 | 0.026 (reported) |
+| `eigh` | 314 | 0 | 0 | 311 | 0.343 |
+| `pinv` | 484 | 0 | 0 | 343 | 0.808 (reported) |
+
+CI runs it on every platform and compiler in the matrix (under the sanitizers and at -O0 and
+-O3 too) and keeps the report with the run.
+
+What it found: **`pinv` broke down on nearly rank-deficient matrices.** For full rank,
+`qt::pinv` used a column-pivoted QR (complete orthogonal decomposition), more accurate than the
+SVD formula on badly scaled matrices; but on a matrix with condition number near 1e15 its
+result had AX off symmetric by 1e13 times the bound (NumPy's: 0.006 of it), the pseudo-inverse
+12 times too large. The QR result is now used only when it meets all four Penrose conditions;
+otherwise the SVD formula, as NumPy. Both earlier tests (the badly scaled matrices, against a
+60-digit reference) and the new ones pass. A test also checks that the audit catches a wrong
+answer: a 1e-9 relative change in one entry of a correct result lifts the ratio from at most
+0.2 to between 7,900 (`pinv`) and 440,000 (LU) ([`tests/test_linalg_audit.py`](tests/test_linalg_audit.py)).
 
 ## Fuzzing
 
@@ -861,10 +949,11 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               380 tests: generated text, refusals, compiled semantics, every example,
+tests/               385 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
-                     (generator, checker, shrinker: `python -m tools.fuzz`)
+                     (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
+                     numpy.linalg checked operation by operation
 ci/                  the reference job's pinned packages
 run_examples.py      press-Run entry point
 ```
@@ -883,9 +972,9 @@ run_examples.py      press-Run entry point
    checked int arithmetic and a time limit on Python calls. 0.9 so far: Clang, sanitizers,
    optimisation levels, Python 3.10/3.14, Windows and macOS ARM64 in CI
    ([Platforms](#platforms)); a program fuzzer with automatic minimisation
-   ([Fuzzing](#fuzzing)). **Next**: operation-specific numerical checks (backward error of solves,
-   residuals of eigendecompositions and Cholesky, Moore-Penrose conditions judged against the
-   condition number); `qtrans doctor` / `inspect` / `explain`; traceable headers (source hash,
+   ([Fuzzing](#fuzzing)); every `numpy.linalg` operation audited for backward stability,
+   in each verification and operation by operation ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)).
+   **Next**: `qtrans doctor` / `inspect` / `explain`; traceable headers (source hash,
    Python line references, CMake); a reproducible benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the

@@ -88,17 +88,17 @@ class Compiler:
     path: str
     kind: str  # "gnu" (g++/clang++) or "msvc"
 
-    def command(self, source, exe, include_dir, system_includes=(), optimise=True):
+    def command(self, source, exe, include_dir, system_includes=(), optimise=True, defines=()):
         if self.kind == "msvc":
             return ([self.path, "/nologo", "/std:c++17", "/EHsc", "/W4", "/fp:precise", "/bigobj",
-                     "/O2" if optimise else "/Od", f"/I{include_dir}"]
+                     "/O2" if optimise else "/Od", f"/I{include_dir}"] + [f"/D{d}" for d in defines]
                     + [f"/external:I{d}" for d in system_includes] + ["/external:W0"] + extra_flags()
                     + [str(source), f"/Fe{exe}"])
         # Eigen goes in as a *system* include so its own internal warnings don't count against
         # the generated code
         return ([self.path, "-std=c++17", "-O2" if optimise else "-O0", "-Wall", "-Wextra",
                  "-Wpedantic", "-Wshadow", "-Wconversion", "-Wdouble-promotion",
-                 "-ffp-contract=off", f"-I{include_dir}"]
+                 "-ffp-contract=off", f"-I{include_dir}"] + [f"-D{d}" for d in defines]
                 + [f"-isystem{d}" for d in system_includes] + extra_flags() + [str(source), "-o", str(exe)])
 
     def version(self) -> str:
@@ -173,6 +173,17 @@ class Case:
     tiny: bool = False  # passed only because |difference| <= atol (values near zero)
     sensitivity: float = 0.0  # Python's own relative change under a 4-ULP input nudge
     order: bool = False  # 'known' because the input breaks two checks at once (see classify)
+    audit: tuple | None = None  # (numpy.linalg operations audited, worst residual / bound, which)
+
+    @property
+    def unstable(self) -> bool:
+        """A numpy.linalg operation of this call left a residual above its stability bound."""
+        return self.audit is not None and self.audit[0] > 0 and self.audit[1] > 1.0
+
+    @property
+    def certified(self) -> bool:
+        """Every numpy.linalg operation of this call (at least one) was backward stable."""
+        return self.audit is not None and self.audit[0] > 0 and self.audit[1] <= 1.0
 
 
 @dataclass
@@ -252,7 +263,22 @@ class VerifyReport:
         if self.mismatches:
             lines += ["", "  First mismatches:"]
             for c in self.mismatches[:10]:
-                lines.append(f"    {c.func}{c.args}: Python {c.py}, C++ {c.cpp}")
+                if c.unstable:
+                    lines.append(f"    {c.func}{c.args}: {c.audit[2]} left a residual {c.audit[1]:.3g} times its "
+                                 "stability bound (C++ " + str(c.cpp)[:200] + ")")
+                else:
+                    lines.append(f"    {c.func}{c.args}: Python {c.py}, C++ {c.cpp}")
+        audited = [c for f in self.functions for c in f.cases if c.audit is not None and c.audit[0] > 0]
+        if audited:
+            worst = max(audited, key=lambda c: c.audit[1])
+            ops = sum(c.audit[0] for c in audited)
+            special = [c for c in audited if c.outcome in ("illcond", "edge")]
+            lines += ["", f"  linalg audit: {len(audited)} cases ran {ops} numpy.linalg operations; the largest residual",
+                      f"  was {worst.audit[1]:.3f} of its backward-stability bound ({worst.audit[2]}, in {worst.func}).",
+                      "  At most 1: each result is the exact answer for a matrix within rounding of its input."]
+            if special:
+                ok = sum(1 for c in special if c.certified)
+                lines.append(f"  The {len(special)} ill-cond / edge cases among them: {ok} with every operation within its bound.")
         lines += ["", "  max rel err / max ULP exclude results within atol of each other (values near zero)",
                   "  and ill-conditioned cases; for arrays, rel err is normwise and ULPs count elements",
                   "  >= 1% of the array's largest value."]
@@ -985,6 +1011,10 @@ int main() {
         in >> mode >> fn;
         Reader r;
         while (in >> tok) r.tokens.push_back(tok);
+#ifdef QTRANS_HAVE_AUDIT
+        qt::audit::reset();
+        qt::audit::state().enabled = mode == "CALL";  // never while timing
+#endif
         try {
 @@BRANCHES@@
             { std::printf("EXC UnknownFunction\n"); }
@@ -998,6 +1028,13 @@ int main() {
         catch (const std::overflow_error&) { std::printf("EXC OverflowError\n"); }
         catch (const std::runtime_error&) { std::printf("EXC RuntimeError\n"); }
         catch (const std::exception&) { std::printf("EXC Exception\n"); }
+#ifdef QTRANS_HAVE_AUDIT
+        // the linear-algebra audit of this call (see qtrans_arrays.hpp): operations audited,
+        // the worst residual / bound, and the operation it came from
+        if (mode == "CALL")
+            std::printf("AUDIT %ld %a %s\n", qt::audit::state().count, qt::audit::state().worst,
+                        qt::audit::state().op[0] ? qt::audit::state().op : "-");
+#endif
     }
     return 0;
 }
@@ -1161,6 +1198,15 @@ class _Toks:
         return self.parts[self.i - 1]
 
 
+def _parse_audit(line):
+    """AUDIT <operations> <worst ratio, hex float> <operation>: (count, worst, operation)."""
+    parts = line.split(" ", 3)
+    try:
+        return (int(parts[1]), float.fromhex(parts[2]), parts[3] if len(parts) > 3 else "-")
+    except (IndexError, ValueError):
+        return None
+
+
 def _parse_cpp_line(line, out_t):
     parts = line.split()
     if not parts:
@@ -1301,6 +1347,9 @@ def _compare_values_loose(a, b, rtol, atol) -> bool:
 
 
 def classify(case: Case, ret, rtol, atol):
+    if case.unstable:
+        case.outcome = "mismatch"
+        return
     py, cpp = case.py, case.cpp
     if py[0] == "ok" and cpp[0] == "ok":
         eq, rel, ulps = _compare_values(py[1], cpp[1], ret, rtol, atol)
@@ -1697,7 +1746,9 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
     if project.uses_random:
         shutil.copy(RANDOM_HEADER, build / "qtrans_random.hpp")
     exe = build / ("qtrans_driver.exe" if os.name == "nt" else "qtrans_driver")
-    cmd = cxx.command(driver, exe, build, system)
+    # the linear-algebra audit (qtrans_arrays.hpp) is compiled in: every numpy.linalg operation a
+    # call makes measures its own backward error; it only reads, so the results are the same
+    cmd = cxx.command(driver, exe, build, system, defines=("QTRANS_LINALG_AUDIT",) if project.uses_arrays else ())
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=build)
     if proc.returncode != 0:
         raise RuntimeError(f"C++ compilation failed:\n{' '.join(cmd)}\n{proc.stderr}{proc.stdout}")
@@ -1714,17 +1765,26 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 index.append((fc, c))
     run = subprocess.run([str(exe)], input="".join(x + "\n" for x in lines), capture_output=True, text=True,
                          encoding="utf-8", errors="replace", timeout=600)
-    outputs = run.stdout.splitlines()
+    outputs, audits = [], []
+    for out_line in run.stdout.splitlines():
+        if out_line.startswith("AUDIT ") and outputs:
+            audits[-1] = _parse_audit(out_line)
+        else:
+            outputs.append(out_line)
+            audits.append(None)
     if len(outputs) != len(lines):
         raise RuntimeError(f"C++ driver produced {len(outputs)} results for {len(lines)} cases "
                            f"(exit code {run.returncode}): {run.stderr[-500:]}")
     nudge_rng = np.random.default_rng(seed + 1)
     normwise = lapack_functions(project.paths[targets[0]]) if single else project_lapack_functions(project)
     linalg = linalg_functions(project.paths.values())
-    for (fc, c), outline in zip(index, outputs):
+    for (fc, c), outline, audit in zip(index, outputs, audits):
         sig = project.modules[fc.module].signatures[fc.name]
         c.cpp = _parse_cpp_line(outline, output_type(sig))
+        c.audit = audit
         classify(c, output_type(sig), fc.rtol, fc.atol)
+        if c.unstable:
+            continue  # a linalg operation broke its stability bound: a failure, whatever the values
         if c.outcome == "mismatch" and python_went_complex(getattr(pymods[fc.module], fc.name), c.args, sig):
             # x ** y with x < 0 and fractional y went complex in Python and NaN in C++ before
             # this result: the documented difference, wherever it shows (or doesn't) in the value

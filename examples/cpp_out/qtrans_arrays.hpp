@@ -901,6 +901,102 @@ void masked_update(A& a, const Eigen::ArrayBase<M>& mask, double v, F f) {
 }
 
 // =====================================================================================
+// The linear-algebra audit (compiled in only with -DQTRANS_LINALG_AUDIT, as `qtrans verify`
+// does). Each numpy.linalg operation measures, on its own inputs and outputs, the quantity
+// numerical analysis bounds for it, and divides by that bound:
+//   ratio <= 1: the result is what a backward-stable algorithm guarantees (the exact answer
+//               for a matrix within rounding of the input), whether or not it equals NumPy's;
+//   ratio > 1:  it is not; the verifier reports that as a failure.
+// LU (solve, inv, det) and Cholesky have rigorous componentwise bounds (Higham, Accuracy and
+// Stability of Numerical Algorithms, 2nd ed., Theorems 9.3, 9.4 and 10.3), evaluated for the
+// very matrices at hand, plus the rounding of computing the residual itself, so their ratio
+// can't exceed 1 unless the code is wrong. eigh and the SVD of pinv only have normwise bounds
+// with an unspecified modest constant p(n); qtrans uses p(n) = 10 n (see tools/linalg_check.py
+// for the worst ratio measured on thousands of constructed matrices, condition numbers up to
+// 1e16). Gradual underflow adds an absolute error the model above leaves out: a term of
+// n^2 * DBL_MIN per bound covers it. Non-finite inputs or results are not audited.
+// =====================================================================================
+#ifdef QTRANS_LINALG_AUDIT
+namespace audit {
+struct State {
+    long count = 0;        // operations audited in this call
+    double worst = 0.0;    // largest ratio
+    const char* op = "";   // the operation it came from
+    bool enabled = true;   // off while the verifier times a function
+};
+inline State& state() { static State s; return s; }
+inline void reset() { const bool on = state().enabled; state() = State{}; state().enabled = on; }
+inline void record(const char* op, double measured, double bound) {
+    if (!(std::isfinite(measured) && std::isfinite(bound))) return;
+    State& st = state();
+    ++st.count;
+    const double r = bound > 0 ? measured / bound : (measured > 0 ? std::numeric_limits<double>::infinity() : 0.0);
+    if (r > st.worst || st.op[0] == '\0') { st.worst = std::max(st.worst, r); st.op = op; }
+}
+inline double gamma(double k) {  // gamma_k = k u / (1 - k u), u = 2^-53
+    const double u = std::numeric_limits<double>::epsilon() / 2;
+    return k * u / (1 - k * u);
+}
+inline double tiny(Index n) { return double(n) * double(n) * std::numeric_limits<double>::min(); }
+inline bool finite(const Eigen::MatrixXd& m) { return m.allFinite(); }
+
+// |PA - LU| <= gamma_n |L||U| (Theorem 9.3); computing PA - LU adds gamma_n |L||U| + u |A|
+inline void lu(const Eigen::MatrixXd& a, const Eigen::PartialPivLU<Eigen::MatrixXd>& f) {
+    const Index n = a.rows();
+    if (n == 0 || !finite(a) || !finite(f.matrixLU())) return;
+    const Eigen::MatrixXd L = f.matrixLU().triangularView<Eigen::UnitLower>();
+    const Eigen::MatrixXd U = f.matrixLU().triangularView<Eigen::Upper>();
+    const Eigen::MatrixXd pa = f.permutationP() * a;
+    const double r = (pa - L * U).norm();
+    const double lu_abs = (L.cwiseAbs() * U.cwiseAbs()).norm();
+    record("LU (solve, inv, det)", r, 2 * gamma(double(n)) * lu_abs + gamma(1) * a.norm() + tiny(n));
+}
+// solves A X = B by LU: (A + dA_j) x_j = b_j with |dA_j| <= gamma_3n |L||U| (Theorem 9.4), so
+// |B - AX| <= gamma_3n |L||U||X|; computing B - AX adds gamma_{n+1} (|B| + |A||X|)
+inline void lu_solve(const char* op, const Eigen::MatrixXd& a, const Eigen::PartialPivLU<Eigen::MatrixXd>& f,
+                     const Eigen::MatrixXd& b, const Eigen::MatrixXd& x) {
+    const Index n = a.rows();
+    if (n == 0 || x.size() == 0 || !finite(a) || !finite(b) || !finite(x)) return;
+    const Eigen::MatrixXd L = f.matrixLU().triangularView<Eigen::UnitLower>();
+    const Eigen::MatrixXd U = f.matrixLU().triangularView<Eigen::Upper>();
+    const Eigen::MatrixXd lux = L.cwiseAbs() * (U.cwiseAbs() * x.cwiseAbs());
+    const Eigen::MatrixXd ax = a.cwiseAbs() * x.cwiseAbs();
+    const double r = (b - a * x).norm();
+    record(op, r, gamma(3.0 * double(n)) * lux.norm() + gamma(double(n) + 1.0) * (b.cwiseAbs() + ax).norm() + tiny(n) * (1 + x.norm()));
+}
+// A = L L^T + dA with |dA| <= gamma_{n+1} |L||L^T| (Theorem 10.3); computing the residual
+// adds gamma_n |L||L^T| + u |A|
+inline void cholesky(const Eigen::MatrixXd& a, const Eigen::MatrixXd& l) {
+    const Index n = a.rows();
+    if (n == 0 || !finite(a) || !finite(l)) return;
+    const Eigen::MatrixXd s = a.selfadjointView<Eigen::Lower>();
+    const double r = (s - l * l.transpose()).norm();
+    const double ll = (l.cwiseAbs() * l.cwiseAbs().transpose()).norm();
+    record("cholesky", r, (gamma(double(n) + 1.0) + gamma(double(n))) * ll + gamma(1) * s.norm() + tiny(n));
+}
+// a backward-stable symmetric eigensolver: A V - V diag(w) and V^T V - I are p(n) u ||A|| and
+// p(n) u, with p(n) a modest polynomial; qtrans takes p(n) = 10 n
+inline double pn(Index n) { return 10.0 * double(std::max<Index>(n, 1)) * std::numeric_limits<double>::epsilon() / 2; }
+inline void eigh(const Eigen::MatrixXd& a, const Eigen::VectorXd& w, const Eigen::MatrixXd& v) {
+    const Index n = a.rows();
+    if (n == 0 || !finite(a) || !w.allFinite() || !finite(v)) return;
+    const Eigen::MatrixXd s = a.selfadjointView<Eigen::Lower>();
+    const double an = s.norm();
+    record("eigh: A V - V diag(w)", (s * v - v * w.asDiagonal()).norm(), pn(n) * an + tiny(n));
+    record("eigh: V^T V - I", (v.transpose() * v - Eigen::MatrixXd::Identity(n, n)).norm(), pn(n));
+    for (Index i = 1; i < n; ++i)
+        if (w(i) < w(i - 1)) record("eigh: ascending eigenvalues", 1.0, 0.0);
+}
+// the pseudo-inverse X: the four Penrose conditions (detail::penrose_ratio, defined with pinv)
+inline void pinv(const Eigen::MatrixXd& a, const Eigen::MatrixXd& x, double dropped = 0.0);
+}  // namespace audit
+#define QTRANS_AUDIT(call) do { if (::qt::audit::state().enabled) ::qt::audit::call; } while (false)
+#define QTRANS_HAVE_AUDIT 1
+#else
+#define QTRANS_AUDIT(call) ((void)0)
+#endif
+
+// =====================================================================================
 // numpy.linalg. LU with partial pivoting is the algorithm LAPACK's gesv uses; like LAPACK,
 // an exactly zero pivot means "Singular matrix".
 // =====================================================================================
@@ -922,19 +1018,29 @@ plain_t<DB> solve(const Eigen::ArrayBase<DA>& a, const Eigen::ArrayBase<DB>& b) 
     if (b.rows() != a.rows()) throw shape_error("solve: right-hand side has the wrong number of rows");
     const auto lu = lu_checked(a);  // singular raises even with an empty right side, as in NumPy
     if (b.size() == 0) return plain_t<DB>(b.rows(), b.cols());  // Eigen 3.4's triangular solve reads x(0, 0) of an empty x
-    const Eigen::MatrixXd x = lu.solve(b.matrix().eval());
+    const Eigen::MatrixXd bm = b.matrix();
+    const Eigen::MatrixXd x = lu.solve(bm);
+    QTRANS_AUDIT(lu(a.matrix(), lu));
+    QTRANS_AUDIT(lu_solve("solve", a.matrix(), lu, bm, x));
     return x.array();
 }
 
 template <class D>
 Mat inv(const Eigen::ArrayBase<D>& a) {
-    return lu_checked(a).inverse().array();
+    const auto lu = lu_checked(a);
+    const Eigen::MatrixXd x = lu.inverse();
+    QTRANS_AUDIT(lu(a.matrix(), lu));
+    QTRANS_AUDIT(lu_solve("inv", a.matrix(), lu, Eigen::MatrixXd::Identity(a.rows(), a.rows()), x));
+    return x.array();
 }
 
 template <class D>
 double det(const Eigen::ArrayBase<D>& a) {
     if (a.rows() != a.cols()) throw linalg_error("Last 2 dimensions of the array must be square");
-    return Eigen::MatrixXd(a.matrix()).partialPivLu().determinant();
+    const Eigen::MatrixXd m = a.matrix();
+    const Eigen::PartialPivLU<Eigen::MatrixXd> lu(m);
+    QTRANS_AUDIT(lu(m, lu));  // det is the product of U's diagonal: the factorization is what to audit
+    return lu.determinant();
 }
 
 // Lower-triangular L with A = L L^T, read from the lower triangle as LAPACK's potrf does.
@@ -943,7 +1049,9 @@ Mat cholesky(const Eigen::ArrayBase<D>& a) {
     if (a.rows() != a.cols()) throw linalg_error("Last 2 dimensions of the array must be square");
     Eigen::LLT<Eigen::MatrixXd> llt{Eigen::MatrixXd(a.matrix())};
     if (llt.info() != Eigen::Success) throw linalg_error("Matrix is not positive definite");
-    return Eigen::MatrixXd(llt.matrixL()).array();
+    const Eigen::MatrixXd l = llt.matrixL();
+    QTRANS_AUDIT(cholesky(a.matrix(), l));
+    return l.array();
 }
 
 // np.linalg.eigh(A): eigenvalues in ascending order and eigenvectors as columns, read from the
@@ -963,20 +1071,49 @@ std::tuple<Vec, Mat> eigh(const Eigen::ArrayBase<D>& a) {
     if (n == 0) return {Vec(0), Mat(0, 0)};
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(m);  // uses the lower triangle
     if (es.info() != Eigen::Success) throw linalg_error("Eigenvalues did not converge");
+    QTRANS_AUDIT(eigh(m, es.eigenvalues(), es.eigenvectors()));
     return {es.eigenvalues().array(), Mat(es.eigenvectors().array())};
 }
 
 template <class D>
 Vec eigvalsh(const Eigen::ArrayBase<D>& a) { return std::get<0>(eigh(a)); }
 
+namespace detail {
+// The four Penrose conditions for X = pinv(A), each residual over the bound a stable
+// computation meets (p(n) u times the scale: ||A||^2 ||X|| for AXA = A, ||X||^2 ||A|| for
+// XAX = X, ||A|| ||X|| for the symmetry of AX and XA; p(n) = 10 n): the largest ratio.
+// `dropped`: the 2-norm of the singular values below the cutoff (rcond * max(s)) that were set
+// aside. X is then the pseudo-inverse of A without them, and AXA - A is exactly their part.
+inline double penrose_ratio(const Eigen::MatrixXd& a, const Eigen::MatrixXd& x, const char** which = nullptr,
+                            double dropped = 0.0) {
+    const Index n = std::max(a.rows(), a.cols());
+    const double an = a.norm(), xn = x.norm();
+    if (a.size() == 0 || an == 0 || xn == 0 || !a.allFinite() || !x.allFinite()) return 0.0;
+    const double pn = 10.0 * double(n) * std::numeric_limits<double>::epsilon() / 2;
+    const double t = double(n) * double(n) * std::numeric_limits<double>::min();
+    const Eigen::MatrixXd ax = a * x, xa = x * a;
+    const double r[4] = {(ax * a - a).norm() / (pn * an * an * xn + dropped * (1 + pn) + t), (xa * x - x).norm() / (pn * xn * xn * an + t),
+                         (ax - ax.transpose()).norm() / (pn * an * xn + t), (xa - xa.transpose()).norm() / (pn * an * xn + t)};
+    static const char* names[4] = {"pinv: A X A = A", "pinv: X A X = X", "pinv: A X symmetric", "pinv: X A symmetric"};
+    int k = 0;
+    for (int i = 1; i < 4; ++i)
+        if (r[i] > r[k]) k = i;
+    if (which) *which = names[k];
+    return r[k];
+}
+}  // namespace detail
+
 // np.linalg.pinv(A, rcond=1e-15). NumPy keeps the singular values s > rcond * max(s) and
 // returns V diag(1/s) U^T. The rank is decided here by exactly that rule, on Eigen's SVD.
-// When every singular value is kept, the pseudo-inverse is unique, and it is computed from a
-// column-pivoted complete orthogonal decomposition instead: rebuilding it from the SVD loses
-// accuracy on badly scaled matrices (entries of 1e8 next to 1e-2), where the QR route stays
-// as accurate as LAPACK's (checked against a 60-digit reference). A rank-deficient matrix uses
-// the SVD formula, as NumPy does. Either way the result agrees with NumPy to rounding; singular
-// values within rounding of the cutoff can be kept by one and dropped by the other.
+// When every singular value is kept, the pseudo-inverse is unique, and a column-pivoted
+// complete orthogonal decomposition computes it more accurately on badly scaled matrices
+// (entries of 1e8 next to 1e-2: the SVD formula lost 5-6 digits against a 60-digit reference
+// where LAPACK's stayed near 1e-15; the QR route stays as accurate as LAPACK's). On a nearly
+// rank-deficient matrix, though, the QR route can break down (the linear-algebra audit found
+// A X off symmetric by 1e13 times its bound), so its result is used only when it meets all
+// four Penrose conditions within a stable computation's bounds; otherwise, and for a
+// rank-deficient matrix, the SVD formula, as NumPy. Singular values within rounding of the
+// cutoff can be kept by one implementation and dropped by the other.
 template <class D>
 Mat pinv(const Eigen::ArrayBase<D>& a, double rcond = 1e-15) {
     const Eigen::MatrixXd m = a.matrix();
@@ -994,12 +1131,33 @@ Mat pinv(const Eigen::ArrayBase<D>& a, double rcond = 1e-15) {
     if (rank == s.size() && rank > 0) {
         Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> cod(m);
         cod.setThreshold(0.0);  // full rank by NumPy's rule: keep every direction
-        if (cod.rank() == rank) return cod.pseudoInverse().array();
+        if (cod.rank() == rank) {
+            const Eigen::MatrixXd x = cod.pseudoInverse();
+            if (detail::penrose_ratio(m, x) <= 1.0) {
+                QTRANS_AUDIT(pinv(m, x));
+                return x.array();
+            }
+        }
     }
-    for (Index i = 0; i < s.size(); ++i) s(i) = s(i) > cutoff ? 1.0 / s(i) : 0.0;
+    double dropped = 0.0;  // what the cutoff sets aside (for the audit: AXA - A is exactly that)
+    for (Index i = 0; i < s.size(); ++i) {
+        if (!(s(i) > cutoff)) dropped += s(i) * s(i);
+        s(i) = s(i) > cutoff ? 1.0 / s(i) : 0.0;
+    }
     const Eigen::MatrixXd res = svd.matrixV() * s.asDiagonal() * svd.matrixU().transpose();
+    QTRANS_AUDIT(pinv(m, res, std::sqrt(dropped)));
+    (void)dropped;
     return res.array();
 }
+
+#ifdef QTRANS_LINALG_AUDIT
+inline void audit::pinv(const Eigen::MatrixXd& a, const Eigen::MatrixXd& x, double dropped) {
+    if (a.size() == 0 || !a.allFinite() || !x.allFinite()) return;
+    const char* which = "pinv";
+    const double r = detail::penrose_ratio(a, x, &which, dropped);
+    record(which, r, 1.0);
+}
+#endif
 
 // np.einsum for one or two operands of rank <= 2 ("ij,ij->i", "ij,jk->ik", "ii->", ...).
 // Every combination of index values is visited and the products added in sequence; NumPy's
