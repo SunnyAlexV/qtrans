@@ -45,6 +45,7 @@ packages = ["qtrans", "qtrans.runtime"]  # runtime: the C++ headers the generate
 
 [tool.setuptools.package-data]
 "qtrans.runtime" = ["*.hpp"]
+"qtrans" = ["live_page.html"]  # the page qtrans live serves
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

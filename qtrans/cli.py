@@ -7,6 +7,7 @@
     python -m qtrans explain FILE.py[:FUNCTION] [--html OUT.html] [--json]
     python -m qtrans inspect FILE.py [--json]
     python -m qtrans doctor [--bind] [--json]
+    python -m qtrans live FILE.py [--port N] [--no-browser]
 
 A file that imports other modules next to it (`from bl_core import nearest_psd`) is translated
 together with them, as a project: one header per module. A folder means every module in it.
@@ -89,7 +90,15 @@ def main(argv=None) -> int:
     d.add_argument("--bind", action="store_true", help="also build and import Python bindings")
     d.add_argument("--json", action="store_true", help="machine-readable output")
 
+    lv = sub.add_parser("live", help="edit Python in the browser and see its C++ update as you type")
+    lv.add_argument("file", help="the Python file to edit (created if it doesn't exist)")
+    lv.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free one)")
+    lv.add_argument("--no-browser", action="store_true", help="don't open the browser, just print the address")
+
     args = ap.parse_args(argv)
+    if args.cmd == "live":
+        from .live import serve
+        return serve(args.file, port=args.port, open_browser=not args.no_browser)
     if args.cmd == "doctor":
         from .doctor import main as doctor
         return doctor(bind=args.bind, as_json=args.json, out=_print)

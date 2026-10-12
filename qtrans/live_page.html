@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@@NAME@@ · qtrans live</title>
+<style>
+/* Two panes like a compiler explorer: source left, output right, each Python statement and the
+   C++ it became share a tint; the cursor's statement is lit on both sides. */
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --fg: #1f2328; --muted: #6b7079; --line: #e3e2de;
+  --accent: #2a62c9; --active: rgba(42, 98, 201, .16); --hover: rgba(42, 98, 201, .08);
+  --err: #b42318; --errbg: rgba(180, 35, 24, .09); --ok: #217a3c; --warn: #9a6700;
+  --k: #8034a8; --s: #2e7d32; --n: #b45309; --c: #8b9099; --ns: #1d5fa8;
+  --b0: rgba(255, 196, 0, .10); --b1: rgba(0, 150, 255, .08); --b2: rgba(0, 190, 120, .08);
+  --b3: rgba(220, 80, 200, .07); --b4: rgba(255, 110, 60, .08); --b5: rgba(120, 100, 255, .08);
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  --ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --lh: 20px; --fs: 13.5px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #15171b; --panel: #1b1e23; --fg: #e4e6ea; --muted: #959ba5; --line: #2b2f36;
+  --accent: #7aa7ff; --active: rgba(122, 167, 255, .20); --hover: rgba(122, 167, 255, .09);
+  --err: #ff8a7a; --errbg: rgba(255, 110, 90, .12); --ok: #7bd389; --warn: #e3b341;
+  --k: #d19cf5; --s: #9ccc9c; --n: #f0a868; --c: #7e858f; --ns: #8ab4ff;
+  --b0: rgba(255, 210, 60, .07); --b1: rgba(60, 170, 255, .07); --b2: rgba(60, 210, 150, .07);
+  --b3: rgba(230, 120, 220, .07); --b4: rgba(255, 140, 90, .07); --b5: rgba(150, 130, 255, .08);
+  color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #15171b; --panel: #1b1e23; --fg: #e4e6ea; --muted: #959ba5; --line: #2b2f36;
+  --accent: #7aa7ff; --active: rgba(122, 167, 255, .20); --hover: rgba(122, 167, 255, .09);
+  --err: #ff8a7a; --errbg: rgba(255, 110, 90, .12); --ok: #7bd389; --warn: #e3b341;
+  --k: #d19cf5; --s: #9ccc9c; --n: #f0a868; --c: #7e858f; --ns: #8ab4ff;
+  --b0: rgba(255, 210, 60, .07); --b1: rgba(60, 170, 255, .07); --b2: rgba(60, 210, 150, .07);
+  --b3: rgba(230, 120, 220, .07); --b4: rgba(255, 140, 90, .07); --b5: rgba(150, 130, 255, .08);
+  color-scheme: dark; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.4 var(--ui); display: grid;
+  grid-template-rows: auto 1fr auto; overflow: hidden; }
+header { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+header .path { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+button { font: 13px var(--ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 11px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button.primary { background: var(--accent); color: var(--panel); border-color: var(--accent); }
+main { display: grid; grid-template-columns: 1fr 6px 1fr; min-height: 0; }
+.pane { display: grid; grid-template-rows: auto 1fr; min-height: 0; min-width: 0; background: var(--panel); }
+.pane h2 { margin: 0; padding: 6px 12px; font: 600 11.5px var(--ui); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: baseline; }
+.pane h2 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; }
+#split { cursor: col-resize; background: var(--line); }
+#split:hover { background: var(--accent); }
+/* the editor: a transparent textarea over the highlighted text */
+.editor { position: relative; display: grid; grid-template-columns: 4.2em 1fr; min-height: 0; overflow: hidden; }
+#gutter { overflow: hidden; font: var(--fs)/var(--lh) var(--mono); color: var(--muted); text-align: right; padding: 8px 0; user-select: none; }
+#gutter div { padding-right: 10px; height: var(--lh); position: relative; }
+#gutter div.err { color: var(--err); font-weight: 700; }
+#gutter div.err::before { content: "✗"; position: absolute; left: 6px; }
+#gutter div.edit::before { content: "…"; position: absolute; left: 6px; color: var(--warn); }
+.code { position: relative; min-width: 0; overflow: hidden; }
+#hl, #src { position: absolute; inset: 0; margin: 0; padding: 8px 12px; font: var(--fs)/var(--lh) var(--mono);
+  white-space: pre; tab-size: 4; border: 0; letter-spacing: 0; }
+#hl { overflow: hidden; pointer-events: none; }
+#hl .l { display: block; height: var(--lh); margin: 0 -12px; padding: 0 12px; }
+#src { resize: none; background: transparent; color: transparent; caret-color: var(--fg); overflow: auto; outline: none; }
+#src::selection { background: rgba(120, 150, 220, .35); color: transparent; }
+.l.err { background: var(--errbg) !important; }
+.l.edit { opacity: .55; }
+.l.active, .cl.active { background: var(--active) !important; }
+.l.hover, .cl.hover { background: var(--hover); }
+.b0 { background: var(--b0); } .b1 { background: var(--b1); } .b2 { background: var(--b2); }
+.b3 { background: var(--b3); } .b4 { background: var(--b4); } .b5 { background: var(--b5); }
+/* the C++ */
+.right { display: grid; grid-template-rows: 1fr 6px var(--why, 34%); min-height: 0; }
+#cpp { overflow: auto; font: var(--fs)/var(--lh) var(--mono); padding: 8px 0; min-height: 0; }
+#cpp .cl { display: flex; white-space: pre; min-height: var(--lh); cursor: pointer; }
+#cpp .cl.plain { cursor: default; color: var(--muted); }
+#cpp .cn { flex: 0 0 3.6em; text-align: right; padding-right: 12px; color: var(--muted); user-select: none; }
+#cpp .ct { padding-right: 16px; }
+#cpp.stale { opacity: .6; }
+#whysplit { cursor: row-resize; background: var(--line); }
+#why { overflow: auto; padding: 10px 14px; font-size: 13.5px; min-height: 0; }
+#why h3 { margin: 0 0 6px; font-size: 13px; }
+#why ul { margin: 0; padding-left: 0; list-style: none; display: grid; gap: 6px; }
+#why li { display: grid; grid-template-columns: 7.5em 1fr; gap: 8px; }
+#why .kind { font: 600 10.5px var(--ui); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding-top: 2px; }
+#why .msg { color: var(--err); }
+#why .hint { color: var(--muted); }
+#why table { border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 6px 0; }
+#why th, #why td { padding: 3px 10px 3px 0; text-align: right; } #why th:first-child, #why td:first-child { text-align: left; }
+#why pre { font: 12px/1.45 var(--mono); white-space: pre-wrap; background: var(--bg); padding: 8px; border-radius: 6px; }
+.chip { display: inline-block; font: 600 11px var(--ui); padding: 1px 8px; border-radius: 99px; border: 1px solid currentColor; }
+.chip.ok { color: var(--ok); } .chip.bad { color: var(--err); } .chip.warn { color: var(--warn); }
+footer { display: flex; gap: 16px; align-items: center; padding: 5px 14px; border-top: 1px solid var(--line); background: var(--panel); font-size: 12.5px; color: var(--muted); }
+footer .grow { flex: 1; }
+#banner { display: flex; gap: 10px; align-items: center; padding: 7px 14px; background: var(--errbg); color: var(--fg); font-size: 13px; }
+.k { color: var(--k); } .s { color: var(--s); } .n { color: var(--n); } .c { color: var(--c); font-style: italic; } .ns { color: var(--ns); }
+@media (max-width: 760px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } #split { display: none; } }
+@media (prefers-reduced-motion: no-preference) { #cpp .cl, .l { transition: background-color .12s; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>@@NAME@@</h1>
+  <span class="path" id="path"></span>
+  <button id="save" title="Ctrl+S">Save</button>
+  <button id="verify" class="primary" title="Compile and check against Python">Verify</button>
+</header>
+<div id="banner" hidden></div>
+<main id="main">
+  <section class="pane">
+    <h2>Python <span class="sub" id="pystate"></span></h2>
+    <div class="editor">
+      <div id="gutter"></div>
+      <div class="code"><pre id="hl" aria-hidden="true"></pre>
+        <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" aria-label="Python source"></textarea></div>
+    </div>
+  </section>
+  <div id="split" role="separator" aria-orientation="vertical"></div>
+  <section class="pane">
+    <h2>C++ <span class="sub" id="cppstate"></span></h2>
+    <div class="right">
+      <div id="cpp" aria-label="C++ header"></div>
+      <div id="whysplit" role="separator" aria-orientation="horizontal"></div>
+      <div id="why"><p class="hint">Put the cursor on a line of Python to see what it became and why.</p></div>
+    </div>
+  </section>
+</main>
+<footer><span id="status">Starting…</span><span class="grow"></span><span id="timing"></span><span id="dirty"></span></footer>
+<script>
+"use strict";
+const TOKEN = "@@TOKEN@@";
+const $ = id => document.getElementById(id);
+const src = $("src"), hl = $("hl"), gutter = $("gutter"), cpp = $("cpp"), why = $("why");
+let fileMtime = null, savedText = "", data = null, lastGood = null, seq = 0, timer = null;
+let pyRow = [], rowInfo = [], cppRows = [], activeRow = -1, hoverRow = -1, verifyResult = null;
+
+async function api(path, body) {
+  const opt = { headers: { "X-Qtrans-Token": TOKEN } };
+  if (body !== undefined) { opt.method = "POST"; opt.body = JSON.stringify(body); opt.headers["Content-Type"] = "application/json"; }
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  return { status: r.status, body: j };
+}
+
+// --- highlighting -------------------------------------------------------------------------
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const PYK = /\b(def|return|if|elif|else|for|while|in|not|and|or|is|None|True|False|import|from|as|class|try|except|finally|raise|assert|pass|break|continue|lambda|with|global|yield)\b/;
+const CPPK = /\b(inline|const|return|if|else|for|while|double|long|bool|void|auto|struct|namespace|try|catch|throw|static_cast|true|false|nullptr|using|template|typename|static|explicit|default|operator)\b/;
+function tokens(line, lang) {
+  const re = lang === "py"
+    ? new RegExp(String.raw`(#.*$)|("""|'''|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(\b\d+\.?\d*(?:e[-+]?\d+)?\b)|` + PYK.source, "g")
+    : new RegExp(String.raw`(//.*$)|("(?:[^"\\]|\\.)*")|(\b\d+\.?\d*(?:e[-+]?\d+)?\b)|` + CPPK.source + String.raw`|(\b(?:qt|std|Eigen)::)`, "g");
+  let out = "", pos = 0, m;
+  while ((m = re.exec(line))) {
+    out += esc(line.slice(pos, m.index));
+    const cls = m[1] ? "c" : m[2] ? "s" : m[3] ? "n" : m[4] ? "k" : "ns";
+    out += `<span class="${cls}">${esc(m[0])}</span>`;
+    pos = m.index + m[0].length;
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  return out + esc(line.slice(pos));
+}
+function highlightPython(lines) {
+  let open = null;  // a triple-quoted string still open from an earlier line
+  return lines.map(t => {
+    let html = "";
+    while (t.length) {
+      if (open) {
+        const end = t.indexOf(open);
+        if (end < 0) { html += `<span class="s">${esc(t)}</span>`; t = ""; break; }
+        html += `<span class="s">${esc(t.slice(0, end + 3))}</span>`; t = t.slice(end + 3); open = null; continue;
+      }
+      const m = /"""|'''/.exec(t), hash = t.indexOf("#");
+      if (m && (hash < 0 || m.index < hash)) {
+        const rest = t.slice(m.index + 3), close = rest.indexOf(m[0]);
+        if (close < 0) { html += tokens(t.slice(0, m.index), "py") + `<span class="s">${esc(t.slice(m.index))}</span>`; open = m[0]; t = ""; break; }
+        const cut = m.index + 3 + close + 3;
+        html += tokens(t.slice(0, m.index), "py") + `<span class="s">${esc(t.slice(m.index, cut))}</span>`; t = t.slice(cut); continue;
+      }
+      html += tokens(t, "py"); t = "";
+    }
+    return html;
+  });
+}
+
+// --- the editor ------------------------------------------------------------------------------
+function renderEditor() {
+  const lines = src.value.split("\n");
+  const html = highlightPython(lines);
+  const errs = new Set(), edits = new Set();
+  if (data && data.functions) for (const f of data.functions) if (!f.translated && f.line) errs.add(f.line);
+  if (data && data.editing) for (let i = data.editing.first; i <= data.editing.last; i++) edits.add(i);
+  if (data && !data.ok && data.error) errs.add(data.error.line);
+  hl.innerHTML = html.map((h, i) => {
+    const n = i + 1, r = pyRow[n];
+    let cls = "l";
+    if (r !== undefined && r >= 0) cls += " b" + (r % 6);
+    if (r === activeRow && r >= 0) cls += " active"; else if (r === hoverRow && r >= 0) cls += " hover";
+    if (errs.has(n)) cls += " err";
+    if (edits.has(n)) cls += " edit";
+    return `<span class="${cls}" data-n="${n}">${h || " "}</span>`;
+  }).join("") + `<span class="l"> </span>`;
+  gutter.innerHTML = lines.map((_, i) => {
+    const n = i + 1;
+    return `<div class="${errs.has(n) ? "err" : edits.has(n) ? "edit" : ""}">${n}</div>`;
+  }).join("") + "<div></div>";
+  syncScroll();
+}
+function syncScroll() { hl.scrollTop = src.scrollTop; hl.scrollLeft = src.scrollLeft; gutter.scrollTop = src.scrollTop; }
+src.addEventListener("scroll", syncScroll);
+function cursorLine() { return src.value.slice(0, src.selectionStart).split("\n").length; }
+function insert(text) {  // keeps the browser's undo history
+  if (!document.execCommand("insertText", false, text)) {
+    const a = src.selectionStart, b = src.selectionEnd;
+    src.setRangeText(text, a, b, "end"); src.dispatchEvent(new Event("input"));
+  }
+}
+src.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); save(); return; }
+  if (e.key === "Tab") {
+    e.preventDefault();
+    const v = src.value, a = src.selectionStart, b = src.selectionEnd;
+    const ls = v.lastIndexOf("\n", a - 1) + 1;
+    if (a === b && !e.shiftKey) { insert(" ".repeat(4 - ((a - ls) % 4))); return; }
+    const le = v.indexOf("\n", b - (b > a && v[b - 1] === "\n" ? 1 : 0)); const end = le < 0 ? v.length : le;
+    const block = v.slice(ls, end).split("\n");
+    const out = block.map(l => e.shiftKey ? l.replace(/^ {1,4}/, "") : "    " + l).join("\n");
+    src.setSelectionRange(ls, end); insert(out); src.setSelectionRange(ls, ls + out.length); return;
+  }
+  if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey) {
+    e.preventDefault();
+    const v = src.value, a = src.selectionStart, ls = v.lastIndexOf("\n", a - 1) + 1, line = v.slice(ls, a);
+    let ind = (line.match(/^ */) || [""])[0];
+    if (/:\s*(#.*)?$/.test(line)) ind += "    ";
+    else if (/^\s*(return|pass|raise|break|continue)\b/.test(line)) ind = ind.slice(4);
+    insert("\n" + ind); return;
+  }
+  if (e.key === "Backspace" && src.selectionStart === src.selectionEnd) {
+    const v = src.value, a = src.selectionStart, ls = v.lastIndexOf("\n", a - 1) + 1, before = v.slice(ls, a);
+    if (before.length && /^ +$/.test(before)) { e.preventDefault(); src.setSelectionRange(a - ((before.length - 1) % 4 + 1), a); insert(""); }
+  }
+});
+src.addEventListener("input", () => { renderEditor(); markDirty(); schedule(); });
+for (const ev of ["keyup", "click", "select", "focus"]) src.addEventListener(ev, () => setActive(rowOfLine(cursorLine()), true));
+src.addEventListener("mousemove", e => {
+  const r = src.getBoundingClientRect(), lh = parseFloat(getComputedStyle(src).lineHeight);
+  const n = Math.floor((e.clientY - r.top - 8 + src.scrollTop) / lh) + 1;
+  setHover(rowOfLine(n));
+});
+src.addEventListener("mouseleave", () => setHover(-1));
+
+// --- rows: a Python statement and its C++ lines ------------------------------------------------
+function buildRows() {
+  pyRow = []; rowInfo = []; cppRows = [];
+  if (!data || !data.ok) return;
+  const add = (r, fn) => { const id = rowInfo.length; rowInfo.push({ ...r, fn }); for (let n = r.first; n <= r.last; n++) pyRow[n] = id; };
+  for (const r of data.module || []) add(r, null);
+  for (const f of data.functions) if (f.translated) for (const r of f.rows) add(r, f);  // a refused function has no C++ to tie to
+  data.map.forEach((s, i) => { cppRows[i] = s ? rowOfLine(s[0]) : -1; });
+}
+function rowOfLine(n) { const r = pyRow[n]; return r === undefined ? -1 : r; }
+function renderCpp() {
+  if (!lastGood) { cpp.innerHTML = ""; return; }
+  const d = lastGood, cur = data && data.ok ? data : null;
+  cpp.classList.toggle("stale", !cur);
+  cpp.innerHTML = d.header.map((t, i) => {
+    const r = cur ? cppRows[i] : -1, s = d.map[i];
+    let cls = "cl" + (s ? "" : " plain");
+    if (r >= 0) cls += " b" + (r % 6);
+    if (r >= 0 && r === activeRow) cls += " active"; else if (r >= 0 && r === hoverRow) cls += " hover";
+    return `<div class="${cls}" data-i="${i}"><span class="cn">${i + 1}</span><span class="ct">${tokens(t, "cpp") || " "}</span></div>`;
+  }).join("");
+}
+cpp.addEventListener("click", e => {
+  const el = e.target.closest(".cl"); if (!el || !lastGood) return;
+  const s = lastGood.map[+el.dataset.i]; if (!s) return;
+  goToLine(s[0]);
+});
+cpp.addEventListener("mousemove", e => { const el = e.target.closest(".cl"); setHover(el ? cppRows[+el.dataset.i] ?? -1 : -1); });
+cpp.addEventListener("mouseleave", () => setHover(-1));
+function goToLine(n) {
+  const v = src.value; let pos = 0;
+  for (let k = 1; k < n; k++) { const j = v.indexOf("\n", pos); if (j < 0) break; pos = j + 1; }
+  src.focus(); src.setSelectionRange(pos, pos);
+  const lh = parseFloat(getComputedStyle(src).lineHeight), y = (n - 1) * lh;
+  if (y < src.scrollTop || y > src.scrollTop + src.clientHeight - 2 * lh) src.scrollTop = Math.max(0, y - src.clientHeight / 3);
+  setActive(rowOfLine(n), true);
+}
+function setActive(r, scrollCpp) {
+  const changed = r !== activeRow; activeRow = r;
+  for (const el of hl.querySelectorAll(".l")) el.classList.toggle("active", r >= 0 && pyRow[+el.dataset.n] === r);
+  let first = null;
+  for (const el of cpp.querySelectorAll(".cl")) {
+    const on = r >= 0 && cppRows[+el.dataset.i] === r; el.classList.toggle("active", on); if (on && !first) first = el;
+  }
+  if (scrollCpp && first && changed) {
+    const top = first.offsetTop - cpp.offsetTop, bottom = top + first.offsetHeight;
+    if (top < cpp.scrollTop || bottom > cpp.scrollTop + cpp.clientHeight) cpp.scrollTop = Math.max(0, top - cpp.clientHeight / 3);
+  }
+  if (changed || !verifyResult) renderWhy();
+}
+function setHover(r) {
+  if (r === hoverRow) return; hoverRow = r;
+  for (const el of hl.querySelectorAll(".l")) el.classList.toggle("hover", r >= 0 && pyRow[+el.dataset.n] === r);
+  for (const el of cpp.querySelectorAll(".cl")) el.classList.toggle("hover", r >= 0 && cppRows[+el.dataset.i] === r);
+}
+
+// --- the reasons panel ---------------------------------------------------------------------------
+function renderWhy() {
+  if (verifyResult) return renderVerify();
+  const n = cursorLine();
+  if (data && !data.ok) {
+    why.innerHTML = `<h3>Waiting for the code to parse</h3><p class="msg">line ${data.error.line}: ${esc(data.error.message)}</p>
+      <p class="hint">The C++ shown is from the last version that translated.</p>`; return;
+  }
+  if (!data) return;
+  if (data.editing && n >= data.editing.first && n <= data.editing.last) {
+    why.innerHTML = `<h3>Being edited</h3><p class="hint">Lines ${data.editing.first}–${data.editing.last} don't parse yet
+      (line ${data.editing.line}: ${esc(data.editing.message)}), so they are left out until they do; the rest of the file is translated.</p>`; return;
+  }
+  const f = (data.functions || []).find(f => n >= f.first && n <= f.last);
+  if (f && !f.translated) {
+    why.innerHTML = `<h3>${esc(f.name)} <span class="chip bad">not translated</span></h3>
+      <p class="msg">line ${f.line}: ${esc(f.reason || "")}</p>${f.hint ? `<p class="hint">hint: ${esc(f.hint)}</p>` : ""}`; return;
+  }
+  const r = rowInfo[rowOfLine(n)];
+  const title = f ? `${esc(f.name)} <span class="chip ok">translated</span>` : (r ? "Module" : "");
+  let html = title ? `<h3>${title}</h3>` : "";
+  if (r && r.reasons.length) html += "<ul>" + r.reasons.map(x => `<li><span class="kind">${esc(x.kind)}</span><span>${esc(x.text)}</span></li>`).join("") + "</ul>";
+  else if (r) html += `<p class="hint">A direct translation: nothing here needs explaining.</p>`;
+  else html += `<p class="hint">No C++ comes from this line.</p>`;
+  why.innerHTML = html;
+}
+function renderVerify() {
+  const v = verifyResult;
+  if (v.running) { why.innerHTML = `<h3>Verifying… <span class="chip warn">compiling</span></h3><p class="hint">Translating, compiling and running every function against Python on 50 random inputs each.</p>`; return; }
+  const rows = (v.functions || []).map(f => `<tr><td>${esc(f.name)}</td><td>${f.cases}</td><td>${f.match}</td><td>${f.illcond}</td><td>${f.known}</td><td>${f.mismatch}</td></tr>`).join("");
+  why.innerHTML = `<h3>Verify <span class="chip ${v.ok ? "ok" : "bad"}">${v.ok ? "pass" : "fail"}</span>
+      <button id="closeverify" style="float:right">Back to reasons</button></h3>
+    ${rows ? `<table><tr><th>function</th><th>cases</th><th>match</th><th>ill-cond</th><th>known</th><th>mismatch</th></tr>${rows}</table>` : ""}
+    <details><summary>Full report</summary><pre>${esc(v.text || "")}</pre></details>`;
+  $("closeverify").onclick = () => { verifyResult = null; renderWhy(); };
+}
+
+// --- translating, saving, watching the file ---------------------------------------------------------
+function schedule() { clearTimeout(timer); timer = setTimeout(translate, 300); }
+async function translate() {
+  const mine = ++seq, text = src.value;
+  $("status").textContent = "Translating…";
+  let res;
+  try { res = await api("/api/translate", { text }); } catch (e) { $("status").textContent = "qtrans live isn't running: start it again"; return; }
+  if (mine !== seq) return;  // a newer edit is on its way
+  data = res.body;
+  if (data.ok) lastGood = data;
+  buildRows(); renderEditor(); renderCpp(); activeRow = -1; setActive(rowOfLine(cursorLine()), document.activeElement === src); renderWhy();
+  const fs = data.functions || [], ok = fs.filter(f => f.translated).length;
+  $("status").textContent = data.ok ? `${ok} of ${fs.length} translated` + (data.editing ? ` · lines ${data.editing.first}–${data.editing.last} being edited` : "")
+                                    : `line ${data.error.line}: ${data.error.message}`;
+  $("pystate").textContent = data.ok && fs.length > ok ? `${fs.length - ok} not translated` : "";
+  $("cppstate").textContent = data.ok ? "" : "last version that translated";
+  $("timing").textContent = data.ms != null ? `${data.ms} ms` : "";
+}
+function markDirty() { const d = src.value !== savedText; $("dirty").textContent = d ? "Unsaved changes" : "Saved"; return d; }
+async function save(force) {
+  const res = await api("/api/save", { text: src.value, mtime: force ? null : fileMtime });
+  if (res.status === 409) return conflict(res.body);
+  if (res.status !== 200) { $("status").textContent = res.body.error || "Couldn't save"; return; }
+  fileMtime = res.body.mtime; savedText = src.value; markDirty(); hideBanner();
+}
+function conflict(disk) {
+  const b = $("banner"); b.hidden = false;
+  b.innerHTML = `<span>The file changed on disk while you had unsaved changes here.</span>
+    <button id="keep">Keep mine (save over it)</button><button id="load">Load the file from disk</button>`;
+  $("keep").onclick = () => save(true);
+  $("load").onclick = () => { setText(disk.text); fileMtime = disk.mtime; savedText = disk.text; markDirty(); hideBanner(); };
+}
+function hideBanner() { $("banner").hidden = true; }
+function setText(t) {
+  const line = cursorLine(), top = src.scrollTop;
+  src.value = t; src.scrollTop = top; goToLineQuiet(line); renderEditor(); schedule();
+}
+function goToLineQuiet(n) { const v = src.value; let pos = 0; for (let k = 1; k < n; k++) { const j = v.indexOf("\n", pos); if (j < 0) break; pos = j + 1; } src.setSelectionRange(pos, pos); }
+async function watch() {
+  try {
+    const r = await api("/api/mtime");
+    if (r.status === 200 && fileMtime !== null && r.body.mtime !== fileMtime) {
+      const f = await api("/api/file");
+      if (f.body.text === src.value) { fileMtime = f.body.mtime; savedText = f.body.text; markDirty(); }
+      else if (!markDirty()) { setText(f.body.text); fileMtime = f.body.mtime; savedText = f.body.text; markDirty(); }
+      else conflict(f.body);
+    }
+  } catch (e) { /* the server stopped: the status line says so on the next edit */ }
+  setTimeout(watch, 1500);
+}
+$("save").onclick = () => save();
+$("verify").onclick = async () => {
+  verifyResult = { running: true }; renderWhy();
+  const res = await api("/api/verify", { text: src.value });
+  verifyResult = res.body; renderWhy();
+};
+window.addEventListener("beforeunload", e => { if (src.value !== savedText) { e.preventDefault(); e.returnValue = ""; } });
+
+// --- resizable panes ------------------------------------------------------------------------------
+function drag(handle, onMove) {
+  handle.addEventListener("pointerdown", e => {
+    handle.setPointerCapture(e.pointerId);
+    const move = ev => onMove(ev), up = () => { handle.removeEventListener("pointermove", move); handle.removeEventListener("pointerup", up); };
+    handle.addEventListener("pointermove", move); handle.addEventListener("pointerup", up);
+  });
+}
+drag($("split"), e => { const m = $("main").getBoundingClientRect(), x = Math.min(Math.max(e.clientX - m.left, 200), m.width - 200);
+  $("main").style.gridTemplateColumns = `${x}px 6px 1fr`; });
+drag($("whysplit"), e => { const r = document.querySelector(".right").getBoundingClientRect(), h = Math.min(Math.max(r.bottom - e.clientY, 60), r.height - 80);
+  document.querySelector(".right").style.setProperty("--why", h + "px"); });
+
+(async () => {
+  const f = await api("/api/file");
+  if (f.status !== 200) { $("status").textContent = f.body.error || "Couldn't open the file"; return; }
+  $("path").textContent = f.body.path;
+  src.value = f.body.text; savedText = f.body.text; fileMtime = f.body.mtime;
+  markDirty(); renderEditor(); await translate(); src.focus(); goToLineQuiet(1); watch();
+})();
+</script>
+</body>
+</html>

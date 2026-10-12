@@ -108,6 +108,13 @@ jobs:
           python -c "from qtrans.verify import environment, find_compiler, find_eigen; print(environment(find_compiler())); print(find_eigen())"
           python -c "import pybind11; print('pybind11', pybind11.__version__)"
 
+      - name: A browser for the qtrans live page test (reference only)
+        if: matrix.reference
+        run: |
+          python -m pip install playwright==1.55.0
+          python -m playwright install --with-deps chromium
+          echo "QTRANS_REQUIRE_BROWSER=1" >> "$GITHUB_ENV"
+
       - name: qtrans doctor (checks the setup by translating, compiling and verifying a sample)
         run: python -m qtrans doctor
 

@@ -149,8 +149,9 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (415 tests). To see the Python next to its C++, ask what will happen
-before translating, or check a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
+`python -m pytest` (422 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+updating next to your Python as you type; for that, a page to keep, a look before translating
+and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -173,15 +174,30 @@ counts as a failure, so a green run means the C++ really was compiled and compar
 
 ## Python and C++ side by side
 
-`python -m qtrans explain my_model.py --html my_model.html` writes a page with your Python on
-the left and, on the right of each statement, the C++ it became. Under the C++, a line
+`python -m qtrans live my_model.py` opens an editor in your browser: your Python on the left,
+the C++ header on the right, translated again a moment after each pause in typing. Each Python
+statement and the C++ it became share a tint; the statement under the cursor is lit on both
+sides and its C++ scrolled into view, with the reasons for it underneath (hover or click a C++
+line to find its Python). A function you are halfway through writing doesn't stop the rest:
+its lines are set aside until they parse, and the page says which. A function qtrans refuses
+is marked at the line that caused it, with the reason and the hint. Ctrl+S saves to the file;
+edits made to it in another editor appear on the page, and if both sides changed it asks which
+to keep. **Verify** compiles the module and checks it against Python. It runs on your computer
+only (127.0.0.1, and every request carries a token the page was served with), needs nothing
+installed beyond qtrans, and works offline. [`tests/test_live.py`](tests/test_live.py) drives
+it in a real browser: typing a function makes its C++ appear, the cursor lights the right
+lines, Ctrl+S writes the file.
+
+For a page to keep or send:
+`python -m qtrans explain my_model.py --html my_model.html` writes a static page with your
+Python on the left and, on the right of each statement, the C++ it became. Under the C++, a line
 explains each choice that isn't a plain transcription: a NumPy broadcasting helper where the
 sizes can't be shown equal, a checked int operation, an index that may be negative, a copy
 before a store that reads the array it writes, how each array is passed and why, a documented
 Python/C++ difference that applies there. Functions qtrans refuses show the reason at the line
 that caused it, with the hint. Without `--html` the same view prints in the terminal;
-`FILE.py:FUNCTION` shows one function; `--json` gives it to other tools (the VS Code preview
-planned for 0.10 will read it). `run_examples.py` writes one page per example to
+`FILE.py:FUNCTION` shows one function; `--json` gives it to other tools (a VS Code preview
+will read it). `run_examples.py` writes one page per example to
 [`examples/cpp_out/explain/`](https://github.com/SunnyAlexV/qtrans/tree/main/examples/cpp_out/explain)
 (download one and open it in a browser).
 
@@ -995,6 +1011,7 @@ qtrans/
   core.py, types.py, library.py, report.py, typing.py (Vec, Mat)
   verify.py          compile, run, compare (incl. conditioning), benchmark
   explain.py         Python next to its C++, row by row, with reasons (text, HTML, JSON)
+  live.py, live_page.html  qtrans live: the editor page and its local server
   inspect_.py, doctor.py   what qtrans will make of a file; whether a machine is ready
   bind.py            pybind11 bindings: generate, build, check against Python
   project.py         several modules: imports followed, import order, one header each
@@ -1005,7 +1022,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               415 tests: generated text, refusals, compiled semantics, every example,
+tests/               422 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1031,8 +1048,8 @@ run_examples.py      press-Run entry point
    ([Fuzzing](#fuzzing)); every `numpy.linalg` operation audited for backward stability,
    in each verification and operation by operation ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)).
    `qtrans explain` (Python and C++ side by side, with reasons), `inspect` and `doctor`
-   ([Python and C++ side by side](#python-and-c-side-by-side)). **Next (0.10)**: the side-by-side
-   view inside VS Code, filling in as each line or block is written; traceable headers (source hash,
+   ([Python and C++ side by side](#python-and-c-side-by-side)). **0.10 so far**: `qtrans live`, the
+   editor with the C++ updating as you type. **Next**: the same inside VS Code; traceable headers (source hash,
    Python line references, CMake); a reproducible benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the
