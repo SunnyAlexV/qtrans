@@ -34,7 +34,13 @@ class ModuleReport:
         return [f for f in self.functions if not f.translated]
 
     def summary(self) -> str:
-        return f"{len(self.translated)} of {len(self.functions)} functions translated"
+        funcs = [f for f in self.functions if f.name != "(program)"]
+        prog = next((f for f in self.functions if f.name == "(program)"), None)
+        text = f"{sum(f.translated for f in funcs)} of {len(funcs)} functions translated" if funcs or not prog else ""
+        if prog is not None:
+            text += ("; " if text else "") + ("the program (main) translated" if prog.translated
+                                              else "the program (main) NOT translated")
+        return text
 
     def to_markdown(self) -> str:
         out = [f"# qtrans report: `{self.filename}`", "", f"**{self.summary()}.**", ""]

@@ -20,12 +20,12 @@ from .errors import Unsupported
 import collections
 
 from .core import dims_of, int_token, iv_of, same_dim
-from .core import cpp_string
+from .core import cpp_string, float_literal
 from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown, cpp_ident, wrap)
 from .structs import THIS
 from .classes import member_safe_name
 from .types import VEC as VEC_T
-from .types import RNG
+from .types import RNG, STR
 from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
@@ -506,6 +506,8 @@ class FunctionTranslator(ExprTranslator):
                 return Expr(self.ident(n), P_ATOM, t, simple=True, iv=self.loop_iv.get(n))
         elif n in self.params:
             t = self.params[n]
+            if t is None:  # a parameter whose type is still being worked out (from the calls)
+                raise _Unknown(n)
             dims, tok = self._var_dims(n, t)
             return Expr(self.ident(n), P_ATOM, t, simple=True, dims=dims, dimtok=tok)
         else:
@@ -728,7 +730,39 @@ class FunctionTranslator(ExprTranslator):
         return isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range"
 
     def _loop_type(self, s):
+        lit = self._literal_items(s.iter)
+        if lit is not None:
+            return lit[0]
         return INT if self._is_range(s.iter) else FLOAT
+
+    @staticmethod
+    def _literal_items(it):
+        """`for x in [0.1, 0.2, 0.5]:` (a list or tuple of numbers or strings, all of one type):
+        (type, C++ for each item), else None."""
+        if not isinstance(it, (ast.List, ast.Tuple)) or not it.elts:
+            return None
+        vals = []
+        for e in it.elts:
+            neg = isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub)
+            c = e.operand if neg else e
+            if not isinstance(c, ast.Constant) or isinstance(c.value, (complex, bytes)) or c.value is None:
+                return None
+            if neg and not isinstance(c.value, (int, float)) or (neg and isinstance(c.value, bool)):
+                return None
+            vals.append(-c.value if neg else c.value)
+        kinds = {type(v) for v in vals}
+        if len(kinds) != 1:
+            return None  # Python's loop variable would change type between iterations
+        kind = kinds.pop()
+        if kind is bool:
+            return BOOL, ["true" if v else "false" for v in vals]
+        if kind is int:
+            if any(abs(v) >= 2 ** 63 for v in vals):
+                return None
+            return INT, [f"{v}LL" for v in vals]
+        if kind is float:
+            return FLOAT, [float_literal(v)[0] for v in vals]
+        return STR, [cpp_string(v) for v in vals]
 
     def _range_lower_bound(self, s):
         """Smallest value a range() loop variable takes, if it is evident from constants."""
@@ -867,6 +901,7 @@ class FunctionTranslator(ExprTranslator):
                                       f"annotate it, e.g. {name}: float = ...")
         # notes from inference are discarded: types were provisional then
         self.notes, self._noted = [], set()
+        self.widened = set()  # locals that hold an int in some assignments, a float in others
         for name in self.locals_order:
             seen = set()
             for ev in self.events:
@@ -876,8 +911,30 @@ class FunctionTranslator(ExprTranslator):
                     except Unsupported:
                         pass
             if self.local_types[name] == FLOAT and (INT in seen or BOOL in seen):
+                self.widened.add(name)
                 self.note(f"widen:{name}", f"'{name}' holds an int in some assignments and a float in "
                                            "others; declared double (same values)")
+        # and those assigned a value that may itself be a Python int (a function returning 0 on
+        # one path, another such local): which print as 0, not 0.0 (see printing.maybe_int)
+        maybe = getattr(self.mod, "maybe_int", set())
+        changed = True
+        while changed:
+            changed = False
+            for ev in self.events:
+                n = ev.name
+                if n in self.widened or self.local_types.get(n) != FLOAT or n in self.params:
+                    continue
+                if ev.kind == "elt":
+                    p = ev.payload
+                    hit = isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and (p.func.id, ev.index[0]) in maybe
+                elif isinstance(ev.stmt, ast.AugAssign):
+                    hit = False  # x += v: x's own type decides (above)
+                else:
+                    self.current = ev.stmt
+                    hit = bool(self.maybe_int(ev.payload)) if isinstance(ev.payload, ast.AST) else False
+                if hit:
+                    self.widened.add(n)
+                    changed = True
 
     # --- pass 3b: aliasing ---------------------------------------------------------------------
     def _alias_sources(self, value, types):
@@ -1025,6 +1082,8 @@ class FunctionTranslator(ExprTranslator):
                         roots.add(subscript_root(f.value))
         elif isinstance(f, ast.Name) and f.id in self.mod.sigs:
             callee = self.mod.sigs[f.id]
+            if f.id in self.mod.printing:
+                roots.add("<output>")  # it prints: where its output goes depends on when it runs
         if callee is not None:
             pos = {p.name: i for i, p in enumerate(callee.params)}
             pairs = list(enumerate(n.args)) + [(pos.get(k.arg, -1), k.value) for k in n.keywords]
@@ -1077,15 +1136,17 @@ class FunctionTranslator(ExprTranslator):
                     roots, draw = self._effect(n, types)
                     if roots:
                         effects.append((n, roots, draw))
-        if len(effects) > 1:
+        def nested(a, b):  # one call inside the other's arguments: the inner one runs first, in both
+            return any(x is b for x in ast.walk(a)) or any(x is a for x in ast.walk(b))
+        if len(effects) > 1 and not all(nested(effects[i][0], effects[j][0])
+                                        for i in range(len(effects)) for j in range(i + 1, len(effects))):
             if all(d for _, _, d in effects):
                 raise Unsupported(s, "two random draws in one statement: C++ doesn't fix which is "
                                      "evaluated first, so the draws could be used in a different order",
                                   "draw into separate variables, one per line")
             raise Unsupported(s, "two calls that change something, in one statement: Python runs them left to "
                                  "right, C++ in an unspecified order", "make each call on its own line")
-        if effects:
-            call, roots, _ = effects[0]
+        for call, roots, _ in effects:
             inside = {id(x) for x in ast.walk(call)}
             for e in reads:
                 for x in ast.walk(e):
@@ -1479,6 +1540,13 @@ class FunctionTranslator(ExprTranslator):
         if not isinstance(v, ast.Call):
             self.note(f"noeffect:{s.lineno}", f"line {s.lineno}: expression with no effect skipped")
             return
+        if self.qualify(v.func) == "sys.exit":
+            return self.exit_call(s, v)
+        if isinstance(v.func, ast.Name) and v.func.id == "print" and not self.is_variable("print") \
+                and "print" not in self.mod.sigs:
+            line = self.print_statement(v)
+            self.emit(line if line else "// print(end=\"\") writes nothing")
+            return
         if ast.unparse(v.func) == "object.__setattr__":
             # the frozen-dataclass idiom for a derived field: object.__setattr__(self, "x", value)
             if not (self.sig.kind == "post_init" and len(v.args) == 3 and isinstance(v.args[0], ast.Name)
@@ -1495,6 +1563,27 @@ class FunctionTranslator(ExprTranslator):
             return
         e = self.expr(v)
         self.emit(f"{e.code};")
+
+    def exit_call(self, s, v):
+        """sys.exit(): from the program's own code `return status;` out of main(), elsewhere
+        std::exit(status). sys.exit(None) and sys.exit() end with status 0."""
+        if v.keywords or len(v.args) > 1:
+            raise Unsupported(s, "sys.exit() takes one argument")
+        arg = v.args[0] if v.args else None
+        code = "0"
+        if arg is not None and not (isinstance(arg, ast.Constant) and arg.value is None):
+            e = self.expr_raw(arg)
+            if e.type == VOID:  # sys.exit(main()): main returns None
+                self.emit(f"{e.code};")
+            elif e.type in (INT, BOOL):
+                code = str(int(e.value)) if isinstance(e.value, (int, bool)) else f"static_cast<int>({e.code})"
+            else:
+                raise Unsupported(arg, f"sys.exit() of a {e.type}: only an int status (or None) is supported",
+                                  "print the message, then sys.exit(1)")
+        if self.sig.cpp == "main" and self.sig.name == "(program)":
+            self.emit(f"return {code};")
+        else:
+            self.emit(f"std::exit({code});")
 
     def var_type(self, name):
         return self.params.get(name) or self.local_types[name]
@@ -1807,6 +1896,14 @@ class FunctionTranslator(ExprTranslator):
 
     def s_For(self, s):
         it = s.iter
+        lit = self._literal_items(it)
+        if lit is not None:  # over a literal list: a range-for over the same values
+            t, items = lit
+            decl = "std::string" if t == STR else t.cpp()
+            self.emit(f"for ({decl} {self.ident(s.target.id)} : {{{', '.join(items)}}}) {{")
+            self._block(s.body)
+            self.emit("}")
+            return
         if not self._is_range(it):
             arr = self.expr(it)
             if arr.type != VEC_T:
@@ -1876,18 +1973,23 @@ class FunctionTranslator(ExprTranslator):
                               f"annotate the return as `-> {ret} | None` if None is a real result")
         if ret == VOID:
             raise Unsupported(s, "returning a value from a function annotated -> None")
+        maybe = self.mod.__dict__.setdefault("maybe_int", set())
         if isinstance(s.value, ast.Tuple):
             if not isinstance(ret, TupleType) or len(ret.elts) != len(s.value.elts):
                 raise Unsupported(s, f"returns {len(s.value.elts)} values but is annotated -> {ret}")
             parts = []
-            for node, et in zip(s.value.elts, ret.elts):
+            for k, (node, et) in enumerate(zip(s.value.elts, ret.elts)):
                 e = self.expr(node)
                 self.check_assignable(et, e, s, "the return value")
+                if et == FLOAT and (e.type in (INT, BOOL) or self.maybe_int(node)):
+                    maybe.add((self.fdef.name, k))  # a Python int on this path
                 parts.append(self.as_double(e).code if et == FLOAT else e.code)
             self.emit(f"return {{{', '.join(parts)}}};")
             return
         e = self.expr(s.value)
         self.check_assignable(ret, e, s, "the return value")
+        if ret == FLOAT and (e.type in (INT, BOOL) or self.maybe_int(s.value)):
+            maybe.add((self.fdef.name, None))  # `return 0` from a float function: a Python int here
         code = self.as_double(e).code if ret == FLOAT else e.code
         self.emit(f"return {code};")
 
@@ -1907,13 +2009,13 @@ class FunctionTranslator(ExprTranslator):
             raise Unsupported(s, f"raising {cls} is not supported",
                               "use ValueError, ZeroDivisionError, ArithmeticError, OverflowError or RuntimeError")
         if not args:
-            msg = cls
-        elif len(args) == 1 and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
-            msg = args[0].value
+            msg = cpp_string(cls)
+        elif len(args) == 1:
+            e = self.text_value(args[0])  # a message: a str, an f-string, str(x), ...
+            msg = e.code
         else:
-            raise Unsupported(s, "exception messages must be plain string literals",
-                              "f-strings and formatting aren't supported in stage 1")
-        self.emit(f"throw {cpp_cls}({cpp_string(msg)});")
+            raise Unsupported(s, "an exception with several arguments is not supported", "pass one message")
+        self.emit(f"throw {cpp_cls}({msg});")
 
     def s_Assert(self, s):
         cond = self.truth(self.expr(s.test), s)

@@ -23,11 +23,13 @@ from .errors import Unsupported
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
 from .functions import FunctionTranslator, is_docstring, python_reads, source_mark, strip_marks, subscript_root, target_leaves, view_root
+from .origins import Origins
 from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, assignable, is_array)
 
 VERSION = "0.9.0"
+PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
 # code. Reported once per module instead of under every function.
@@ -35,6 +37,7 @@ GENERAL_NOTES = {"int64", "div0", "powoverflow"}
 RUNTIME_HEADER = Path(__file__).parent / "runtime" / "qtrans_runtime.hpp"
 ARRAYS_HEADER = Path(__file__).parent / "runtime" / "qtrans_arrays.hpp"
 RANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_random.hpp"
+PRINT_HEADER = Path(__file__).parent / "runtime" / "qtrans_print.hpp"
 
 
 @dataclass
@@ -89,6 +92,11 @@ class TranslationResult:
     deps: list = None      # modules of the project this one imports (their headers are included)
     line_map: list = None  # per header line: the (first, last) Python lines it came from, or None
     line_notes: dict = None  # function -> [((first, last), key, note)]: where each note applies
+    program: str | None = None      # a program (top-level code): the whole <module>.cpp, with int main()
+    program_map: list = None        # per program line: the Python lines it came from, as line_map
+    main_lines: tuple = ()          # the Python lines (first, last) of each of main()'s statements
+    library: bool = True            # anything for other code to use (functions, classes, constants)
+    prints: frozenset = frozenset()  # translated functions that print (verify compares what they print)
 
 
 def _collect_comments(source):
@@ -120,6 +128,77 @@ def _collect_comments(source):
             inline[line] = text
             cols[line] = (tok.start[1], line)
     return full, inline
+
+
+def _own_body_nodes(fdef):
+    """The nodes of a function's body, not entering functions or classes defined inside it."""
+    stack = list(fdef.body)
+    while stack:
+        n = stack.pop()
+        yield n
+        stack += [c for c in ast.iter_child_nodes(n)
+                  if not isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))]
+
+
+def _is_main_guard(node) -> bool:
+    """`if __name__ == "__main__":` (either way round)."""
+    if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare) or len(node.test.ops) != 1 \
+            or not isinstance(node.test.ops[0], ast.Eq):
+        return False
+    sides = {ast.unparse(node.test.left), ast.unparse(node.test.comparators[0])}
+    return sides in ({"__name__", "'__main__'"}, {"__name__", '"__main__"'})
+
+
+def _runs(node, index) -> bool:
+    """A module-level statement that does something when the file runs (not a definition)."""
+    if isinstance(node, ast.Expr):
+        return not isinstance(node.value, ast.Constant)  # a docstring or bare literal does nothing
+    if isinstance(node, ast.If):
+        return "__name__" not in ast.unparse(node.test)
+    return isinstance(node, (ast.For, ast.While, ast.With, ast.Try, ast.AugAssign, ast.Assert, ast.Raise,
+                             ast.Delete, ast.Match))
+
+
+def _stays_module_level(node, fn_reads) -> bool:
+    """In a program, an assignment stays a module constant only when a function reads it (or it
+    is qtrans' own setting, or a type alias); the program's other variables are main()'s."""
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+        return False
+    name = targets[0].id
+    return name in fn_reads or name.startswith("QTRANS_") or name in ("Vec", "Mat", "__all__")
+
+
+def library_tree(tree):
+    """The module without its program part (the top-level code that becomes int main()): what
+    the verifier imports to call the functions, so that importing doesn't run the program."""
+    body = tree.body
+    if not any(_is_main_guard(n) or _runs(n, i) for i, n in enumerate(body)):
+        return tree
+    fn_reads = set()
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            fn_reads |= {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    keep = [n for i, n in enumerate(body) if not (_is_main_guard(n) or _runs(n, i) or (
+        isinstance(n, (ast.Assign, ast.AnnAssign)) and not _stays_module_level(n, fn_reads)))]
+    return ast.Module(body=keep, type_ignores=[])
+
+
+class _MainTranslator(FunctionTranslator):
+    """The program's top-level code, as the body of int main(). Comments are carried over from
+    its own lines only (not from the functions and classes between its statements)."""
+
+    def __init__(self, mod, fdef, sig, skip):
+        super().__init__(mod, fdef, sig)
+        self.skip = skip  # Python lines that belong to definitions
+        self.comment_floor = fdef.comment_floor
+
+    def flush_comments(self, upto_line):
+        full = self.mod.full_comments
+        for ln in range(self.comment_floor + 1, upto_line):
+            if ln in full and ln not in self.skip:
+                self.lines.append("    " * self.depth + "// " + full[ln] + source_mark(ln, ln))
+        self.comment_floor = max(self.comment_floor, upto_line - 1)
 
 
 class _ConstTranslator(ExprTranslator):
@@ -176,6 +255,8 @@ class ModuleTranslator:
         self.ext_math_domain: set = set()  # imported functions that may raise a math domain error
         self.class_owner: dict = {}        # class name -> namespace of the module defining it
         self.translated: set = set()       # after translate(): the names that got a body
+        self.origins = Origins(self)       # which numbers are Python's and which NumPy's (for repr)
+        self.printing: set = set()         # functions that print, also through a function they call
 
     # --- annotations -----------------------------------------------------------------
     def parse_annotation(self, node, allow_void=False):
@@ -662,31 +743,39 @@ class ModuleTranslator:
                         if isinstance(n, ast.Name):
                             assigned_count[n.id] = assigned_count.get(n.id, 0) + 1
 
+        # a program (code that runs, not only definitions) becomes int main(): its statements in
+        # order, the `if __name__ == "__main__":` block's in its place
+        self.is_program = any(_is_main_guard(n) or _runs(n, i) for i, n in enumerate(body))
+        fn_reads = set()
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                fn_reads |= {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        self.main_body, self.main_error = [], None
         for i, node in enumerate(body):
             if i == 0 and is_docstring(node):
                 self.doc = inspect.cleandoc(node.value.value)
             elif id(node) in handled:
                 continue  # an import from another module of the project (see _import_project)
-            elif isinstance(node, ast.Import):
-                for a in node.names:
-                    if a.name in self.deps:
-                        continue
-                    if a.asname:
-                        self.imports[a.asname] = a.name
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                self._collect_import(node)
+            elif self.is_program and _is_main_guard(node):
+                for st in node.body:
+                    if isinstance(st, (ast.Import, ast.ImportFrom)):
+                        self._collect_import(st)
+                    elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        self.main_error = self.main_error or Unsupported(
+                            st, "a function or class defined inside `if __name__ == \"__main__\":` is not supported",
+                            "define it at module level")
                     else:
-                        top = a.name.split(".")[0]
-                        self.imports[top] = top
-            elif isinstance(node, ast.ImportFrom):
-                if node.module == "__future__":
-                    continue
-                if node.level:
-                    self.report.module_notes.append(f"line {node.lineno}: relative import ignored")
-                    continue
-                for a in node.names:
-                    if a.name == "*":
-                        self.report.module_notes.append(f"line {node.lineno}: `from {node.module} import *` ignored")
-                        continue
-                    self.imports[a.asname or a.name] = f"{node.module}.{a.name}"
+                        self.main_body.append(st)
+                if node.orelse:
+                    self.report.module_notes.append(f"line {node.orelse[0].lineno}: the `else:` of "
+                                                    "`if __name__ == \"__main__\":` runs only on import; skipped")
+            elif self.is_program and isinstance(node, (ast.Assign, ast.AnnAssign)) \
+                    and not _stays_module_level(node, fn_reads):
+                self.main_body.append(node)  # a variable of the program, not read by any function
+            elif self.is_program and _runs(node, i):
+                self.main_body.append(node)
             elif isinstance(node, ast.FunctionDef):
                 if node.name in self.fdefs:
                     self.report.module_notes.append(f"line {node.lineno}: `{node.name}` is defined twice; "
@@ -713,16 +802,222 @@ class ModuleTranslator:
             self.rejected.pop(name, None)
             self.skipped_globals.pop(name, None)
         self._collect_classes()
+        self._find_printing()
         for f in self.fdefs.values():
             self._strip_errstate(f)
+        pending = {}
         for name, f in self.fdefs.items():
             if name in self.rejected or name in self.sigs:  # methods already have theirs
                 continue
             try:
                 self.sigs[name] = self.signature(f)
             except Unsupported as e:
-                self.rejected[name] = e
+                if getattr(e, "missing_annotation", False) and "." not in name:
+                    pending[name] = e  # types left out: perhaps the file's calls show them
+                else:
+                    self.rejected[name] = e
+        if pending:
+            self._infer_from_calls(pending)
         self.analyze_array_params()
+
+    # --- types of unannotated functions, from how the file calls them ----------------------------
+    def _main_fdef(self):
+        """The program's top-level code as a function (what becomes int main())."""
+        first, last = self.main_body[0], self.main_body[-1]
+        return ast.FunctionDef(name=PROGRAM, args=ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[],
+                                                                kw_defaults=[], kwarg=None, defaults=[]),
+                               body=list(self.main_body), decorator_list=[], returns=ast.Constant(None),
+                               type_params=[], lineno=first.lineno, col_offset=0,
+                               end_lineno=last.end_lineno, end_col_offset=0)
+
+    def _provisional(self, name, f, known):
+        """A signature with what is known so far (None for a type not known yet)."""
+        a = f.args
+        nodes = list(a.posonlyargs) + list(a.args)
+        defaults = [None] * (len(nodes) - len(a.defaults)) + list(a.defaults)
+        params = []
+        for arg, d in zip(nodes, defaults):
+            t = known.get(arg.arg) if arg.annotation is None else None
+            if arg.annotation is not None:
+                try:
+                    t = self.parse_annotation(arg.annotation)
+                except Unsupported:
+                    t = None
+            params.append(Param(arg.arg, cpp_ident(arg.arg), t, None if d is None else "/* default */"))
+        returns_value = any(isinstance(n, ast.Return) and n.value is not None and not (
+            isinstance(n.value, ast.Constant) and n.value.value is None) for n in _own_body_nodes(f))
+        if f.returns is not None:
+            try:
+                ret = self.parse_annotation(f.returns, allow_void=True)
+            except Unsupported:
+                ret = None
+        else:
+            ret = known.get("return") if returns_value else VOID
+        sig = Signature(name, cpp_ident(name), params, ret, f.lineno, None)
+        sig.decorator_notes = []
+        return sig
+
+    def _infer_from_calls(self, pending):
+        """Parameters (and returns) written without a type, typed from the file itself: each
+        parameter takes the type every call passes it (and its default's); a return, the type of
+        what the body returns. A parameter called with an int in one place and a float in another
+        is refused: Python would compute with each as it is (7 // 2 against 7.0 // 2), and a C++
+        parameter has one type."""
+        from .functions import FunctionTranslator, _Unknown
+        known = {name: {} for name in pending}
+        conflict = {}
+        self.pending_sigs = {}
+        def calls_pending(f):
+            return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in pending
+                       for n in _own_body_nodes(f))
+        # only what can tell something: a function calling one of them, or one of them (its returns)
+        callers = [(name, f) for name, f in self.fdefs.items() if "." not in name and name not in self.rejected
+                   and (name in pending or calls_pending(f))]
+        main = self._main_fdef() if self.is_program and self.main_body and self.main_error is None else None
+        if main is not None and not calls_pending(main):
+            main = None
+        param_names = {name: [x.arg for x in list(self.fdefs[name].args.posonlyargs) + list(self.fdefs[name].args.args)]
+                       for name in pending}
+        for _ in range(2 * len(pending) + 3):
+            progress = False
+            self.pending_sigs = {n: self._provisional(n, self.fdefs[n], known[n]) for n in pending}
+            seen = {n: {} for n in pending}  # parameter -> {type: [lines]}
+            todo = [(f, self.sigs.get(n) or self.pending_sigs.get(n)) for n, f in callers]
+            if main is not None:
+                todo.append((main, Signature(PROGRAM, "main", [], VOID, main.lineno, None)))
+            for f, sig in todo:
+                if sig is None:
+                    continue
+                tr = FunctionTranslator(self, f, sig)
+                try:
+                    tr.scan(tr.body)
+                    tr.check_loop_vars()
+                    tr.finish_scan()
+                    tr.infer_types()
+                except Exception:  # noqa: BLE001 - what is typed so far is enough to look at the calls
+                    pass
+                tr.inferring = True
+                for call in (n for n in _own_body_nodes(f) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                             and n.func.id in pending and not tr.is_variable(n.func.id)):
+                    names = param_names[call.func.id]
+                    pairs = [(names[i], a) for i, a in enumerate(call.args) if i < len(names) and not isinstance(a, ast.Starred)]
+                    pairs += [(k.arg, k.value) for k in call.keywords if k.arg in names]
+                    for pname, a in pairs:
+                        tr.current = call
+                        try:
+                            t = tr.expr_raw(a).type
+                        except Exception:  # noqa: BLE001 - not known yet
+                            continue
+                        if t is not None and t not in (VOID, NONE):
+                            seen[call.func.id].setdefault(pname, {}).setdefault(t, []).append(a.lineno)
+                # what a pending function returns, once its parameters are known
+                name = getattr(f, "name", None)
+                if name in pending and "return" not in known[name] and sig.ret is None \
+                        and all(p.type is not None for p in sig.params):
+                    types = set()
+                    for r in (n for n in _own_body_nodes(f) if isinstance(n, ast.Return) and n.value is not None):
+                        tr.current = r
+                        try:
+                            types.add(tr.expr_raw(r.value).type)
+                        except Exception:  # noqa: BLE001 - e.g. a recursive call, not typed yet
+                            continue
+                    # one type for every return (an int on one path and a float on another would
+                    # be a Python int or float depending on the path: not one C++ type)
+                    if len(types) == 1:
+                        t = next(iter(types))
+                        if t is not None and t not in (VOID, NONE) and not isinstance(t, OptionalType):
+                            known[name]["return"] = t
+                            progress = True
+            tr0 = _ConstTranslator(self)
+            for name in pending:
+                f = self.fdefs[name]
+                a = f.args
+                nodes = list(a.posonlyargs) + list(a.args)
+                for arg, d in zip(nodes[len(nodes) - len(a.defaults):], a.defaults):
+                    if arg.annotation is None:
+                        try:
+                            seen[name].setdefault(arg.arg, {}).setdefault(tr0.expr(d).type, []).append(d.lineno)
+                        except Unsupported:
+                            pass
+                for pname, types in seen[name].items():
+                    if pname in known[name]:
+                        continue
+                    if len(types) == 1:
+                        (t, _), = types.items()
+                        if isinstance(t, (Scalar, ArrayType, StructType)) or t in (STR, RNG):
+                            known[name][pname] = t
+                            progress = True
+                    elif len(types) > 1:
+                        conflict[(name, pname)] = types
+            if not progress:
+                break
+        self.pending_sigs = {}
+        for name, e in pending.items():
+            f = self.fdefs[name]
+            missing = [x.arg for x in list(f.args.posonlyargs) + list(f.args.args) if x.annotation is None]
+            bad = [(p, conflict[(name, p)]) for p in missing if (name, p) in conflict and p not in known[name]]
+            if bad:
+                p, types = bad[0]
+                where = "; ".join(f"{t} (line {', '.join(map(str, sorted(set(ls))))})" for t, ls in types.items())
+                err = Unsupported(f, f"parameter '{p}' of {name}() is given different types by its calls: {where}; "
+                                     "a C++ parameter has one type, and Python computes with each as it is",
+                                  f"annotate it (`{p}: float`), or pass it the same type everywhere")
+                self.rejected[name] = err
+                continue
+            try:
+                sig = self.signature(f, given=known[name])
+            except Unsupported as err:
+                if getattr(err, "missing_annotation", False):
+                    err = Unsupported(f if "return annotation" in err.message else
+                                      next((x for x in f.args.args if x.annotation is None), f),
+                                      err.message + (", and no call in this file shows its type"
+                                                     if "parameter" in err.message else
+                                                     ", and its return type can't be worked out from the body"), err.hint)
+                self.rejected[name] = err
+                continue
+            shown = [f"{p}: {known[name][p]}" for p in missing if p in known[name]]
+            if f.returns is None and "return" in known[name]:
+                shown.append(f"-> {known[name]['return']}")
+            sig.decorator_notes.append("types from how the file calls it (no annotations): " + ", ".join(shown))
+            self.sigs[name] = sig
+
+    def _collect_import(self, node):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in self.deps:
+                    continue
+                if a.asname:
+                    self.imports[a.asname] = a.name
+                else:
+                    top = a.name.split(".")[0]
+                    self.imports[top] = top
+            return
+        if node.module == "__future__":
+            return
+        if node.level:
+            self.report.module_notes.append(f"line {node.lineno}: relative import ignored")
+            return
+        for a in node.names:
+            if a.name == "*":
+                self.report.module_notes.append(f"line {node.lineno}: `from {node.module} import *` ignored")
+                continue
+            self.imports[a.asname or a.name] = f"{node.module}.{a.name}"
+
+    def _find_printing(self):
+        """The functions that print, directly or through a function they call: calls to them
+        have an effect (output), so their order matters as a random draw's does."""
+        calls = {}
+        for name, f in self.fdefs.items():
+            calls[name] = {n.func.id for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            if "print" in calls[name]:
+                self.printing.add(name)
+        changed = True
+        while changed:
+            changed = False
+            for name, called in calls.items():
+                if name not in self.printing and called & self.printing:
+                    self.printing.add(name)
+                    changed = True
 
     def _qualify_path(self, node):
         parts = []
@@ -1023,7 +1318,10 @@ class ModuleTranslator:
         self.constants[name] = Constant(cpp_ident(name), t, code, lineno=node.lineno)
         self.report.constants.append(f"{name}: {t}")
 
-    def signature(self, f):
+    def signature(self, f, given=None):
+        """given: types for parameters (and "return") written without an annotation, worked out
+        from how the file calls the function (see _infer_from_calls)."""
+        given = given or {}
         a = f.args
         if a.vararg or a.kwarg or a.kwonlyargs:
             raise Unsupported(f, "*args, **kwargs and keyword-only parameters are not supported")
@@ -1040,12 +1338,14 @@ class ModuleTranslator:
         defaults = [None] * (len(nodes) - len(a.defaults)) + list(a.defaults)
         params = []
         for arg, d in zip(nodes, defaults):
-            if arg.annotation is None:
-                raise Unsupported(arg, f"parameter '{arg.arg}' has no type annotation",
-                                  f"write `{arg.arg}: float` (or int / bool) for a number, or "
-                                  f"`{arg.arg}: Vec` / `{arg.arg}: Mat` for a 1-D / 2-D float array "
-                                  f"(from qtrans.typing import Vec, Mat)")
-            t = self.parse_annotation(arg.annotation)
+            if arg.annotation is None and arg.arg not in given:
+                e = Unsupported(arg, f"parameter '{arg.arg}' has no type annotation",
+                                f"write `{arg.arg}: float` (or int / bool) for a number, or "
+                                f"`{arg.arg}: Vec` / `{arg.arg}: Mat` for a 1-D / 2-D float array "
+                                f"(from qtrans.typing import Vec, Mat)")
+                e.missing_annotation = True
+                raise e
+            t = given[arg.arg] if arg.annotation is None else self.parse_annotation(arg.annotation)
             if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType)) and t != STR:
                 raise Unsupported(arg, f"parameter '{arg.arg}': {t} parameters are not supported; "
                                        "use float, int, bool, Vec, Mat or np.random.Generator")
@@ -1063,9 +1363,18 @@ class ModuleTranslator:
                     else e.code
             params.append(Param(arg.arg, cpp_ident(arg.arg), t, code))
         if f.returns is None:
-            raise Unsupported(f, f"function '{f.name}' has no return annotation",
-                              "add -> float (or int, bool, tuple[float, float], None)")
-        ret = self.parse_annotation(f.returns, allow_void=True)
+            returns_value = any(isinstance(n, ast.Return) and n.value is not None and not (
+                isinstance(n.value, ast.Constant) and n.value.value is None) for n in _own_body_nodes(f))
+            if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in _own_body_nodes(f)):
+                raise Unsupported(f, "generators (yield) are not supported")
+            if returns_value and "return" not in given:
+                e = Unsupported(f, f"function '{f.name}' has no return annotation",
+                                "add -> float (or int, bool, tuple[float, float], None)")
+                e.missing_annotation = True
+                raise e
+            ret = given["return"] if returns_value else VOID  # no value returned: it returns None
+        else:
+            ret = self.parse_annotation(f.returns, allow_void=True)
         if ret == RNG:
             raise Unsupported(f, "returning a generator is not supported", "create it where it is used")
         doc = inspect.cleandoc(f.body[0].value.value) if f.body and is_docstring(f.body[0]) else None
@@ -1076,6 +1385,18 @@ class ModuleTranslator:
     # --- translation ---------------------------------------------------------------------------
     def translate(self) -> TranslationResult:
         self.collect()
+        self.maybe_int = set()  # (function, element or None): a float return that is a Python int on some path
+        for _ in range(len(self.fdefs) + 1):
+            known = set(self.maybe_int)
+            bodies, notes, general = self._translate_functions()
+            if self.maybe_int == known:
+                break  # what each function printed was judged knowing every int-returning one
+        self.main_lines = None
+        if self.is_program:
+            self._translate_main()
+        return self._finish(bodies, notes, general)
+
+    def _translate_functions(self):
         bodies, notes, general = {}, {}, {}
         while True:  # a function calling a rejected function is rejected too: iterate
             progress = False
@@ -1113,7 +1434,9 @@ class ModuleTranslator:
             if not progress:
                 break
             bodies, notes, general = {}, {}, {}  # retranslate: a call may now point at a rejected function
+        return bodies, notes, general
 
+    def _finish(self, bodies, notes, general):
         for info in self.classes.values():
             if info.external:
                 continue
@@ -1134,6 +1457,12 @@ class ModuleTranslator:
                 e = self.rejected[name]
                 self.report.functions.append(FunctionReport(name, f.lineno, False, e.message, e.lineno, e.hint))
 
+        if self.is_program:
+            first = self.main_body[0].lineno if self.main_body else 1
+            e = self.main_error
+            self.report.functions.append(FunctionReport(PROGRAM, first, e is None, e.message if e else None,
+                                                        e.lineno if e else None, e.hint if e else None,
+                                                        notes=getattr(self, "main_notes", [])))
         for text, names in general.items():
             self.report.general_notes.append(f"{text} (applies to: {', '.join(names)})")
         header = self.render(bodies)
@@ -1142,10 +1471,101 @@ class ModuleTranslator:
         self._build_namespace()
         uses_random = "qtrans_random.hpp" in header
         live = {n: self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None}
-        return TranslationResult(self.module_name, header, self.report, sigs, "qt::" in header,
-                                 "qtrans_arrays.hpp" in header or uses_random, uses_random, live, self.ns,
+        program = getattr(self, "program_text", None)
+        pmap = getattr(self, "program_map", None)
+        if program is not None and program.endswith("\n"):
+            pmap = pmap[:-1]
+        notes = {n: v for n, v in self.line_notes.items() if n in bodies or (n == PROGRAM and program)}
+        uses_arrays = "qtrans_arrays.hpp" in header or uses_random  # the header's needs (the program's: its text)
+        return TranslationResult(self.module_name, header, self.report, sigs, "qt::" in header + (program or ""),
+                                 uses_arrays, uses_random, live, self.ns,
                                  list(self.project_deps), self.line_map[:-1] if header.endswith("\n") else self.line_map,
-                                 {n: v for n, v in self.line_notes.items() if n in bodies})
+                                 notes, program, pmap,
+                                 self._main_spans(),
+                                 bool(sigs or live or any(not c.external for c in self.constants.values())),
+                                 frozenset(n for n in bodies if n in self.printing))
+
+    def _main_spans(self) -> tuple:
+        """The Python lines of the program: the `if __name__ == "__main__":` line, then each statement."""
+        if not self.is_program:
+            return ()
+        guard = next((n for n in self.tree.body if _is_main_guard(n)), None)
+        head = ((guard.lineno, guard.test.end_lineno),) if guard is not None else ()
+        lines = self.source.splitlines()
+        ends = sorted({n.end_lineno for n in self.tree.body} | ({guard.test.end_lineno} if guard is not None else set()))
+        spans = []
+        for st in self.main_body:
+            floor = max([e for e in ends if e < st.lineno] + [0])
+            a = st.lineno
+            while a - 1 > floor and (not lines[a - 2].strip() or lines[a - 2].lstrip().startswith("#")):
+                a -= 1  # the comments (and blank lines) just above it are the program's too
+            while a < st.lineno and not lines[a - 1].strip():
+                a += 1
+            spans.append((a, st.end_lineno))
+        return head + tuple(spans)
+
+    def _translate_main(self):
+        """The program's statements as main()'s body (self.main_lines), or why not (self.main_error)."""
+        if self.main_error is not None:
+            return
+        if not self.main_body:
+            self.main_error = Unsupported(None, "the `if __name__ == \"__main__\":` block has nothing to run")
+            return
+        later = {}
+        for name, f in self.fdefs.items():
+            later[name] = f.lineno
+        for name, info in self.classes.items():
+            if not info.external:
+                later[name] = info.node.lineno
+        for c_name, c in self.constants.items():
+            if not c.external and c.lineno:
+                later[c_name] = c.lineno
+        for st in self.main_body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and later.get(n.id, 0) > st.lineno \
+                        and not any(isinstance(x, ast.Name) and x.id == n.id and isinstance(x.ctx, ast.Store)
+                                    for b in self.main_body if b.lineno < st.lineno for x in ast.walk(b)):
+                    self.main_error = Unsupported(
+                        n, f"`{n.id}` is used here but defined further down, on line {later[n.id]}: when the file "
+                           "runs, Python raises NameError", "move the definition above this line")
+                    return
+        first, last = self.main_body[0], self.main_body[-1]
+        fdef = ast.FunctionDef(name=PROGRAM, args=ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[],
+                                                                kw_defaults=[], kwarg=None, defaults=[]),
+                               body=list(self.main_body), decorator_list=[], returns=ast.Constant(None),
+                               type_params=[], lineno=first.lineno, col_offset=0,
+                               end_lineno=last.end_lineno, end_col_offset=0)
+        # comments: from the line after whatever precedes main()'s first statement
+        prev = [n.end_lineno for n in self.tree.body if n.end_lineno < first.lineno]
+        guard = next((n for n in self.tree.body if _is_main_guard(n)), None)
+        fdef.comment_floor = max(prev) if prev else 0
+        if guard is not None and guard.lineno < first.lineno:
+            fdef.comment_floor = max(fdef.comment_floor, guard.lineno)
+        skip = set()
+        mine = {id(st) for st in self.main_body}
+        for n in self.tree.body:
+            if id(n) in mine or _is_main_guard(n):
+                continue
+            a = n.lineno
+            if isinstance(n, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
+                a = min([a] + [d.lineno for d in n.decorator_list]) - len(self.attached_comments(min([a] + [d.lineno for d in n.decorator_list])))
+            skip.update(range(a, n.end_lineno + 1))
+        self._strip_errstate(fdef)
+        sig = Signature(PROGRAM, "main", [], VOID, first.lineno, None)
+        self.sigs[PROGRAM] = sig
+        tr = _MainTranslator(self, fdef, sig, skip)
+        try:
+            self.main_lines = tr.translate()
+            self.array_users[PROGRAM] = tr.used_arrays
+            self.line_notes[PROGRAM] = [(src, key, re.sub(r"^line \d+: ", "", text))
+                                        for src, key, text in getattr(tr, "line_notes", [])]
+            self.main_notes = [text for key, text in tr.notes if key not in GENERAL_NOTES]
+            self.main_may_raise = getattr(tr, "text_may_raise", False)  # a format that can raise
+            self.main_guard = guard
+        except Unsupported as e:
+            self.main_error = e
+        finally:
+            del self.sigs[PROGRAM]
 
     # --- rendering -----------------------------------------------------------------------------
     def attached_comments(self, first_line):
@@ -1343,27 +1763,73 @@ class ModuleTranslator:
 
         out.append(f"}}  // namespace {ns}")
         text = "\n".join(out) + "\n"
+        if self.main_lines is not None:
+            empty = not own_constants and not live and not names
+            self.program_text, self.program_map = strip_marks(self._program(out, empty, bodies))
+        text, self.line_map = strip_marks(text.replace("@@INCLUDES@@", "\n".join(self._includes(text, bodies))))
+        return text
 
+    def _includes(self, text, bodies) -> list:
         includes = ["<cmath>"]
-        checks = [("<algorithm>", r"std::(max|min)\("), ("<cstdlib>", r"std::abs\("),
+        checks = [("<algorithm>", r"std::(max|min)\("), ("<cstdlib>", r"std::(abs|exit)\("),
                   ("<stdexcept>", r"throw std::"), ("<tuple>", r"std::(tuple|tie|ignore|make_tuple)"),
-                  ("<initializer_list>", r"std::(max|min)\(\{"), ("<string>", r"std::string"),
-                  ("<optional>", r"std::optional"), ("<utility>", r"std::move\(")]
+                  ("<initializer_list>", r"(?m)std::(max|min)\(\{|^\s*for \([^:;]+ : \{"), ("<string>", r"std::(string|to_string)\b"),
+                  ("<optional>", r"std::optional"), ("<utility>", r"std::move\("),
+                  ("<iostream>", r"std::(cout|cerr)\b"), ("<exception>", r"std::exception\b")]
+        code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text)  # not what string literals say
         for inc, pat in checks:
-            if re.search(pat, text):
+            if re.search(pat, code):
                 includes.append(inc)
+        if "int main()" in code and not re.search(r"std::(sqrt|exp|log|pow|fabs|floor|ceil|sin|cos|nearbyint|isnan|isinf|isfinite)|qt::", code):
+            includes.remove("<cmath>")  # nothing mathematical (a program that only prints)
         inc_lines = [f"#include {i}" for i in includes]
-        if "qt::Rng" in text:
+        if "qt::Rng" in code:
             inc_lines.append('#include "qtrans_random.hpp"  // NumPy\'s generator, plus Eigen arrays')
-        elif re.search(r"qt::(Vec|Mat|Mask2?)\b", text) or "Eigen::" in text \
-                or any(self.array_users.get(n) for n in bodies):  # e.g. qt::dot(qt::vec({...}), ...) only
+        elif re.search(r"qt::(Vec|Mat|Mask2?)\b", code) or "Eigen::" in code \
+                or any(self.array_users.get(n) for n in bodies) or (self.array_users.get(PROGRAM) and "int main()" in code):
             inc_lines.append('#include "qtrans_arrays.hpp"  // Eigen, plus NumPy semantics')
-        elif "qt::" in text:
+        elif "qt::" in code.replace("qt::py::", ""):
             inc_lines.append('#include "qtrans_runtime.hpp"')
+        if "qt::py::" in code:
+            inc_lines.append('#include "qtrans_print.hpp"  // print(), str(), repr(), format() as Python writes them')
         for d in self.project_deps:  # the modules of the project it imports from
             inc_lines.append(f'#include "{d}.hpp"  // from {d} import ...')
-        text, self.line_map = strip_marks(text.replace("@@INCLUDES@@", "\n".join(inc_lines)))
-        return text
+        return inc_lines
+
+    def _program(self, header_lines, empty_ns, bodies) -> str:
+        """<module>.cpp: the module's C++ (no #pragma once; no namespace when there is nothing in
+        it) followed by int main(), the program's top-level code."""
+        out = [f"// {self.module_name}.cpp: generated by qtrans {VERSION} from {Path(self.filename).name}.",
+               "// Edit the Python source and re-run qtrans rather than editing this file."]
+        rest = header_lines[2:]
+        rest = [l for l in rest if l != "#pragma once"]
+        if empty_ns:
+            k = rest.index(f"namespace {self.ns} {{")
+            rest = rest[:k] + [l for l in rest[k + 1:] if l != f"}}  // namespace {self.ns}" and l.strip()]
+        else:
+            rest.append("")
+        body = list(self.main_lines)
+        if not empty_ns:  # the module's own functions, classes and constants, from outside its namespace
+            body = [self.qualify_code(l) for l in body]
+        code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', "\n".join(body))
+        calls = {self.sigs[n].cpp for n in self.fdefs if n in self.sigs and n in bodies}
+        risky = getattr(self, "main_may_raise", False) or \
+            re.search(r"\bthrow\b|qt::(?!py::(str|repr|np|format|round_numpy)\b|inf\b|nan\b|pi\b|e\b|tau\b)", code) or \
+            any(re.search(rf"\b{re.escape(c)}\(", code) for c in calls)
+        guard = getattr(self, "main_guard", None)
+        head = "int main() {" + (source_mark(guard.lineno, guard.test.end_lineno) if guard is not None else "")
+        if risky:
+            # an exception Python wouldn't catch ends the program with its message and exit status 1
+            out_main = [head, "    try {"] + ["    " + l if l.strip() else l for l in body] + [
+                "    } catch (const std::exception& e) {",
+                "        std::cerr << e.what() << '\\n';",
+                "        return 1;",
+                "    }",
+                "}"]
+        else:
+            out_main = [head] + body + ["}"]
+        text = "\n".join(out + rest + out_main) + "\n"
+        return text.replace("@@INCLUDES@@", "\n".join(self._includes(text, bodies)))
 
 
 def translate_source(source: str, module_name: str = "module", filename: str = "<input>") -> TranslationResult:
@@ -1382,13 +1848,20 @@ def translate_file(path, out_dir=None) -> TranslationResult:
     if out_dir is not None:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{path.stem}.hpp").write_text(result.header, encoding="utf-8")
+        if result.library or result.program is None:
+            (out / f"{path.stem}.hpp").write_text(result.header, encoding="utf-8")
+        if result.program is not None:
+            (out / f"{path.stem}.cpp").write_text(result.program, encoding="utf-8")
         (out / f"{path.stem}_report.md").write_text(result.report.to_markdown(), encoding="utf-8")
         if result.uses_runtime:
             (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
-        if result.uses_arrays:
+        everything = result.header + (result.program or "")
+        if result.uses_arrays or "qtrans_arrays.hpp" in everything or "qtrans_random.hpp" in everything:
             (out / "qtrans_arrays.hpp").write_text(ARRAYS_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
             (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
-        if result.uses_random:
+        if result.uses_random or "qtrans_random.hpp" in everything:
             (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
+        if "qtrans_print.hpp" in result.header + (result.program or ""):
+            for h in (RUNTIME_HEADER, PRINT_HEADER):
+                (out / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")
     return result

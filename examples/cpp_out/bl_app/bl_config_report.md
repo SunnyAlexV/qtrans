@@ -4,7 +4,7 @@
 
 ## Not translated
 
-- `market_default` (line 91). line 91: parameter 'market_name' has no type annotation
+- `market_default` (line 91). line 91: parameter 'market_name' has no type annotation, and no call in this file shows its type
   - Hint: write `market_name: float` (or int / bool) for a number, or `market_name: Vec` / `market_name: Mat` for a 1-D / 2-D float array (from qtrans.typing import Vec, Mat)
 
 ## Module constants

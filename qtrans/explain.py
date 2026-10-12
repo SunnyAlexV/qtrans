@@ -24,7 +24,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .translator import VERSION
+from .translator import PROGRAM, VERSION
 
 # (pattern in the C++ of a row, kind, why). The pattern is what the reason is about, so a reason
 # is only ever shown next to C++ that contains it (tests/test_explain.py checks this).
@@ -122,6 +122,28 @@ RULES = [
     (r"catch \(const qt::linalg_error&\)", "errors",
      "except LinAlgError: catches what NumPy's routines raise; statements before the error keep "
      "their effect, as in Python"),
+    (r"^int main\(\)", "program",
+     "the code that runs when the file runs (its top level, or the `if __name__ == \"__main__\":` block) "
+     "becomes main(); an exception it doesn't catch ends it with exit status 1, as Python's does"),
+    (r"qt::py::repr\(qt::py::np\(", "printing",
+     "made by NumPy, so a NumPy scalar in Python: repr shows it as NumPy 2 does, np.float64(2.5)"),
+    (r"qt::py::repr\([^)]*\)?, \"[np]+\"\)", "printing",
+     "a tuple shows each element's repr; the ones NumPy made show as np.float64(...)"),
+    (r"qt::py::repr\(", "printing", "Python's repr(): a str in quotes, an array as array([...])"),
+    (r"qt::py::str\(", "printing",
+     "as Python prints it: a float as the shortest decimal that reads back the same (0.1, 1e+16), "
+     "an array laid out as NumPy lays it out"),
+    (r"qt::py::format\(", "printing",
+     "Python's format mini-language with CPython's own rules: the same digits, rounding and padding"),
+    (r"\? \"True\" : \"False\"", "printing", "a bool prints as True or False"),
+    (r"qt::py::round\(", "rounding",
+     "Python's round(x, n): the exact decimal value of x rounded half to even, so round(2.675, 2) is "
+     "2.67 (2.675 is really 2.67499999...), as in Python"),
+    (r"qt::py::round_numpy\(", "rounding",
+     "round() of a NumPy float64 is np.round: x times 10^n, rounded half to even, divided by 10^n, "
+     "which differs from Python's round now and then (round(np.float64(1.85), 1) is 1.8)"),
+    (r"std::to_string\(", "printing", "an int in decimal, as Python writes it"),
+    (r"std::cerr <<", "printing", "print(..., file=sys.stderr)"),
 ]
 _COMPILED = [(re.compile(p), k, w) for p, k, w in RULES]
 # translator notes that say what a rule above already says about the same C++
@@ -178,6 +200,7 @@ class FunctionView:
     hint: str | None = None
     notes: list = field(default_factory=list)
     params: list = field(default_factory=list)  # [{name, python, cpp, mode, why}]
+    spans: list = field(default_factory=list)   # the program: its lines, between the definitions
 
 
 @dataclass
@@ -267,8 +290,9 @@ def _function_defs(tree):
 def explain_result(result, source: str, filename: str = "<input>") -> ModuleView:
     """The rows of every function of a translated module (a TranslationResult)."""
     src_lines = source.splitlines()
-    header_lines = result.header.splitlines()
-    line_map = list(result.line_map or [None] * len(header_lines))
+    program = getattr(result, "program", None)
+    header_lines = (program if program is not None else result.header).splitlines()
+    line_map = list((result.program_map if program is not None else result.line_map) or [None] * len(header_lines))
     line_map += [None] * (len(header_lines) - len(line_map))
     tree = ast.parse(source)
     reports = {f.name: f for f in result.report.functions}
@@ -311,33 +335,66 @@ def explain_result(result, source: str, filename: str = "<input>") -> ModuleView
                 rows.append(Row(ln, ln, [src_lines[ln - 1]], error=why if ln == at else None))
             view = FunctionView(qual, first, last, False, rows, why, at, rep.hint if rep else None)
         views.append(view)
+    prog = reports.get(PROGRAM)
+    if prog is not None and getattr(result, "main_lines", ()):
+        views.append(_program_view(prog, result, src_lines, header_lines, line_map))
     includes = [l for l in header_lines if l.startswith("#include")]
     view = ModuleView(result.module, Path(filename).name, VERSION, views, includes,
                       list(result.report.general_notes))
-    view.module_rows = _module_rows(tree, src_lines, header_lines, line_map, views)
+    view.module_rows = _module_rows(tree, src_lines, header_lines, line_map, views, result.report.module_notes)
     return view
 
 
-def _module_rows(tree, src_lines, header_lines, line_map, views):
-    """The module's own lines: its imports against the header's includes, and its constants."""
+def _program_view(rep, result, src_lines, header_lines, line_map):
+    """The program (top-level code, int main()): rows for each of its statements."""
+    spans = [tuple(s) for s in result.main_lines]
+    first, last = min(a for a, _ in spans), max(b for _, b in spans)
+    if rep.translated:
+        rows = []
+        notes = (result.line_notes or {}).get(PROGRAM, [])
+        for a, b in spans:
+            rows += _rows_for(src_lines, header_lines, line_map, a, b, notes)
+        return FunctionView(PROGRAM, first, last, True, rows, notes=list(rep.notes), spans=spans)
+    at = rep.reason_line or first
+    rows = [Row(ln, ln, [src_lines[ln - 1]], error=rep.reason if ln == at else None)
+            for a, b in spans for ln in range(a, b + 1)]
+    return FunctionView(PROGRAM, first, last, False, rows, rep.reason, at, rep.hint, spans=spans)
+
+
+def _module_rows(tree, src_lines, header_lines, line_map, views, notes=()):
+    """The module's own lines: its imports against the header's includes, its constants, and
+    every top-level line left out, with the reason."""
     rows = []
+    for text in notes:  # "line 12: ..." from the translator: nothing is left out silently
+        m = re.match(r"line (\d+): (.*)", text)
+        if m and 1 <= int(m.group(1)) <= len(src_lines):
+            n = int(m.group(1))
+            rows.append(Row(n, n, [src_lines[n - 1]], reasons=[Reason("skipped", m.group(2))]))
     imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
     if imports:
         a, b = imports[0].lineno, imports[-1].end_lineno
-        pre = [l for l in header_lines[:header_lines.index(next(l for l in header_lines if l.startswith("namespace")))
-                                       + 1] if l.startswith(("#include", "namespace"))] \
-            if any(l.startswith("namespace") for l in header_lines) else []
+        if any(l.startswith("namespace") for l in header_lines):
+            k = header_lines.index(next(l for l in header_lines if l.startswith("namespace")))
+            pre = [l for l in header_lines[:k + 1] if l.startswith(("#include", "namespace"))]
+        else:  # a program with nothing but main(): no namespace
+            pre = [l for l in header_lines if l.startswith("#include")]
         row = Row(a, b, src_lines[a - 1:b], 1 + header_lines.index(pre[0]) if pre else 0, pre)
-        row.reasons.append(Reason("module", "the module becomes a header: the runtime it needs is included "
-                                            "(Eigen's arrays, NumPy's generator, the scalar helpers) and "
-                                            "everything goes in a namespace named after the module"))
+        if any(l.startswith("int main()") for l in header_lines):
+            row.reasons.append(Reason("module", "the program becomes one .cpp file: the runtime it needs is included "
+                                                "(Eigen's arrays, NumPy's generator, Python's printing), the "
+                                                "functions go in a namespace named after the module, and the code "
+                                                "that runs becomes int main()"))
+        else:
+            row.reasons.append(Reason("module", "the module becomes a header: the runtime it needs is included "
+                                                "(Eigen's arrays, NumPy's generator, the scalar helpers) and "
+                                                "everything goes in a namespace named after the module"))
         rows.append(row)
-    inside = [(v.first, v.last) for v in views]
+    inside = [s for v in views for s in (v.spans or [(v.first, v.last)])]
     for i, (text, span) in enumerate(zip(header_lines, line_map)):
         if span and not any(a <= span[0] <= b for a, b in inside) and not (imports and imports[0].lineno <= span[0] <= imports[-1].end_lineno):
             rows.append(Row(span[0], span[1], src_lines[span[0] - 1:span[1]], i + 1, [text],
                             [Reason("constant", "a module-level constant: an inline const, computed once")]))
-    return rows
+    return sorted(rows, key=lambda r: (r.py_first, r.py_last))
 
 
 def _params(sig, node):
@@ -380,8 +437,8 @@ def to_text(view: ModuleView, width: int = 0) -> str:
     """Two columns: Python | C++, with the reasons under each row."""
     import shutil
     width = width or max(100, shutil.get_terminal_size((140, 40)).columns)
-    left = min(max((len(l) for f in view.functions for r in f.rows for l in r.python), default=20) + 6,
-               width // 2)
+    rows = [r for f in view.functions for r in f.rows] + list(view.module_rows)
+    left = min(max((len(l) for r in rows for l in r.python), default=20) + 7, width // 2)
     right = width - left - 3
     n = len(view.functions)
     out = [f"qtrans explain: {view.file} ({n} function{'s' if n != 1 else ''})", ""]
@@ -396,7 +453,7 @@ def to_text(view: ModuleView, width: int = 0) -> str:
 
         for r in f.rows:
             pys = [(f"{r.py_first + k:>4} ", part if j == 0 else "  " + part)
-                   for k, t in enumerate(r.python) for j, part in enumerate(chunks(t, left - 8))]
+                   for k, t in enumerate(r.python) for j, part in enumerate(chunks(t, left - 7))]
             pys = [(num if j == 0 or not num.strip() else "     ", t) for j, (num, t) in enumerate(pys)]
             seen_num = set()
             fixed = []

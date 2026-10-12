@@ -19,6 +19,7 @@ from . import library as lib
 from .errors import Unsupported
 from .arrays import STACKERS, ArrayOps
 from .structs import StructOps
+from .printing import TextOps
 from .types import (BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
@@ -36,7 +37,6 @@ _UNSUPPORTED_EXPR = {
     "DictComp": ("dict comprehensions", None),
     "GeneratorExp": ("generator expressions", "use an explicit for-loop over range()"),
     "Lambda": ("lambdas", "define a named function at module level"),
-    "JoinedStr": ("f-strings", "strings can be compared, passed, returned and joined with +; not formatted"),
     "Subscript": ("indexing / subscripts", "arrays arrive in stage 2"),
     "Starred": ("starred expressions", None),
     "NamedExpr": ("walrus (:=) expressions", "assign on a separate line"),
@@ -51,14 +51,13 @@ _CMP = {ast.Lt: ("<", P_REL), ast.LtE: ("<=", P_REL), ast.Gt: (">", P_REL),
 
 _BUILTINS = {"abs", "min", "max", "float", "int", "bool", "round", "pow"}
 _REJECTED_BUILTINS = {
-    "print": "printing / I/O isn't translated; keep it in the Python caller",
+    "print": "print() returns None: call it as a statement of its own",
     "len": "len() needs sequences (arrays arrive in stage 2)",
     "sum": "sum() needs sequences; use a for-loop over range() (arrays arrive in stage 2)",
     "range": "range() is only supported as the iterable of a for-loop",
     "divmod": "divmod() returns a pair; use // and % separately",
     "isinstance": "run-time type checks have no meaning in typed C++",
     "complex": "complex numbers are not supported",
-    "str": "strings are not supported",
 }
 
 
@@ -102,7 +101,7 @@ def _outer_call(code: str):
     return None
 
 
-class ExprTranslator(ArrayOps, StructOps):
+class ExprTranslator(ArrayOps, StructOps, TextOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
@@ -307,6 +306,8 @@ class ExprTranslator(ArrayOps, StructOps):
 
     # --- operators -----------------------------------------------------------------------
     def e_BinOp(self, node):
+        if isinstance(node.op, ast.Mod) and isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
+            return self.text_value(node)  # "%.2f" % x: printf-style formatting
         return self.binop(node, node.op, self.expr(node.left), self.expr(node.right))
 
     def binop(self, node, op, L: Expr, R: Expr) -> Expr:
@@ -606,6 +607,9 @@ class ExprTranslator(ArrayOps, StructOps):
         return Expr(f"{wrap(c, P_COND - 1)} ? {wrap(b, P_COND - 1)} : {wrap(o, P_COND)}", P_COND, t,
                     dims=dims, iv=iv, dimtok=tok)
 
+    def e_JoinedStr(self, node):
+        return self.text_value(node)
+
     def e_Tuple(self, node):
         parts = [self.expr(e) for e in node.elts]
         for e, p in zip(node.elts, parts):
@@ -627,10 +631,18 @@ class ExprTranslator(ArrayOps, StructOps):
             name = f.id
             if self.is_variable(name):
                 raise Unsupported(node, f"'{name}' is a variable, not a function")
-            if name in self.mod.sigs or (name in self.mod.rejected and name in self.mod.imported):
+            if name in self.mod.sigs or name in self.mod.rejected:
                 return self.call_user(node, name)
+            pending = getattr(self.mod, "pending_sigs", {})
+            if name in pending:  # being typed from its calls (translator._infer_from_calls)
+                sig = pending[name]
+                if sig.ret is None or any(p.type is None for p in sig.params):
+                    raise _Unknown(name)
+                return Expr(f"{sig.cpp}(...)", P_ATOM, sig.ret)
             if name in self.mod.imports:
                 return self.call_library(node, self.mod.imports[name])
+            if name in ("str", "repr", "format"):
+                return self.text_value(node)
             if name in _BUILTINS:
                 return self.call_builtin(node, name)
             if name == "len" and len(node.args) == 1 and not node.keywords:
@@ -650,6 +662,9 @@ class ExprTranslator(ArrayOps, StructOps):
                 raise Unsupported(node, f"'{name}' was not translated: {self.mod.skipped_globals[name]}")
             raise Unsupported(node, f"unknown function '{name}'",
                               "define it in this file, or import it from another module of the project (from m import f)")
+        if isinstance(f, ast.Attribute) and f.attr == "format" and isinstance(f.value, ast.Constant) \
+                and isinstance(f.value.value, str):
+            return self.text_value(node)
         q = self.qualify(f)
         if q is None and isinstance(f, ast.Attribute) and not self._is_module_path(f.value):
             base = self.expr(f.value)
@@ -823,10 +838,23 @@ class ExprTranslator(ArrayOps, StructOps):
             self._arity(node, args, 0, 1)
             return self.truth(args[0], node) if args else Expr("false", P_ATOM, BOOL, value=False, simple=True)
         if name == "round":
-            if len(args) == 2:
-                raise Unsupported(node, "round(x, ndigits) is not supported: Python rounds the exact "
-                                        "decimal value of the double, which C++ can't reproduce simply",
-                                  "multiply, round and divide explicitly if you need it")
+            if len(args) == 2 and not (isinstance(node.args[1], ast.Constant) and node.args[1].value is None):
+                x, n = args
+                if n.type not in (INT, BOOL):
+                    raise Unsupported(node.args[1], f"round()'s ndigits must be an int (Python raises TypeError for a {n.type})")
+                n = self.as_type(n, INT)
+                if x.type == FLOAT:
+                    o = self.origin(node.args[0])
+                    if o == "py":  # CPython: the exact decimal value, correctly rounded
+                        return Expr(f"qt::py::round({x.code}, {n.code})", P_ATOM, FLOAT)
+                    if o == "np":  # a NumPy float64: np.round's multiply, round half to even, divide
+                        return Expr(f"qt::py::round_numpy({x.code}, {n.code})", P_ATOM, FLOAT)
+                    raise Unsupported(node, f"round({ast.unparse(node.args[0])}, ...): qtrans can't tell whether the "
+                                            "value is a Python float or a NumPy float64 here, and the two round "
+                                            "differently (round(1.85, 1) is 1.9, round(np.float64(1.85), 1) is 1.8)",
+                                      "write float(...) around it for Python's rounding")
+                return Expr(f"qt::py::round({self.as_type(x, INT).code}, {n.code})", P_ATOM, INT)
+            args = args[:1]
             self._arity(node, args, 1)
             a = args[0]
             if a.type == FLOAT:

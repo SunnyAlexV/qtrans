@@ -24,9 +24,9 @@ def safe_log(x: float) -> float:
         return -math.inf
 
 
-def describe(x: float) -> float:
-    print(f"x = {x}")
-    return x
+def lookup(x: float) -> float:
+    rates = {"base": x}  # dicts
+    return rates["base"]
 
 
 def no_annotations(x, y):

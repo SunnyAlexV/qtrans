@@ -28,11 +28,11 @@ These only matter on inputs where Python would raise an exception or overflow.
 
 ## Not translated
 
-- `stationary_bootstrap_indices` (line 28). line 28: parameter 'T' has no type annotation
+- `stationary_bootstrap_indices` (line 28). line 28: parameter 'T' has no type annotation, and no call in this file shows its type
   - Hint: write `T: float` (or int / bool) for a number, or `T: Vec` / `T: Mat` for a 1-D / 2-D float array (from qtrans.typing import Vec, Mat)
-- `paired_bootstrap` (line 59). line 59: parameter 'a' has no type annotation
+- `paired_bootstrap` (line 59). line 59: parameter 'a' has no type annotation, and no call in this file shows its type
   - Hint: write `a: float` (or int / bool) for a number, or `a: Vec` / `a: Mat` for a 1-D / 2-D float array (from qtrans.typing import Vec, Mat)
-- `sharpe_diff_test` (line 122). line 122: parameter 'a' has no type annotation
+- `sharpe_diff_test` (line 122). line 122: parameter 'a' has no type annotation, and no call in this file shows its type
   - Hint: write `a: float` (or int / bool) for a number, or `a: Vec` / `a: Mat` for a 1-D / 2-D float array (from qtrans.typing import Vec, Mat)
-- `breakeven_cost_bps` (line 162). line 162: parameter 'bt_a' has no type annotation
+- `breakeven_cost_bps` (line 162). line 162: parameter 'bt_a' has no type annotation, and no call in this file shows its type
   - Hint: write `bt_a: float` (or int / bool) for a number, or `bt_a: Vec` / `bt_a: Mat` for a 1-D / 2-D float array (from qtrans.typing import Vec, Mat)

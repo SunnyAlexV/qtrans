@@ -300,3 +300,20 @@ def _python_modules_importable():
     yield
     for p in (str(DATA), str(EXAMPLES), str(PROJECT)):
         sys.path.remove(p)
+
+
+def test_what_a_compiled_function_prints_goes_to_python_stdout(built, tmp_path, capsys):
+    """A function that prints, called from Python: its output goes through sys.stdout (so a
+    notebook shows it, in order with Python's own prints), exactly as Python's print writes it."""
+    import contextlib
+    import io
+    f = tmp_path / "talk.py"
+    f.write_text("import sys\n\n\ndef greet(n: int, x: float) -> float:\n    print('hello', n, x / 3)\n"
+                 "    print(f'{x:.2f}', file=sys.stderr)\n    return x * n\n", encoding="utf-8")
+    mod = built(f).load()
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        print("before")
+        r = mod.greet(3, 2.5)
+        print("after")
+    assert r == 7.5 and out.getvalue() == "before\nhello 3 0.8333333333333334\nafter\n" and err.getvalue() == "2.50\n"

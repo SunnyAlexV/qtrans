@@ -5,39 +5,33 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>@@NAME@@ · qtrans live</title>
 <style>
-/* Two panes like a compiler explorer: source left, output right, each Python statement and the
-   C++ it became share a tint; the cursor's statement is lit on both sides. */
+/* Two panes like a compiler explorer: source left, output right. Plain code; only the
+   statement under the cursor, and its C++, are lit. */
 :root {
   --bg: #f7f7f5; --panel: #ffffff; --fg: #1f2328; --muted: #6b7079; --line: #e3e2de;
-  --accent: #2a62c9; --active: rgba(42, 98, 201, .16); --hover: rgba(42, 98, 201, .08);
+  --accent: #2a62c9; --active: rgba(42, 98, 201, .11); --hover: rgba(42, 98, 201, .045);
   --err: #b42318; --errbg: rgba(180, 35, 24, .09); --ok: #217a3c; --warn: #9a6700;
   --k: #8034a8; --s: #2e7d32; --n: #b45309; --c: #8b9099; --ns: #1d5fa8;
-  --b0: rgba(255, 196, 0, .10); --b1: rgba(0, 150, 255, .08); --b2: rgba(0, 190, 120, .08);
-  --b3: rgba(220, 80, 200, .07); --b4: rgba(255, 110, 60, .08); --b5: rgba(120, 100, 255, .08);
   --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
   --ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --lh: 20px; --fs: 13.5px;
 }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   --bg: #15171b; --panel: #1b1e23; --fg: #e4e6ea; --muted: #959ba5; --line: #2b2f36;
-  --accent: #7aa7ff; --active: rgba(122, 167, 255, .20); --hover: rgba(122, 167, 255, .09);
+  --accent: #7aa7ff; --active: rgba(122, 167, 255, .14); --hover: rgba(122, 167, 255, .05);
   --err: #ff8a7a; --errbg: rgba(255, 110, 90, .12); --ok: #7bd389; --warn: #e3b341;
   --k: #d19cf5; --s: #9ccc9c; --n: #f0a868; --c: #7e858f; --ns: #8ab4ff;
-  --b0: rgba(255, 210, 60, .07); --b1: rgba(60, 170, 255, .07); --b2: rgba(60, 210, 150, .07);
-  --b3: rgba(230, 120, 220, .07); --b4: rgba(255, 140, 90, .07); --b5: rgba(150, 130, 255, .08);
   color-scheme: dark; } }
 :root[data-theme="dark"] {
   --bg: #15171b; --panel: #1b1e23; --fg: #e4e6ea; --muted: #959ba5; --line: #2b2f36;
-  --accent: #7aa7ff; --active: rgba(122, 167, 255, .20); --hover: rgba(122, 167, 255, .09);
+  --accent: #7aa7ff; --active: rgba(122, 167, 255, .14); --hover: rgba(122, 167, 255, .05);
   --err: #ff8a7a; --errbg: rgba(255, 110, 90, .12); --ok: #7bd389; --warn: #e3b341;
   --k: #d19cf5; --s: #9ccc9c; --n: #f0a868; --c: #7e858f; --ns: #8ab4ff;
-  --b0: rgba(255, 210, 60, .07); --b1: rgba(60, 170, 255, .07); --b2: rgba(60, 210, 150, .07);
-  --b3: rgba(230, 120, 220, .07); --b4: rgba(255, 140, 90, .07); --b5: rgba(150, 130, 255, .08);
   color-scheme: dark; }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
-body { background: var(--bg); color: var(--fg); font: 14px/1.4 var(--ui); display: grid;
+body { background: var(--bg); color: var(--fg); font: 14px/1.4 var(--ui); font-variant-ligatures: none; display: grid;
   grid-template-rows: auto 1fr auto; overflow: hidden; }
 header { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
 header h1 { font-size: 15px; margin: 0; font-weight: 600; }
@@ -59,8 +53,13 @@ main { display: grid; grid-template-columns: 1fr 6px 1fr; min-height: 0; }
 #gutter div.err { color: var(--err); font-weight: 700; }
 #gutter div.err::before { content: "✗"; position: absolute; left: 6px; }
 #gutter div.edit::before { content: "…"; position: absolute; left: 6px; color: var(--warn); }
+#gutter div.skip::before { content: "–"; position: absolute; left: 6px; color: var(--warn); }
+#why .out { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+#why .out pre { margin: 0; max-height: 40vh; overflow: auto; white-space: pre; border: 1px solid var(--line); border-radius: 4px; padding: 6px; font: 12px/1.45 var(--mono); }
+#why .out h4 { margin: 0 0 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
+#why .out .diff { background: var(--errbg); }
 .code { position: relative; min-width: 0; overflow: hidden; }
-#hl, #src { position: absolute; inset: 0; margin: 0; padding: 8px 12px; font: var(--fs)/var(--lh) var(--mono);
+#hl, #src { font-variant-ligatures: none; position: absolute; inset: 0; margin: 0; padding: 8px 12px; font: var(--fs)/var(--lh) var(--mono);
   white-space: pre; tab-size: 4; border: 0; letter-spacing: 0; }
 #hl { overflow: hidden; pointer-events: none; }
 #hl .l { display: block; height: var(--lh); margin: 0 -12px; padding: 0 12px; }
@@ -70,11 +69,9 @@ main { display: grid; grid-template-columns: 1fr 6px 1fr; min-height: 0; }
 .l.edit { opacity: .55; }
 .l.active, .cl.active { background: var(--active) !important; }
 .l.hover, .cl.hover { background: var(--hover); }
-.b0 { background: var(--b0); } .b1 { background: var(--b1); } .b2 { background: var(--b2); }
-.b3 { background: var(--b3); } .b4 { background: var(--b4); } .b5 { background: var(--b5); }
 /* the C++ */
 .right { display: grid; grid-template-rows: 1fr 6px var(--why, 34%); min-height: 0; }
-#cpp { overflow: auto; font: var(--fs)/var(--lh) var(--mono); padding: 8px 0; min-height: 0; }
+#cpp { font-variant-ligatures: none; overflow: auto; font: var(--fs)/var(--lh) var(--mono); padding: 8px 0; min-height: 0; }
 #cpp .cl { display: flex; white-space: pre; min-height: var(--lh); cursor: pointer; }
 #cpp .cl.plain { cursor: default; color: var(--muted); }
 #cpp .cn { flex: 0 0 3.6em; text-align: right; padding-right: 12px; color: var(--muted); user-select: none; }
@@ -120,7 +117,7 @@ footer .grow { flex: 1; }
   </section>
   <div id="split" role="separator" aria-orientation="vertical"></div>
   <section class="pane">
-    <h2>C++ <span class="sub" id="cppstate"></span></h2>
+    <h2>C++ <span class="sub" id="cppfile"></span> <span class="sub" id="cppstate"></span></h2>
     <div class="right">
       <div id="cpp" aria-label="C++ header"></div>
       <div id="whysplit" role="separator" aria-orientation="horizontal"></div>
@@ -190,14 +187,14 @@ function highlightPython(lines) {
 function renderEditor() {
   const lines = src.value.split("\n");
   const html = highlightPython(lines);
-  const errs = new Set(), edits = new Set();
+  const errs = new Set(), edits = new Set(), skips = new Set();
   if (data && data.functions) for (const f of data.functions) if (!f.translated && f.line) errs.add(f.line);
+  if (data && data.module) for (const r of data.module) if (r.skipped) for (let i = r.first; i <= r.last; i++) skips.add(i);
   if (data && data.editing) for (let i = data.editing.first; i <= data.editing.last; i++) edits.add(i);
   if (data && !data.ok && data.error) errs.add(data.error.line);
   hl.innerHTML = html.map((h, i) => {
     const n = i + 1, r = pyRow[n];
     let cls = "l";
-    if (r !== undefined && r >= 0) cls += " b" + (r % 6);
     if (r === activeRow && r >= 0) cls += " active"; else if (r === hoverRow && r >= 0) cls += " hover";
     if (errs.has(n)) cls += " err";
     if (edits.has(n)) cls += " edit";
@@ -205,7 +202,7 @@ function renderEditor() {
   }).join("") + `<span class="l"> </span>`;
   gutter.innerHTML = lines.map((_, i) => {
     const n = i + 1;
-    return `<div class="${errs.has(n) ? "err" : edits.has(n) ? "edit" : ""}">${n}</div>`;
+    return `<div class="${errs.has(n) ? "err" : edits.has(n) ? "edit" : skips.has(n) ? "skip" : ""}">${n}</div>`;
   }).join("") + "<div></div>";
   syncScroll();
 }
@@ -269,7 +266,6 @@ function renderCpp() {
   cpp.innerHTML = d.header.map((t, i) => {
     const r = cur ? cppRows[i] : -1, s = d.map[i];
     let cls = "cl" + (s ? "" : " plain");
-    if (r >= 0) cls += " b" + (r % 6);
     if (r >= 0 && r === activeRow) cls += " active"; else if (r >= 0 && r === hoverRow) cls += " hover";
     return `<div class="${cls}" data-i="${i}"><span class="cn">${i + 1}</span><span class="ct">${tokens(t, "cpp") || " "}</span></div>`;
   }).join("");
@@ -321,7 +317,7 @@ function renderWhy() {
     why.innerHTML = `<h3>Being edited</h3><p class="hint">Lines ${data.editing.first}–${data.editing.last} don't parse yet
       (line ${data.editing.line}: ${esc(data.editing.message)}), so they are left out until they do; the rest of the file is translated.</p>`; return;
   }
-  const f = (data.functions || []).find(f => n >= f.first && n <= f.last);
+  const f = (data.functions || []).find(f => (f.spans || [[f.first, f.last]]).some(([a, b]) => n >= a && n <= b));
   if (f && !f.translated) {
     why.innerHTML = `<h3>${esc(f.name)} <span class="chip bad">not translated</span></h3>
       <p class="msg">line ${f.line}: ${esc(f.reason || "")}</p>${f.hint ? `<p class="hint">hint: ${esc(f.hint)}</p>` : ""}`; return;
@@ -336,13 +332,35 @@ function renderWhy() {
 }
 function renderVerify() {
   const v = verifyResult;
-  if (v.running) { why.innerHTML = `<h3>Verifying… <span class="chip warn">compiling</span></h3><p class="hint">Translating, compiling and running every function against Python on 50 random inputs each.</p>`; return; }
+  if (v.running) { why.innerHTML = `<h3>Verifying… <span class="chip warn">compiling</span></h3><p class="hint">Translating, compiling and running every function against Python on 50 random inputs each, and the program itself both ways.</p>`; return; }
+  if (v.setup) {
+    why.innerHTML = `<h3>Can't verify yet <span class="chip warn">setup</span>
+        <button id="closeverify" style="float:right">Back to reasons</button></h3>
+      <p>Verifying compiles the C++ and runs it against Python, so it needs a C++ compiler (and Eigen for array code),
+      and this computer doesn't have one qtrans can find. Translating doesn't need one: the C++ on this page is complete.</p>
+      <p class="hint">${esc(v.text || "")}</p>
+      <p class="hint">Then run <code>python -m qtrans doctor</code> in a terminal: it checks everything and says what is still missing.</p>`;
+    $("closeverify").onclick = () => { verifyResult = null; renderWhy(); };
+    return;
+  }
   const rows = (v.functions || []).map(f => `<tr><td>${esc(f.name)}</td><td>${f.cases}</td><td>${f.match}</td><td>${f.illcond}</td><td>${f.known}</td><td>${f.mismatch}</td></tr>`).join("");
   why.innerHTML = `<h3>Verify <span class="chip ${v.ok ? "ok" : "bad"}">${v.ok ? "pass" : "fail"}</span>
       <button id="closeverify" style="float:right">Back to reasons</button></h3>
+    ${v.program ? programRun(v.program) : ""}
     ${rows ? `<table><tr><th>function</th><th>cases</th><th>match</th><th>ill-cond</th><th>known</th><th>mismatch</th></tr>${rows}</table>` : ""}
     <details><summary>Full report</summary><pre>${esc(v.text || "")}</pre></details>`;
   $("closeverify").onclick = () => { verifyResult = null; renderWhy(); };
+}
+
+function programRun(p) {
+  if (p.error) return `<p class="msg">The program couldn't be compared: ${esc(p.error)}</p>`;
+  const verdict = p.identical ? `Ran the Python and the C++: the same output, character for character, and the same exit status (${p.py_code}).`
+    : p.ok ? `The same output but for ${p.rounding} number(s) differing in their last digits (rounding), and the same exit status.`
+    : p.line ? `The output differs from line ${p.line}.` : `The exit status differs: Python ${p.py_code}, C++ ${p.cpp_code}.`;
+  const mark = (text) => text.split("\n").map((l, i) => `<span class="${p.line && i + 1 === p.line ? "diff" : ""}">${esc(l)}</span>`).join("\n");
+  const err = (t, who) => t && t.trim() ? `<p class="hint">${who} wrote to stderr: ${esc(t.trim().split("\n").slice(-1)[0])}</p>` : "";
+  return `<p>${verdict}</p><div class="out"><div><h4>Python (exit ${p.py_code})</h4><pre>${mark(p.python)}</pre></div>
+    <div><h4>C++ (exit ${p.cpp_code})</h4><pre>${mark(p.cpp)}</pre></div></div>${err(p.py_err, "Python")}${err(p.cpp_err, "C++")}`;
 }
 
 // --- translating, saving, watching the file ---------------------------------------------------------
@@ -361,6 +379,7 @@ async function translate() {
                                     : `line ${data.error.line}: ${data.error.message}`;
   $("pystate").textContent = data.ok && fs.length > ok ? `${fs.length - ok} not translated` : "";
   $("cppstate").textContent = data.ok ? "" : "last version that translated";
+  if (data.ok) $("cppfile").textContent = data.file || "";
   $("timing").textContent = data.ms != null ? `${data.ms} ms` : "";
 }
 function markDirty() { const d = src.value !== savedText; $("dirty").textContent = d ? "Unsaved changes" : "Saved"; return d; }

@@ -144,9 +144,9 @@ def test_includes_only_what_is_used():
 # --- refusals: every one names the line and, where possible, a fix ----------------------
 @pytest.mark.parametrize("src, expected", [
     ("def f(x):\n    return x\n", "no type annotation"),
-    ("def f(x: float):\n    return x\n", "no return annotation"),
+    ("def f(x: float):\n    if x > 0:\n        return 1\n    return 2.5\n", "no return annotation"),
     ("def f(x: list) -> float:\n    return 0.0\n", "type annotation 'list'"),
-    ("def f(x: float) -> float:\n    print(x)\n    return x\n", "print() is not supported"),
+    ("def f(x: float) -> float:\n    print(f'{x!a}')\n    return x\n", "the !a conversion"),
     ("def f(n: int) -> int:\n    for i in range(n):\n        pass\n    return i\n", "outside its for-loop"),
     ("def f(n: int) -> int:\n    for i in range(n):\n        i = 3\n    return n\n", "assigning to loop variable"),
     ("def f(x: float) -> float:\n    if x > 0:\n        return x\n", "can reach its end"),
@@ -156,8 +156,9 @@ def test_includes_only_what_is_used():
     ("def f(x: float) -> float:\n    return [x][0]\n", "not supported"),
     ("def f(x: float) -> float:\n    try:\n        return 1.0 / x\n    except ZeroDivisionError:\n        return 0.0\n",
      "catching ZeroDivisionError is not supported: x / 0.0 raises it in Python but gives inf in C++"),
-    ("def f(x: float) -> float:\n    raise ValueError(f'bad {x}')\n", "plain string literals"),
-    ("def f(x: float) -> float:\n    return round(x, 2)\n", "round(x, ndigits)"),
+    ("def f(x: float) -> float:\n    raise ValueError('bad', x)\n", "several arguments"),
+    ("from qtrans.typing import Vec\ndef f(v: Vec) -> float:\n    s = 0.0\n    for e in v:\n        s += e\n    return round(s, 2)\n",
+     "a Python float or a NumPy float64"),
     ("def f(x: float) -> float:\n    for i in range(x):\n        pass\n    return x\n", "must be ints"),
 ])
 def test_rejections(src, expected):
@@ -165,7 +166,7 @@ def test_rejections(src, expected):
 
 
 def test_rejection_propagates_to_callers():
-    r = translate_source("def bad(x: float) -> float:\n    print(x)\n    return x\n\n"
+    r = translate_source("def bad(x: float) -> float:\n    return [x][0]\n\n"
                          "def good(x: float) -> float:\n    return bad(x) + 1\n", "m")
     reasons = {f.name: f.reason for f in r.report.rejected}
     assert "calls bad()" in reasons["good"]

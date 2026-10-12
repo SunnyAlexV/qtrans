@@ -22,7 +22,7 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .translator import (ARRAYS_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
+from .translator import (ARRAYS_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
 
 
 class ProjectError(Exception):
@@ -79,14 +79,21 @@ class ProjectResult:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         for name, r in self.modules.items():
-            (out / f"{name}.hpp").write_text(r.header, encoding="utf-8")
+            if r.library or r.program is None:
+                (out / f"{name}.hpp").write_text(r.header, encoding="utf-8")
+            if r.program is not None:
+                (out / f"{name}.cpp").write_text(r.program, encoding="utf-8")
             (out / f"{name}_report.md").write_text(r.report.to_markdown(), encoding="utf-8")
         headers = [RUNTIME_HEADER]
-        if self.uses_arrays:
+        texts = [r.header + (r.program or "") for r in self.modules.values()]
+        if any("qtrans_print.hpp" in t for t in texts):
+            headers.append(PRINT_HEADER)
+        if self.uses_arrays or any("qtrans_arrays.hpp" in t or "qtrans_random.hpp" in t for t in texts):
             headers.append(ARRAYS_HEADER)
-        if self.uses_random:
+        if self.uses_random or any("qtrans_random.hpp" in t for t in texts):
             headers.append(RANDOM_HEADER)
-        if any(r.uses_runtime or r.uses_arrays for r in self.modules.values()):
+        if any(r.uses_runtime or r.uses_arrays or "qtrans_print.hpp" in r.header + (r.program or "")
+               for r in self.modules.values()):
             for h in headers:
                 (out / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")
         return out

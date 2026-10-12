@@ -152,3 +152,54 @@ def test_the_page_in_a_browser(live):
         assert "def cube(x: float) -> float:\n    return x * x * x" in live["file"].read_text(encoding="utf-8")
         assert errors == []
         browser.close()
+
+
+def test_verify_without_a_compiler_says_how_to_get_one(monkeypatch, tmp_path):
+    import qtrans.verify as V
+    from qtrans.live import verify_text
+
+    def none(explicit=None):
+        raise RuntimeError("No C++ compiler found. On Windows the simplest is GCC from winlibs.com")
+    monkeypatch.setattr(V, "find_compiler", none)
+    v = verify_text(SAMPLE, tmp_path / "model.py")
+    assert v["setup"] and not v["ok"] and "winlibs" in v["text"]
+
+
+def test_a_mingw_gcc_off_the_path_is_found_on_windows(monkeypatch, tmp_path):
+    import os
+    import qtrans.verify as V
+    exe = tmp_path / "mingw64" / "bin" / "g++.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    monkeypatch.setattr(V.shutil, "which", lambda name: None)
+    monkeypatch.setattr(V.os, "name", "nt")
+    monkeypatch.setattr(V, "_windows_gcc_candidates", lambda: iter([exe]))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv("CXX", raising=False)
+    cxx = V.find_compiler()
+    assert cxx.path == str(exe) and cxx.kind == "gnu"
+    assert os.environ["PATH"].split(os.pathsep)[0] == str(exe.parent)  # its DLLs, for the programs it builds
+
+
+def test_a_program_shows_its_main():
+    """Typed in as a script, it is a program: the page shows the whole .cpp, main() and all,
+    each line next to the Python it came from, and a line left out says why."""
+    d = translate_text("A = 1+1\nprint(A)\n", ROOT / "model.py")
+    assert d["ok"] and d["file"] == "model.cpp"
+    by_line = {}
+    for text, span in zip(d["header"], d["map"]):
+        if span:
+            by_line.setdefault(span[0], []).append(text.strip())
+    assert by_line == {1: ["long long A = 1LL + 1;"], 2: ["std::cout << A << '\\n';"]}
+    prog = next(f for f in d["functions"] if f["name"] == "(program)")
+    assert prog["translated"] and prog["spans"] == [[1, 1], [2, 2]]
+    d = translate_text("from .x import y\nprint(1)\n", ROOT / "model.py")
+    assert any(r["skipped"] and r["first"] == 1 and "relative import" in r["reasons"][0]["text"] for r in d["module"])
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_verify_runs_the_program_both_ways(live):
+    status, v = call(live, "/api/verify", {"text": "import math\nx = math.sqrt(2.0)\nprint(f'{x:.4f}', x)\n"})
+    assert status == 200 and v["ok"], v.get("text")
+    p = v["program"]
+    assert p["identical"] and p["python"] == p["cpp"] == "1.4142 1.4142135623730951\n" and p["py_code"] == 0

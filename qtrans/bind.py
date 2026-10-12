@@ -57,7 +57,7 @@ from pathlib import Path
 import numpy as np
 
 from . import verify as V
-from .translator import ARRAYS_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
+from .translator import ARRAYS_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
 from .types import (BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
                     VoidType)
 
@@ -362,6 +362,10 @@ class Binder:
         if notes:
             self.notes.setdefault(name, []).extend(notes)
         extra = "".join(", " + a for a in pyargs)
+        if name in (self.result.prints or ()):
+            # what it prints goes to Python's sys.stdout / sys.stderr (a notebook shows it), in
+            # order with Python's own output, rather than straight to the process's stdout
+            extra += ", py::call_guard<py::scoped_ostream_redirect, py::scoped_estream_redirect>()"
         doc = _doc(sig.doc)
         return [f"    m.def({_cstr(name)}, {lam}{extra}{', ' + doc if doc else ''});"]
 
@@ -805,7 +809,7 @@ def build_extension(path, out_dir=None, build_dir=None, eigen=None, module_name=
     if not any(b.bound or b.bound_classes for b in binders.values()):
         raise RuntimeError(f"nothing in {first.name} could be translated and bound")
     path = first
-    for h in (RUNTIME_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PYBIND_HEADER):
+    for h in (RUNTIME_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, PYBIND_HEADER):
         shutil.copy(h, build / h.name)
     cpp = build / f"{name}_bind.cpp"
     cpp.write_text(src, encoding="utf-8")

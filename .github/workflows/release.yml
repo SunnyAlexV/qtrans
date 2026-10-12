@@ -49,6 +49,10 @@ jobs:
           /tmp/env/bin/qtrans explain instruments.py --html instruments.html && test -s instruments.html
           /tmp/env/bin/qtrans translate black_scholes.py -o out
           /tmp/env/bin/qtrans verify instruments.py --cases 50
+          printf 'import math\nx = math.sqrt(2.0)\nprint(f"{x:.4f}", x, round(2.675, 2))\n' > hello.py
+          /tmp/env/bin/qtrans verify hello.py
+          /tmp/env/bin/qtrans translate hello.py -o out && g++ -std=c++17 -I out out/hello.cpp -o hello
+          test "$(./hello)" = "$(/tmp/env/bin/python hello.py)"
           /tmp/env/bin/qtrans bind instruments.py --check --cases 50
           /tmp/env/bin/python -c "import instruments_cpp as m; print(m.Option(100.0, 95.0, 0.5, 0.2, 0.04).price())"
 

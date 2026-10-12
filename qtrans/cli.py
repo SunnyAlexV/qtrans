@@ -11,6 +11,8 @@
 
 A file that imports other modules next to it (`from bl_core import nearest_psd`) is translated
 together with them, as a project: one header per module. A folder means every module in it.
+A file with code that runs (a script, or an `if __name__ == "__main__":` block) is a program:
+it also becomes <module>.cpp, the whole thing with an int main() you can compile and run.
 """
 from __future__ import annotations
 
@@ -47,7 +49,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="qtrans", description="Translate typed quant Python into readable C++.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    t = sub.add_parser("translate", help="write <module>.hpp (one per module) and a report")
+    t = sub.add_parser("translate", help="write <module>.hpp (one per module), <module>.cpp for a program, and a report")
     t.add_argument("files", nargs="+", help="Python files, or one folder")
     t.add_argument("-o", "--out", default=None, help="output folder (default: cpp_out next to the first file)")
 
@@ -142,8 +144,13 @@ def main(argv=None) -> int:
         out = Path(args.out) if args.out else (first if first.is_dir() else first.parent) / "cpp_out"
         project = translate_project(inputs, out)
         for m in project.order:
-            print(project.modules[m].report.to_text())
-            print(f"wrote {out / (m + '.hpp')}")
+            r = project.modules[m]
+            print(r.report.to_text())
+            if r.library or r.program is None:
+                print(f"wrote {out / (m + '.hpp')}")
+            if r.program is not None:
+                print(f"wrote {out / (m + '.cpp')}: the program, with main(); build it with")
+                print(f"  g++ -std=c++17 -O2 -I {out}{' -I <Eigen>' if r.uses_arrays else ''} {out / (m + '.cpp')} -o {m}")
         return 0 if not any(project.modules[m].report.rejected for m in project.requested) else 1
     report = verify_project(inputs, n_random=args.cases, seed=args.seed, rtol=args.rtol, atol=args.atol,
                             bench=args.bench, compiler=args.cxx, build_dir=args.build, all_modules=args.all,

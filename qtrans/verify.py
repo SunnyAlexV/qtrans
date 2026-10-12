@@ -24,7 +24,9 @@ Outcome of each test case
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
+import io
 import dataclasses
 import importlib.util
 import inspect
@@ -46,8 +48,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .translator import ARRAYS_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult, translate_file
-from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, StructType, TupleType
+from .translator import (ARRAYS_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
+                         library_tree, translate_file)
+from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, OptionalType, StructType, TupleType
 
 # Which Python exceptions a given C++ exception class stands for.
 CPP_EXC_MATCHES = {
@@ -161,6 +164,23 @@ def find_eigen(explicit: str | None = None) -> Path:
         "or set QTRANS_EIGEN to the folder that contains Eigen/Dense.")
 
 
+def _windows_gcc_candidates():
+    """Where a MinGW-w64 g++ usually is on Windows when it isn't on the PATH: unzipped from
+    winlibs.com, MSYS2, TDM-GCC, Strawberry Perl, or a conda environment."""
+    home = Path(os.environ.get("USERPROFILE", "~")).expanduser()
+    roots = [Path("C:/mingw64"), Path("C:/winlibs/mingw64"), Path("C:/msys64/ucrt64"), Path("C:/msys64/mingw64"),
+             Path("C:/TDM-GCC-64"), Path("C:/Strawberry/c"), Path("C:/Program Files/mingw64"),
+             home / "mingw64", Path(sys.prefix) / "Library" / "mingw-w64", Path(sys.prefix) / "Library"]
+    roots += sorted(Path("C:/").glob("*/mingw64")) + sorted(home.glob("*/mingw64")) + sorted(home.glob("*/*/mingw64"))
+    for r in roots:
+        exe = r / "bin" / "g++.exe"
+        try:
+            if exe.is_file():
+                yield exe
+        except OSError:
+            continue
+
+
 def find_compiler(explicit: str | None = None) -> Compiler:
     candidates = [explicit, os.environ.get("CXX"), "g++", "clang++", "c++", "cl"]
     for c in candidates:
@@ -170,10 +190,17 @@ def find_compiler(explicit: str | None = None) -> Compiler:
         if path:
             kind = "msvc" if Path(path).stem.lower() == "cl" else "gnu"
             return Compiler(path, kind)
+    if os.name == "nt":
+        for exe in _windows_gcc_candidates():
+            # its folder goes on the PATH of what qtrans runs: a MinGW program needs the
+            # compiler's own DLLs (libstdc++, libgcc) next to it or on the PATH to start
+            os.environ["PATH"] = str(exe.parent) + os.pathsep + os.environ.get("PATH", "")
+            return Compiler(str(exe), "gnu")
     raise RuntimeError(
-        "No C++ compiler found. Install one of: g++ (Linux: apt install g++; Windows with "
-        "Anaconda: conda install -c conda-forge m2w64-toolchain), clang++, or MSVC (Visual "
-        "Studio Build Tools). Or set the CXX environment variable to its path.")
+        "No C++ compiler found. On Windows the simplest is GCC from winlibs.com: download the "
+        "UCRT 64-bit zip, unzip it so that C:\\mingw64\\bin\\g++.exe exists, and qtrans finds it "
+        "(no PATH changes needed); or MSYS2's mingw-w64-ucrt-x86_64-gcc. On Linux: apt install g++; "
+        "on macOS: xcode-select --install. Or set the CXX environment variable to the compiler's path.")
 
 
 # --- results ---------------------------------------------------------------------------
@@ -191,6 +218,9 @@ class Case:
     sensitivity: float = 0.0  # Python's own relative change under a 4-ULP input nudge
     order: bool = False  # 'known' because the input breaks two checks at once (see classify)
     audit: tuple | None = None  # (numpy.linalg operations audited, worst residual / bound, which)
+    py_out: str = ""   # what the call printed, in Python
+    cpp_out: str = ""  # and in C++
+    printed_differs: bool = False
 
     @property
     def unstable(self) -> bool:
@@ -244,6 +274,7 @@ class VerifyReport:
     rtol: float
     atol: float
     environment: str = ""
+    program: ProgramCheck | None = None  # a program (top-level code): its run against the compiled one
 
     @property
     def mismatches(self):
@@ -251,7 +282,7 @@ class VerifyReport:
 
     @property
     def ok(self):
-        return not self.mismatches
+        return not self.mismatches and (self.program is None or self.program.ok)
 
     def to_text(self) -> str:
         t = self.translation.report
@@ -283,6 +314,8 @@ class VerifyReport:
                 if c.unstable:
                     lines.append(f"    {c.func}{c.args}: {c.audit[2]} left a residual {c.audit[1]:.3g} times its "
                                  "stability bound (C++ " + str(c.cpp)[:200] + ")")
+                elif c.printed_differs:
+                    lines.append(f"    {c.func}{c.args}: printed {c.py_out[:200]!r} in Python, {c.cpp_out[:200]!r} in C++")
                 else:
                     lines.append(f"    {c.func}{c.args}: Python {c.py}, C++ {c.cpp}")
         audited = [c for f in self.functions for c in f.cases if c.audit is not None and c.audit[0] > 0]
@@ -336,9 +369,12 @@ class VerifyReport:
             py = f"{c.py[1]}" if c.py[0] == "ok" else f"{c.py[1]} ({c.py[2]})"
             lines += ["", f"  'known' also counts {len(ints)} case(s) where an int left 64 bits: Python's int grows,",
                       f"  C++ raises OverflowError, e.g. {c.func}{c.args}: Python {py}"]
+        if self.program is not None:
+            lines += ["", self.program.to_text().replace("{file}", Path(self.file).name)]
         if self.warnings:
             lines += ["", "  Compiler warnings in generated code:"] + [f"    {w}" for w in self.warnings[:10]]
-        lines += ["", "  RESULT: " + ("PASS (no mismatches)" if self.ok else f"FAIL ({len(self.mismatches)} mismatches)")]
+        bad = len(self.mismatches) + (0 if self.program is None or self.program.ok else 1)
+        lines += ["", "  RESULT: " + ("PASS (no mismatches)" if self.ok else f"FAIL ({bad} mismatches)")]
         return "\n".join(lines)
 
 
@@ -616,15 +652,18 @@ def is_timeout(r) -> bool:
     return r[0] == "exc" and r[1] == "Timeout"
 
 
-def run_python(fn, args, sig, limit=None):
+def run_python(fn, args, sig, limit=None, printed=False):
     """Python's result for one call: in the worker process with a time limit of `limit`
-    seconds (PYTHON_CASE_SECONDS) while a verification runs (see PythonWorker), else here."""
+    seconds (PYTHON_CASE_SECONDS) while a verification runs (see PythonWorker), else here.
+    printed=True: (result, what the call printed)."""
     limit = PYTHON_CASE_SECONDS if limit is None else limit
     if _WORKER is not None:
-        r = _WORKER.call(fn, args, sig, limit)
+        r = _WORKER.call(fn, args, sig, limit, mode="printed" if printed else None)
         if r is not None:
-            return r
-    return _run_python(fn, args, sig)
+            if printed and (r[0] != "printed"):
+                return r, ""  # a timeout or a crash: nothing printed to compare
+            return (r[1], r[2]) if printed else r
+    return _run_python_printed(fn, args, sig) if printed else _run_python(fn, args, sig)
 
 
 def _probe_singular(fn, args, sig):
@@ -758,6 +797,18 @@ def python_near_singular(fn, case, sig) -> bool:
 
 
 def _run_python(fn, args, sig):
+    return _run_python_printed(fn, args, sig)[0]
+
+
+def _run_python_printed(fn, args, sig):
+    """(result, what the call printed)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r = _call_python(fn, args, sig)
+    return r, buf.getvalue()
+
+
+def _call_python(fn, args, sig):
     args = _call_args(args, sig)
     try:
         with warnings.catch_warnings():
@@ -766,6 +817,8 @@ def _run_python(fn, args, sig):
                 v = fn(*args)
     except Exception as e:  # noqa: BLE001 - every exception is a test outcome
         return ("exc", _py_category(e), str(e))
+    if sig.ret == VOID and not any(getattr(p, "mode", "") == "ref" for p in sig.params):
+        return ("ok", None)  # a function that only prints
     try:
         refs = [int(args[i].bit_generator.random_raw()) if p.type == RNG else args[i]
                 for i, p in enumerate(sig.params) if getattr(p, "mode", "") == "ref"]
@@ -789,7 +842,10 @@ def load_module(path, name=None):
     sys.modules[name] = mod
     sys.path.insert(0, str(path.parent))
     try:
-        spec.loader.exec_module(mod)
+        # a program's top-level code (what becomes int main()) is left out: importing the file
+        # to call its functions must not run the program (it is run on its own, see run_program)
+        tree = library_tree(ast.parse(path.read_text(encoding="utf-8"), str(path)))
+        exec(compile(tree, str(path), "exec"), mod.__dict__)
     except BaseException:
         sys.modules.pop(name, None)
         raise
@@ -826,8 +882,12 @@ def _worker_main(conn, specs, path, class_names):
             return
         key, fname, args, sig, mode = msg
         fn = _resolve(mods[key], fname)
-        r = (_probe_singular(fn, args, sig) if mode == "singular" else
-             _probe_complex(fn, args, sig) if mode == "complex" else _run_python(fn, args, sig))
+        if mode == "printed":
+            r = ("printed",) + _run_python_printed(fn, args, sig)
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):  # a function that prints: not here
+                r = (_probe_singular(fn, args, sig) if mode == "singular" else
+                     _probe_complex(fn, args, sig) if mode == "complex" else _run_python(fn, args, sig))
         try:
             conn.send(r)
         except Exception as e:  # noqa: BLE001 - a result that can't be pickled
@@ -1021,6 +1081,12 @@ static void bench(Fn&& f) {
 }
 
 int main() {
+    // what the functions print goes here, and is reported after each call (PRINTED)
+    std::ostringstream printed;
+    struct Restore {  // std::cout must have its own buffer back before `printed` goes away
+        std::streambuf* saved;
+        ~Restore() { std::cout.rdbuf(saved); }
+    } restore{std::cout.rdbuf(printed.rdbuf())};
     std::string line;
     while (std::getline(std::cin, line)) {
         std::istringstream in(line);
@@ -1052,6 +1118,13 @@ int main() {
             std::printf("AUDIT %ld %a %s\n", qt::audit::state().count, qt::audit::state().worst,
                         qt::audit::state().op[0] ? qt::audit::state().op : "-");
 #endif
+        if (mode == "CALL" && !printed.str().empty()) {
+            std::printf("PRINTED");
+            out(printed.str());
+            std::printf("\n");
+        }
+        printed.str("");
+        printed.clear();
     }
     return 0;
 }
@@ -1107,7 +1180,7 @@ def driver_source(result, header_name=None, namespace=None, targets=None) -> str
         for name, sig in res.signatures.items():
             if sig.owner:
                 continue  # methods are exercised through the functions that call them
-            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params):
+            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params) and name not in res.prints:
                 continue
             branches.append(_branch(name if single else f"{module}:{name}", sig, namespace))
     uses_arrays = any(r.uses_arrays for r, _ in modules.values()) if single else result.uses_arrays
@@ -1230,6 +1303,8 @@ def _parse_cpp_line(line, out_t):
         return ("exc", "NoOutput")
     if parts[0] == "EXC":
         return ("exc", parts[1] if len(parts) > 1 else "Exception")
+    if out_t == VOID:
+        return ("ok", None)
     toks = _Toks(parts[1:])
     values = [_parse_value(t, toks) for t in _flatten(out_t)]
     return ("ok", tuple(values) if isinstance(out_t, TupleType) else values[0])
@@ -1257,6 +1332,142 @@ def _parse_value(t, toks):
     return next(toks) == "1"
 
 
+# --- what a program prints ------------------------------------------------------------------------
+_NUMBER = re.compile(r"[-+]?(?:\d[\d_,]*\.?\d*|\.\d+)(?:[eE][-+]?\d+)?%?|[-+]?(?:inf|nan)\b")
+
+
+def _number(tok):
+    try:
+        return float(tok.replace(",", "").replace("_", "").rstrip("%"))
+    except ValueError:
+        return None
+
+
+def printed_numbers_differ(py: str, cpp: str, rtol: float, atol: float = 1e-13):
+    """Where two printed texts differ, are the differences only in numbers that agree to rounding?
+    -> (None if they do; else the first differing line), and how many numbers differed.
+
+    A computation that agrees to the last bit or two (np.linalg.solve and Eigen add in different
+    orders) prints a shortest repr that differs in its last digits: those numbers must agree
+    within rtol (or atol, near zero), as verify's other checks do. Everything that isn't a number
+    must be identical."""
+    a_lines, b_lines = py.splitlines(), cpp.splitlines()
+    if len(a_lines) != len(b_lines):
+        k = next((i for i, (x, y) in enumerate(zip(a_lines, b_lines)) if x != y), min(len(a_lines), len(b_lines)))
+        return k + 1, 0
+    differing = 0
+    for k, (x, y) in enumerate(zip(a_lines, b_lines)):
+        if x == y:
+            continue
+        xs, ys = _NUMBER.split(x), _NUMBER.split(y)
+        xn, yn = _NUMBER.findall(x), _NUMBER.findall(y)
+        if xs != ys or len(xn) != len(yn):
+            # NumPy pads array elements to one width: a different number of digits shifts the
+            # spaces; compare without the padding
+            if [t.strip() for t in xs] != [t.strip() for t in ys] or len(xn) != len(yn):
+                return k + 1, differing
+        for p, c in zip(xn, yn):
+            if p == c:
+                continue
+            pv, cv = _number(p), _number(c)
+            if pv is None or cv is None:
+                return k + 1, differing
+            if math.isnan(pv) and math.isnan(cv):
+                continue
+            if pv == cv:
+                continue
+            if not (math.isfinite(pv) and math.isfinite(cv)) or abs(pv - cv) > max(rtol * max(abs(pv), abs(cv)), atol):
+                return k + 1, differing
+            differing += 1
+    return None, differing
+
+
+def printed_agrees(py: str, cpp: str, rtol: float) -> bool:
+    return printed_numbers_differ(py, cpp, rtol)[0] is None
+
+
+@dataclass
+class ProgramCheck:
+    """`python file.py` against the compiled program: what each printed, and its exit status."""
+    py_out: str = ""
+    cpp_out: str = ""
+    py_code: int = 0
+    cpp_code: int = 0
+    py_err: str = ""
+    cpp_err: str = ""
+    seconds_py: float = 0.0
+    seconds_cpp: float = 0.0
+    line: int | None = None    # the first line of output that differs
+    rounding: int = 0          # numbers that differ only by rounding
+    error: str = ""            # it couldn't be run (a timeout)
+
+    @property
+    def ok(self):
+        return not self.error and self.line is None and self.py_code == self.cpp_code
+
+    @property
+    def identical(self):
+        return self.ok and self.py_out == self.cpp_out
+
+    def to_text(self) -> str:
+        n = len(self.py_out.splitlines())
+        head = (f"  program: `python {{file}}` and the compiled program, run the same way: "
+                f"{n} line(s) of output, exit status {self.py_code}")
+        if self.error:
+            return head + f"\n    {self.error}"
+        if self.identical:
+            return head + f"\n    output identical, character for character; exit status the same" + \
+                f" ({self.seconds_py:.2f} s in Python, {self.seconds_cpp:.2f} s in C++)"
+        out = [head]
+        if self.line is None and self.rounding:
+            out.append(f"    output the same but for {self.rounding} number(s) that differ in their last digits "
+                       "(agreeing within rtol: the last bit or two of a computation, as above)")
+        elif self.line is not None:
+            a = self.py_out.splitlines()
+            b = self.cpp_out.splitlines()
+            out.append(f"    OUTPUT DIFFERS at line {self.line}:")
+            out.append(f"      Python: {a[self.line - 1] if self.line <= len(a) else '(no line)'}")
+            out.append(f"      C++:    {b[self.line - 1] if self.line <= len(b) else '(no line)'}")
+        if self.py_code != self.cpp_code:
+            out.append(f"    EXIT STATUS DIFFERS: Python {self.py_code}, C++ {self.cpp_code}")
+        for name, err in (("Python", self.py_err), ("C++", self.cpp_err)):
+            if err.strip():
+                out.append(f"    {name} wrote to stderr: " + err.strip().splitlines()[-1][:200])
+        return "\n".join(out)
+
+
+PROGRAM_SECONDS = 120.0
+
+
+def run_program(py_file, exe, rtol) -> ProgramCheck:
+    """Run the Python file and the compiled program, each in the file's folder, and compare."""
+    folder = Path(py_file).resolve().parent
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    here = str(Path(__file__).resolve().parent.parent)  # this qtrans, for `from qtrans.typing import Vec`
+    env["PYTHONPATH"] = os.pathsep.join(x for x in (env.get("PYTHONPATH"), here) if x)
+    chk = ProgramCheck()
+    try:
+        t0 = time.perf_counter()
+        p = subprocess.run([sys.executable, str(Path(py_file).resolve())], capture_output=True, cwd=folder, env=env,
+                           timeout=PROGRAM_SECONDS)
+        chk.seconds_py = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        c = subprocess.run([str(exe)], capture_output=True, cwd=folder, timeout=PROGRAM_SECONDS)
+        chk.seconds_cpp = time.perf_counter() - t0
+    except subprocess.TimeoutExpired as e:
+        chk.error = f"it didn't finish within {PROGRAM_SECONDS:g} s ({Path(str(e.cmd[0])).name})"
+        return chk
+
+    def text(b):
+        return b.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    chk.py_out, chk.cpp_out = text(p.stdout), text(c.stdout)
+    chk.py_err, chk.cpp_err = text(p.stderr), text(c.stderr)
+    chk.py_code, chk.cpp_code = p.returncode, c.returncode
+    if chk.py_out != chk.cpp_out:
+        chk.line, chk.rounding = printed_numbers_differ(chk.py_out, chk.cpp_out, rtol)
+    return chk
+
+
 # --- comparison ---------------------------------------------------------------------------------
 def ulp_distance(a: float, b: float) -> int:
     def key(x):
@@ -1267,6 +1478,8 @@ def ulp_distance(a: float, b: float) -> int:
 
 def _compare_values(pv, cv, t, rtol, atol):
     """-> (equal, rel_err, ulps)"""
+    if t == VOID:
+        return (True, 0.0, 0)
     if isinstance(t, TupleType):
         worst = (True, 0.0, 0)
         for a, b, et in zip(pv, cv, t.elts):
@@ -1698,8 +1911,8 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         for name, sig in result.signatures.items():
             if sig.owner:
                 continue  # methods are checked through the functions that use them
-            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params):
-                continue
+            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params) and name not in result.prints:
+                continue  # nothing to compare
             tol = tolerances.get(name, rtol)
             f_rtol, f_atol = (tol, atol) if isinstance(tol, (int, float)) else tuple(tol)
             fc = FunctionCheck(name, rtol=f_rtol, atol=f_atol)
@@ -1733,7 +1946,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 if hung_on_edge and edge_inputs(c.args):
                     fc.timeouts += 1  # it hung on such inputs before: don't wait for it again
                     continue
-                c.py = run_python(fn, c.args, sig)
+                c.py, c.py_out = run_python(fn, c.args, sig, printed=True)
                 if is_timeout(c.py):
                     fc.timeouts += 1
                     if edge_inputs(c.args) and not hung_on_edge:
@@ -1756,6 +1969,10 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
     driver.write_text(src, encoding="utf-8")
     if not (build / "qtrans_runtime.hpp").exists():
         shutil.copy(RUNTIME_HEADER, build / "qtrans_runtime.hpp")
+    shutil.copy(PRINT_HEADER, build / "qtrans_print.hpp")
+    for m, r in project.modules.items():  # the driver includes each module's header, programs' too
+        if not (build / f"{m}.hpp").exists():
+            (build / f"{m}.hpp").write_text(r.header, encoding="utf-8")
     system = []
     if project.uses_arrays:
         shutil.copy(ARRAYS_HEADER, build / "qtrans_arrays.hpp")
@@ -1782,24 +1999,31 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 index.append((fc, c))
     run = subprocess.run([str(exe)], input="".join(x + "\n" for x in lines), capture_output=True, text=True,
                          encoding="utf-8", errors="replace", timeout=600)
-    outputs, audits = [], []
+    outputs, audits, printed = [], [], []
     for out_line in run.stdout.splitlines():
         if out_line.startswith("AUDIT ") and outputs:
             audits[-1] = _parse_audit(out_line)
+        elif out_line.startswith("PRINTED ") and outputs:
+            printed[-1] = bytes.fromhex(out_line.split()[1][1:]).decode("utf-8", errors="replace")
         else:
             outputs.append(out_line)
             audits.append(None)
+            printed.append("")
     if len(outputs) != len(lines):
         raise RuntimeError(f"C++ driver produced {len(outputs)} results for {len(lines)} cases "
                            f"(exit code {run.returncode}): {run.stderr[-500:]}")
     nudge_rng = np.random.default_rng(seed + 1)
     normwise = lapack_functions(project.paths[targets[0]]) if single else project_lapack_functions(project)
     linalg = linalg_functions(project.paths.values())
-    for (fc, c), outline, audit in zip(index, outputs, audits):
+    for (fc, c), outline, audit, out_text in zip(index, outputs, audits, printed):
         sig = project.modules[fc.module].signatures[fc.name]
         c.cpp = _parse_cpp_line(outline, output_type(sig))
         c.audit = audit
+        c.cpp_out = out_text
         classify(c, output_type(sig), fc.rtol, fc.atol)
+        if c.outcome == "match" and c.py_out != c.cpp_out and not printed_agrees(c.py_out, c.cpp_out, fc.rtol):
+            c.outcome = "mismatch"  # same result, but it printed something else
+            c.printed_differs = True
         if c.unstable:
             continue  # a linalg operation broke its stability bound: a failure, whatever the values
         if c.outcome == "mismatch" and python_went_complex(getattr(pymods[fc.module], fc.name), c.args, sig):
@@ -1858,6 +2082,26 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         warns = [w.strip() for w in diagnostics if "warning" in w.lower() and f"{module}.hpp" in w]
         reports[module] = VerifyReport(str(project.paths[module]), project.modules[module], f"{Path(cxx.path).name}",
                                        " ".join(cmd), warns, checks[module], rtol, atol, env)
+        result = project.modules[module]
+        if result.program is not None:  # a program: run it both ways and compare what it prints
+            src = build / f"{module}.cpp"
+            src.write_text(result.program, encoding="utf-8")
+            for h in (RUNTIME_HEADER, PRINT_HEADER):
+                shutil.copy(h, build / h.name)
+            prog_system = list(system)
+            if "qtrans_arrays.hpp" in result.program or "qtrans_random.hpp" in result.program:
+                shutil.copy(ARRAYS_HEADER, build / "qtrans_arrays.hpp")
+                shutil.copy(RANDOM_HEADER, build / "qtrans_random.hpp")
+                if not prog_system:
+                    prog_system.append(find_eigen(eigen))
+            prog = build / (f"{module}_program.exe" if os.name == "nt" else f"{module}_program")
+            pcmd = cxx.command(src, prog, build, prog_system)
+            pp = subprocess.run(pcmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=build)
+            if pp.returncode != 0:
+                raise RuntimeError(f"C++ compilation of the program failed:\n{' '.join(pcmd)}\n{pp.stderr}{pp.stdout}")
+            reports[module].warnings += [w.strip() for w in (pp.stderr + pp.stdout).splitlines()
+                                         if "warning" in w.lower() and f"{module}.cpp" in w]
+            reports[module].program = run_program(project.paths[module], prog, rtol)
     return ProjectVerifyReport(reports)
 
 

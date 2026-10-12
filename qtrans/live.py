@@ -4,14 +4,16 @@
 
 A small web server on this computer (127.0.0.1 only) serves an editor page. Each pause in
 typing sends the editor's text here; it is translated as `qtrans translate` would (the
-project modules it imports included) and the page shows the header, every C++ line tinted
-like the Python statement it came from, and the reasons for the statement under the cursor.
+project modules it imports included) and the page shows the C++ (the header, or for a program
+the whole .cpp with its main()), the C++ of the statement under the cursor lit, and the reasons
+for it.
 While one function is half-written (it doesn't parse yet), the rest of the module is still
 translated: that function's lines are left out until they parse, and the page says so.
 
 Ctrl+S saves to the file. Edits made to the file in another editor show up on the page; if the
 page has unsaved changes too, it asks which to keep. "Verify" compiles the module and checks it
-against Python (`qtrans verify`, 50 random cases a function).
+against Python (`qtrans verify`, 50 random cases a function); a program is also run both ways
+and what each printed is shown side by side.
 
 Every request carries a random token the page was served with, and only requests addressed to
 this computer are answered, so another web page open in the browser can't read or write files
@@ -133,16 +135,20 @@ def translate_text(text: str, path: Path) -> dict:
     for f in view.functions:
         funcs.append({
             "name": f.name, "first": f.first, "last": f.last, "translated": f.translated,
+            "spans": [list(x) for x in f.spans] or [[f.first, f.last]],
             "reason": f.reason, "line": f.line, "hint": f.hint,
             "rows": [{"first": r.py_first, "last": r.py_last,
                       "reasons": [{"kind": x.kind, "text": x.text} for x in r.reasons]} for r in f.rows],
         })
-    module_rows = [{"first": r.py_first, "last": r.py_last,
+    module_rows = [{"first": r.py_first, "last": r.py_last, "skipped": any(x.kind == "skipped" for x in r.reasons),
                     "reasons": [{"kind": x.kind, "text": x.text} for x in r.reasons]} for r in view.module_rows]
-    lines = result.header.split("\n")
+    program = result.program is not None
+    lines = (result.program if program else result.header).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    out = {"ok": True, "header": lines, "map": [list(s) if s else None for s in (result.line_map or [])],
+    lmap = (result.program_map if program else result.line_map) or []
+    out = {"ok": True, "header": lines, "map": [list(s) if s else None for s in lmap],
+           "file": f"{path.stem}.cpp" if program else f"{path.stem}.hpp",
            "functions": funcs, "module": module_rows, "notes": view.general_notes,
            "ms": round(1000 * (time.perf_counter() - t0), 1)}
     if editing:
@@ -153,7 +159,7 @@ def translate_text(text: str, path: Path) -> dict:
 
 def verify_text(text: str, path: Path, cases: int = 50) -> dict:
     """Compile the editor's text and check it against Python (qtrans verify)."""
-    from .verify import verify_file
+    from .verify import find_compiler, find_eigen, verify_file
     try:
         ast.parse(text)
     except SyntaxError as e:
@@ -166,13 +172,25 @@ def verify_text(text: str, path: Path, cases: int = 50) -> dict:
         target = work / path.name
         target.write_text(text, encoding="utf-8")
         try:
+            find_compiler()
+            find_eigen() if re.search(r"\bnumpy\b|\bnp\.", text) else None
+        except RuntimeError as e:  # nothing to compile with: a setup problem, not a failed check
+            return {"ok": False, "setup": True, "functions": [], "text": str(e)}
+        try:
             rep = verify_file(target, n_random=cases, build_dir=work / "build")
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "text": f"{type(e).__name__}: {e}"}
         rows = [{"name": f.name, "cases": len(f.cases), "match": f.count("match"), "illcond": f.count("illcond"),
                  "known": f.count("known"), "mismatch": f.count("mismatch")} for f in rep.functions]
-        return {"ok": rep.ok, "functions": rows, "warnings": rep.warnings[:10],
-                "text": rep.to_text().replace(str(work), str(path.parent))}
+        out = {"ok": rep.ok, "functions": rows, "warnings": rep.warnings[:10],
+               "text": rep.to_text().replace(str(work), str(path.parent))}
+        if rep.program is not None:
+            p = rep.program
+            out["program"] = {"ok": p.ok, "identical": p.identical, "line": p.line, "rounding": p.rounding,
+                              "python": p.py_out[-20000:], "cpp": p.cpp_out[-20000:], "py_code": p.py_code,
+                              "cpp_code": p.cpp_code, "error": p.error,
+                              "py_err": p.py_err[-2000:].replace(str(work), str(path.parent)), "cpp_err": p.cpp_err[-2000:]}
+        return out
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

@@ -82,6 +82,12 @@ SAMPLE = textwrap.dedent('''
 
 
     QTRANS_CASES = {"floor_div": [(-7, 2), (7, -2)], "simulate": [(42, 1000)]}
+
+
+    if __name__ == "__main__":
+        A = np.array([[2.0, 1.0], [1.0, 3.0]])
+        x = ridge(A, np.array([1.0, 2.0]), 0.1)
+        print(f"ridge: {x}, simulate: {simulate(7, 100):.6f}, {floor_div(-7, 2)}")
 ''')
 
 
@@ -165,9 +171,10 @@ def _end_to_end() -> Check:
             return Check("translate, compile, verify", FAIL, rep.to_text()[-800:],
                          "this is a bug or a platform difference: please report it with this output")
         warn = f", {len(rep.warnings)} compiler warnings" if rep.warnings else ""
+        ran = " and its program printed what Python printed" if rep.program is not None and rep.program.ok else ""
         return Check("translate, compile, verify", WARN if rep.warnings else OK,
                      f"a sample with arrays, np.linalg.solve, NumPy's random generator and int // : "
-                     f"{cases} cases, all agree with Python{warn}",
+                     f"{cases} cases, all agree with Python{ran}{warn}",
                      "the generated code should compile without warnings: please report these" if warn else "")
 
 

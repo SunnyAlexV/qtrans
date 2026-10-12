@@ -56,6 +56,15 @@ strong evidence, but no finite set of cases can rule out a difference elsewhere.
   ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)); and `qtrans explain`, your
   Python next to its C++ with the reason for each choice, `inspect` and `doctor`
   ([Python and C++ side by side](#python-and-c-side-by-side)).
+- **0.10, programs:** a whole script translates, not only its functions. Code that runs at the
+  top level of a file (or under `if __name__ == "__main__":`) becomes `int main()` in a
+  self-contained `<module>.cpp`, and `print()`, f-strings, `str()`, `repr()`, `format()`,
+  `"...".format()`, `%` formatting and `round(x, n)` write exactly what Python writes: floats as
+  Python's shortest repr, format specs by CPython's rules, arrays laid out as NumPy lays them out,
+  NumPy scalars as `np.float64(...)`. Functions written without type hints take their types
+  from how the file calls them. `qtrans verify` runs the file with Python and the program it
+  became, and compares what each printed, character for character, and the exit status.
+  See [Programs](#programs-a-script-becomes-a-c-program).
 
 ```python
 def black_litterman(cov: Mat, w_mkt: Vec, P: Mat, Q: Vec, omega_diag: Vec,
@@ -149,15 +158,17 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (422 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (449 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
 - A C++17 compiler, for verification only. The verifier finds `g++`, `clang++` or `cl` on the
-  PATH, or you pass `compiler=` a path. On Windows, a standalone MinGW-w64 GCC (for example
-  from winlibs.com) can be unzipped anywhere.
+  PATH, or you pass `compiler=` a path. On Windows the simplest is GCC from winlibs.com: unzip
+  the UCRT 64-bit release so that `C:\mingw64\bin\g++.exe` exists, and qtrans finds it without
+  any PATH change (it also looks in MSYS2, TDM-GCC, Strawberry Perl and the conda environment).
+  `python -m qtrans doctor` says whether it was found.
 - Eigen, for array and Monte Carlo code only. Install it with `conda install -c conda-forge eigen`. The
   verifier looks in the conda environment, then `/usr/include/eigen3`, or wherever
   `QTRANS_EIGEN` points.
@@ -175,14 +186,15 @@ counts as a failure, so a green run means the C++ really was compiled and compar
 ## Python and C++ side by side
 
 `python -m qtrans live my_model.py` opens an editor in your browser: your Python on the left,
-the C++ header on the right, translated again a moment after each pause in typing. Each Python
-statement and the C++ it became share a tint; the statement under the cursor is lit on both
-sides and its C++ scrolled into view, with the reasons for it underneath (hover or click a C++
+the C++ header on the right, translated again a moment after each pause in typing. The code stays plain: the statement under the cursor is lit on both sides
+and its C++ scrolled into view, with the reasons for it underneath (hover or click a C++
 line to find its Python). A function you are halfway through writing doesn't stop the rest:
 its lines are set aside until they parse, and the page says which. A function qtrans refuses
 is marked at the line that caused it, with the reason and the hint. Ctrl+S saves to the file;
 edits made to it in another editor appear on the page, and if both sides changed it asks which
-to keep. **Verify** compiles the module and checks it against Python. It runs on your computer
+to keep. **Verify** compiles the module and checks it against Python. For a script (a
+[program](#programs-a-script-becomes-a-c-program)) the right side is the whole `.cpp` with its
+`main()`, and Verify also runs both and shows what each printed, side by side. It runs on your computer
 only (127.0.0.1, and every request carries a token the page was served with), needs nothing
 installed beyond qtrans, and works offline. [`tests/test_live.py`](tests/test_live.py) drives
 it in a real browser: typing a function makes its C++ appear, the cursor lights the right
@@ -228,6 +240,120 @@ compiles and verifies a small module with arrays, `np.linalg.solve`, NumPy's ran
 int `//`, which is what `qtrans verify` will do. `--bind` also builds and imports a compiled
 module. Each problem comes with its fix (`conda install -c conda-forge eigen`, Visual Studio
 Build Tools for bindings on Windows, ...).
+
+## Programs: a script becomes a C++ program
+
+```python
+A = 1+1
+print(A)
+```
+
+becomes `two.cpp`:
+
+```cpp
+#include <iostream>
+
+int main() {
+    long long A = 1LL + 1;
+    std::cout << A << '\n';
+}
+```
+
+A file with code that runs (statements at its top level, or an `if __name__ == "__main__":`
+block) is a program. Its functions, classes and constants are translated as for a module; the
+code that runs becomes `int main()`, in order, and the whole is one `.cpp` you can compile and
+run (`python -m qtrans translate script.py` says how). A top-level variable that no function reads
+is a local of `main()`, as a C++ programmer would write it; one a function reads stays a
+module constant. A module that only defines things is not a program, and gets its header as
+before.
+
+What a program prints is what Python prints, character for character:
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(7)
+z = rng.standard_normal(4)
+m = np.mean(z)
+print(f"mean {m:.4f}, sd {float(np.std(z)):.3e}")
+print(z, repr(m), (m, len(z)))
+print("%-6s|%8.3f|%d" % ("x", 1234.5678, 42), round(2.675, 2))
+```
+
+```cpp
+int main() {
+    try {
+        qt::Rng rng(7);
+        qt::Vec z = rng.standard_normal(4);
+        double m = qt::mean(z);
+        std::cout << ("mean " + qt::py::format(m, ".4f") + ", sd " + qt::py::format(qt::std_(z), ".3e") + "\n");
+        std::cout << qt::py::str(z) << ' ' << qt::py::repr(qt::py::np(m)) << ' ' << qt::py::repr(std::make_tuple(m, static_cast<long long>(z.size())), "np") << '\n';
+        std::cout << ("x     |1234.568|42 " + qt::py::str(qt::py::round(2.675, 2LL)) + "\n");
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 1;
+    }
+}
+```
+
+Both print
+
+```
+mean -0.2162, sd 4.389e-01
+[ 0.00123015  0.29874554 -0.27413786 -0.89059184] np.float64(-0.21618850081338484) (np.float64(-0.21618850081338484), 4)
+x     |1234.568|42 2.67
+```
+
+- `print(...)`: `sep`, `end`, `file=sys.stderr` and `flush`; each value as `str()` shows it.
+  Where a value can't fail to compute, the line is streamed (`std::cout << "n = " << n`); where
+  part of it could raise, or a function it calls prints too, the line is made first and then
+  written, because Python writes nothing of a line whose values raise.
+- Floats print as Python's `repr`: the shortest decimal that reads back as the same double
+  (`0.1`, `0.30000000000000004`, `1e+16`, `inf`). Format specs (`.2f`, `,.2f`, `>10.3e`, `%`,
+  `g`, `#x`, `08b`, `z`, nested `{x:{w}}`) follow CPython's own code, ported; a spec Python
+  would reject is refused at translation. `"%.2f" % x` is mapped to the format spec that writes
+  the same, and checked against Python on sample values before it is used.
+- Arrays print as NumPy prints them: the precision it picks, fixed or scientific for all
+  elements, aligned columns, wrapping at 75 characters, `...` past 1,000 elements, and
+  `repr`'s `array([...])`, `shape=` and `dtype=`.
+- NumPy scalars: `np.mean(v)` is a NumPy float64 in Python, `float(np.mean(v))` a Python float.
+  `print()` shows them the same, `repr()` doesn't (`np.float64(2.5)`, NumPy 2), and neither does
+  `round(x, 2)`: Python's rounds the exact decimal value (`round(2.675, 2)` is 2.67), NumPy's
+  multiplies, rounds and divides (`round(np.float64(1.85), 1)` is 1.8, Python's `round(1.85, 1)`
+  is 1.9). qtrans works out which kind each value is from how it was made, and where it depends
+  on the run (`x = 0.0`, then `x += v[i]` in a loop) it refuses `repr`/`round` there, with the
+  hint to write `float(...)`.
+- An exception the program doesn't catch ends it with exit status 1, its message on stderr;
+  `sys.exit(n)` ends it with status `n`.
+- Type hints are optional where the file shows the types. A parameter without one takes the
+  type every call in the file passes it (and its default's), a return without one the type of
+  what the body returns, and the report says so (`types from how the file calls it: S: float,
+  K: float, -> float`). A function that never returns a value is `-> None`. Where the calls
+  disagree (`half(7)` and `half(7.0)`: Python computes `7 // 2` and `7.0 // 2` differently, a
+  C++ parameter has one type) it is refused with both lines named; a function no call types is
+  refused, with the hint to annotate it.
+- A variable that starts as an int and later holds floats (`total = 0`, then `total += x`) is
+  a `double`; Python prints it as `0` until the first float arrives, as a float after. Where
+  printing it could show the int, it is refused with the hint `total = 0.0` (where the loop
+  surely ran, over a literal list or `range(3)`, it is printed).
+- Nothing is left out quietly: a top-level line that isn't translated says why, at its line,
+  in the report, `qtrans explain` and `qtrans live`. Using a function before the line that
+  defines it is refused (Python raises `NameError` there).
+
+`qtrans verify script.py` checks the functions as always, then runs `python script.py` and the
+compiled program in the script's folder and compares their output: identical, character for
+character, or the first line that differs. Numbers that differ only in their last digits
+(a computation that agrees to the last bit or two, `np.linalg.solve` against Eigen) are
+counted and reported, and pass only within the same tolerance as the function checks. In
+`qtrans live`, **Verify** shows the two outputs side by side. Functions that print are checked
+too: what each call prints is compared, case by case.
+
+All of it is checked against Python and NumPy themselves ([`tests/test_print.py`](tests/test_print.py)):
+one compiled driver formats 14,362 values (floats of every bit pattern and magnitude through
+every presentation type, with grouping, padding and signs; ints; strings), rounds 52,178 (ties,
+extremes, both kinds of `round`) and prints 619 arrays with `str` and `repr`, and each result is
+compared with Python's or NumPy's own; [`tests/test_programs.py`](tests/test_programs.py) runs whole programs both
+ways.
 
 ## How it works
 
@@ -940,11 +1066,15 @@ Each is listed in the per-module report next to the functions it affects.
 - **Types:** `float`, `int`, `bool`, `str`, `Vec`, `Mat`, `np.random.Generator`, `tuple[...]`
   of those, `X | None` (also `Optional[X]`) for a number or array, `@dataclass` and `NamedTuple`
   classes, and `-> None`.
-  Parameters and returns are annotated; locals are inferred.
+  Parameters and returns are annotated, or typed from how the file calls the function; locals
+  are inferred.
+- **Programs:** top-level code and `if __name__ == "__main__":` as `int main()`; `print`,
+  f-strings, `str`, `repr`, `format`, `"...".format`, `%` formatting, `round(x, n)`, `sys.exit`,
+  exception messages built with any of them.
 - **Statements:** assignment (including tuple unpacking, swaps, `a[i] = x`, `a[i:j] = v`,
   `A[i] = row`, `A[:, j] = col`), augmented assignment, `if`/`elif`/`else`, `while`,
-  `for` over `range(...)` or over a `Vec`, `break`, `continue`, `return`, `raise` with a
-  string, `assert`, `try`/`except np.linalg.LinAlgError` or `ValueError`, `with np.errstate(...)`.
+  `for` over `range(...)`, a `Vec` or a literal list, `break`, `continue`, `return`, `raise` with a
+  message, `assert`, `try`/`except np.linalg.LinAlgError` or `ValueError`, `with np.errstate(...)`.
 - **Scalar library:** `math.*`, scalar NumPy functions, `scipy.stats.norm.cdf/pdf/ppf/sf`
   with `loc`/`scale`, `scipy.special.erf/erfc/ndtr/ndtri`, and the builtins `abs`, `min`,
   `max`, `float`, `int`, `bool`, `round`, `pow`.
@@ -1002,9 +1132,12 @@ explanation for every disagreement:
 
 ```
 qtrans/
-  translator.py      module level: imports, constants, signatures, parameter passing, header
+  translator.py      module level: imports, constants, signatures (also from the calls), the
+                     header, and a program's main()
   functions.py       per function: scan, loops, inference, aliasing, declarations, emission
   expressions.py     scalar expressions, Python semantics, library calls
+  printing.py        print, f-strings, str/repr/format, % formatting: Python's text, exactly
+  origins.py         which values are Python's and which NumPy's (they repr and round differently)
   arrays.py          array expressions: arithmetic, broadcasting, indexing, NumPy functions
   classes.py         @dataclass / NamedTuple: fields, defaults, methods (stage 5)
   structs.py         object expressions: fields, properties, methods, constructors, ==
@@ -1018,12 +1151,13 @@ qtrans/
   runtime/qtrans_runtime.hpp   scalar helpers (standard library only)
   runtime/qtrans_arrays.hpp    array helpers on Eigen, NumPy algorithms ported
   runtime/qtrans_random.hpp    NumPy's Generator (SeedSequence + PCG64 + ziggurat)
+  runtime/qtrans_print.hpp     Python's repr and format mini-language, NumPy's array printing
   runtime/qtrans_pybind.hpp    the bindings' conversions, write-backs and exceptions
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               422 tests: generated text, refusals, compiled semantics, every example,
-                     projects, the Python bindings
+tests/               449 tests: generated text, refusals, compiled semantics, every example,
+                     projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
                      numpy.linalg checked operation by operation
@@ -1049,8 +1183,11 @@ run_examples.py      press-Run entry point
    in each verification and operation by operation ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)).
    `qtrans explain` (Python and C++ side by side, with reasons), `inspect` and `doctor`
    ([Python and C++ side by side](#python-and-c-side-by-side)). **0.10 so far**: `qtrans live`, the
-   editor with the C++ updating as you type. **Next**: the same inside VS Code; traceable headers (source hash,
-   Python line references, CMake); a reproducible benchmark protocol.
+   editor with the C++ updating as you type; programs, with Python's printing reproduced
+   exactly, and types taken from how a script calls its functions
+   ([Programs](#programs-a-script-becomes-a-c-program)). **Next**: lists; the editor inside VS
+   Code; traceable headers (source hash, Python line references, CMake); a reproducible
+   benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the
    supported subset. Not planned: pandas, all of Python, GPU backends.
