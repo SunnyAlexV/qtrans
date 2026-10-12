@@ -140,7 +140,8 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (385 tests).
+`python -m pytest` (413 tests). To see the Python next to its C++, ask what will happen
+before translating, or check a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
 **Requirements:**
 - Python 3.10+, numpy and scipy.
@@ -160,6 +161,48 @@ folder, for a project),
 Tested on every push by GitHub Actions on Linux (g++, Eigen 3.4 from apt) and Windows
 (MinGW g++ for `verify` and MSVC for `bind`, Eigen from conda-forge, as on an Anaconda machine). In CI a skipped compiled test
 counts as a failure, so a green run means the C++ really was compiled and compared.
+
+## Python and C++ side by side
+
+`python -m qtrans explain my_model.py --html my_model.html` writes a page with your Python on
+the left and, on the right of each statement, the C++ it became. Under the C++, a line
+explains each choice that isn't a plain transcription: a NumPy broadcasting helper where the
+sizes can't be shown equal, a checked int operation, an index that may be negative, a copy
+before a store that reads the array it writes, how each array is passed and why, a documented
+Python/C++ difference that applies there. Functions qtrans refuses show the reason at the line
+that caused it, with the hint. Without `--html` the same view prints in the terminal;
+`FILE.py:FUNCTION` shows one function; `--json` gives it to other tools (the VS Code preview
+planned for 0.10 will read it). `run_examples.py` writes one page per example to
+[`examples/cpp_out/explain/`](https://github.com/SunnyAlexV/qtrans/tree/main/examples/cpp_out/explain)
+(download one and open it in a browser).
+
+```
+  12     return X.T @ X / (T - ddof)        │     return qt::matmul(X.transpose(), X) / static_cast<double>(qt::isub(T, ddof));
+                                            │ }
+                                            │   ↳ int arithmetic that could leave 64 bits: the exact result, or OverflowError
+                                            │     where Python's unbounded int would grow past what a long long holds (C++
+                                            │     overflow is undefined)
+```
+
+How it works: the translator marks every C++ line with the Python lines it came from, as it
+writes it, and `explain` groups them into rows (a statement, or an `if`/`for` header, and every
+C++ line it produced; a block's closing brace goes with its last line). Tests check, for every
+example, that each C++ line of a function body comes from a line of that function, that every
+Python line is in exactly one row, in order, and that each reason sits next to the C++ it is
+about ([`tests/test_explain.py`](tests/test_explain.py)). The marks are stripped before the
+header is written, so headers are byte for byte what they were.
+
+`python -m qtrans inspect my_model.py` lists, without compiling, what qtrans will make of each
+function: translated or not (the reason, its line, the hint), the C++ signature and how each
+parameter is passed, the `numpy.linalg` routines it uses, the functions it calls, and every
+documented difference that applies, by line.
+
+`python -m qtrans doctor` checks a machine: Python, NumPy and SciPy versions, the compiler
+(it compiles and runs a C++17 program), Eigen and its version, pybind11; then it translates,
+compiles and verifies a small module with arrays, `np.linalg.solve`, NumPy's random generator and
+int `//`, which is what `qtrans verify` will do. `--bind` also builds and imports a compiled
+module. Each problem comes with its fix (`conda install -c conda-forge eigen`, Visual Studio
+Build Tools for bindings on Windows, ...).
 
 ## How it works
 
@@ -940,6 +983,8 @@ qtrans/
   structs.py         object expressions: fields, properties, methods, constructors, ==
   core.py, types.py, library.py, report.py, typing.py (Vec, Mat)
   verify.py          compile, run, compare (incl. conditioning), benchmark
+  explain.py         Python next to its C++, row by row, with reasons (text, HTML, JSON)
+  inspect_.py, doctor.py   what qtrans will make of a file; whether a machine is ready
   bind.py            pybind11 bindings: generate, build, check against Python
   project.py         several modules: imports followed, import order, one header each
   runtime/qtrans_runtime.hpp   scalar helpers (standard library only)
@@ -949,7 +994,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               385 tests: generated text, refusals, compiled semantics, every example,
+tests/               413 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -974,7 +1019,9 @@ run_examples.py      press-Run entry point
    ([Platforms](#platforms)); a program fuzzer with automatic minimisation
    ([Fuzzing](#fuzzing)); every `numpy.linalg` operation audited for backward stability,
    in each verification and operation by operation ([Linear algebra](#linear-algebra-checked-by-what-it-guarantees)).
-   **Next**: `qtrans doctor` / `inspect` / `explain`; traceable headers (source hash,
+   `qtrans explain` (Python and C++ side by side, with reasons), `inspect` and `doctor`
+   ([Python and C++ side by side](#python-and-c-side-by-side)). **Next (0.10)**: the side-by-side
+   view inside VS Code, filling in as each line or block is written; traceable headers (source hash,
    Python line references, CMake); a reproducible benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the

@@ -108,6 +108,9 @@ jobs:
           python -c "from qtrans.verify import environment, find_compiler, find_eigen; print(environment(find_compiler())); print(find_eigen())"
           python -c "import pybind11; print('pybind11', pybind11.__version__)"
 
+      - name: qtrans doctor (checks the setup by translating, compiling and verifying a sample)
+        run: python -m qtrans doctor
+
       - name: Run tests (a skipped test fails the run)
         run: python -m pytest -q -rs ${{ matrix.pytest_args }}
 

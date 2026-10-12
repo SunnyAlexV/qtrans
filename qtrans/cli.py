@@ -4,6 +4,9 @@
     python -m qtrans verify FILE.py [...] [--cases N] [--seed S] [--bench] [--rtol X] [--atol X] [--all]
                                         [--profile strict|stress]
     python -m qtrans bind FILE.py [...] [-o OUT_DIR] [--check] [--cases N] [--bench] [--all]
+    python -m qtrans explain FILE.py[:FUNCTION] [--html OUT.html] [--json]
+    python -m qtrans inspect FILE.py [--json]
+    python -m qtrans doctor [--bind] [--json]
 
 A file that imports other modules next to it (`from bl_core import nearest_psd`) is translated
 together with them, as a project: one header per module. A folder means every module in it.
@@ -55,7 +58,42 @@ def main(argv=None) -> int:
     b.add_argument("--all", action="store_true", help="with --check: also check the modules the files import")
     b.add_argument("--build", default=None, help="folder for the generated sources and build files")
 
+    e = sub.add_parser("explain", help="Python next to its C++, line by line, with the reason for each choice")
+    e.add_argument("target", help="FILE.py, or FILE.py:FUNCTION for one function")
+    e.add_argument("--html", default=None, help="write a side-by-side page here (open it in a browser)")
+    e.add_argument("--json", action="store_true", help="machine-readable output")
+    e.add_argument("--width", type=int, default=0, help="terminal width for the text view")
+
+    i = sub.add_parser("inspect", help="what qtrans will make of each function, without compiling")
+    i.add_argument("file")
+    i.add_argument("--json", action="store_true", help="machine-readable output")
+
+    d = sub.add_parser("doctor", help="check the compiler, Eigen and packages qtrans needs, by using them")
+    d.add_argument("--bind", action="store_true", help="also build and import Python bindings")
+    d.add_argument("--json", action="store_true", help="machine-readable output")
+
     args = ap.parse_args(argv)
+    if args.cmd == "doctor":
+        from .doctor import main as doctor
+        return doctor(bind=args.bind, as_json=args.json)
+    if args.cmd == "inspect":
+        from .inspect_ import inspect_file, to_json as ijson, to_text as itext
+        infos = inspect_file(args.file)
+        print(ijson(args.file, infos) if args.json else itext(args.file, infos))
+        return 0 if all(x.translated for x in infos) else 1
+    if args.cmd == "explain":
+        from .explain import explain_file, to_html, to_json as ejson, to_text as etext
+        path, _, fn = args.target.partition(".py:")
+        path = path + ".py" if fn or not path.endswith(".py") else path
+        view = explain_file(path if Path(path).exists() else args.target, fn or None)
+        if args.html:
+            Path(args.html).write_text(to_html(view), encoding="utf-8")
+            print(f"wrote {args.html}: open it in a browser")
+        elif args.json:
+            print(ejson(view))
+        else:
+            print(etext(view, args.width))
+        return 0
     inputs = _inputs(args.files)
     if args.cmd == "bind":
         from .bind import build_extension, check_bindings

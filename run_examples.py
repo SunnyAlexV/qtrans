@@ -43,7 +43,13 @@ def main(check=False):
     proj = translate_project(HERE / "examples" / "bl_app", out / "bl_app")
     for m in proj.order:
         print(proj.modules[m].report.to_text(), "\n")
-    print(f"C++ written to {out}\n")
+    # the side-by-side pages: each example's Python next to its C++ (open them in a browser)
+    from qtrans.explain import explain_file, to_html
+    (out / "explain").mkdir(parents=True, exist_ok=True)
+    for name in EXAMPLES:
+        page = to_html(explain_file(HERE / "examples" / f"{name}.py"))
+        (out / "explain" / f"{name}.html").write_text(page, encoding="utf-8")
+    print(f"C++ written to {out}; side-by-side pages in {out / 'explain'}\n")
 
     rows = []
     for name in EXAMPLES:

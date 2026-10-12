@@ -122,6 +122,13 @@ class ExprTranslator(ArrayOps, StructOps):
         if key not in self._noted:
             self._noted.add(key)
             self.notes.append((key, text))
+        # where it applies, for `qtrans explain`: every statement it comes from, as emitted
+        src = getattr(self, "cur_src", None)
+        if src is not None and not getattr(self, "inferring", False):
+            seen = self.__dict__.setdefault("_line_noted", set())
+            if (src, key) not in seen:
+                seen.add((src, key))
+                self.__dict__.setdefault("line_notes", []).append((src, key, text))
 
     def need_scalar(self, e: Expr, node, what: str):
         if not isinstance(e.type, Scalar):

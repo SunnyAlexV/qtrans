@@ -22,7 +22,7 @@ from . import library as lib
 from .errors import Unsupported
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
-from .functions import FunctionTranslator, is_docstring, python_reads, subscript_root, target_leaves, view_root
+from .functions import FunctionTranslator, is_docstring, python_reads, source_mark, strip_marks, subscript_root, target_leaves, view_root
 from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, assignable, is_array)
@@ -87,6 +87,8 @@ class TranslationResult:
     classes: dict = None   # name -> classes.ClassInfo, translated classes only (stage 5)
     namespace: str = ""    # the C++ namespace
     deps: list = None      # modules of the project this one imports (their headers are included)
+    line_map: list = None  # per header line: the (first, last) Python lines it came from, or None
+    line_notes: dict = None  # function -> [((first, last), key, note)]: where each note applies
 
 
 def _collect_comments(source):
@@ -151,6 +153,7 @@ class ModuleTranslator:
         self.full_comments, self.inline_comments = _collect_comments(source)
         self.imports: dict = {}
         self.array_users: dict = {}  # function -> whether its translation used any array value
+        self.line_notes: dict = {}   # function -> [((first, last) Python lines, key, text)] (for explain)
         self.constants: dict = {}
         self.skipped_globals: dict = {}
         self.sigs: dict = {}
@@ -1088,6 +1091,8 @@ class ModuleTranslator:
                 try:
                     bodies[name] = tr.translate()
                     self.array_users[name] = tr.used_arrays
+                    self.line_notes[name] = [(src, key, re.sub(r"^line \d+: ", "", text))
+                                             for src, key, text in getattr(tr, "line_notes", [])]
                     notes[name] = list(self.sigs[name].decorator_notes)
                     for key, text in tr.notes:
                         if key in GENERAL_NOTES:
@@ -1139,7 +1144,8 @@ class ModuleTranslator:
         live = {n: self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None}
         return TranslationResult(self.module_name, header, self.report, sigs, "qt::" in header,
                                  "qtrans_arrays.hpp" in header or uses_random, uses_random, live, self.ns,
-                                 list(self.project_deps))
+                                 list(self.project_deps), self.line_map[:-1] if header.endswith("\n") else self.line_map,
+                                 {n: v for n, v in self.line_notes.items() if n in bodies})
 
     # --- rendering -----------------------------------------------------------------------------
     def attached_comments(self, first_line):
@@ -1189,13 +1195,19 @@ class ModuleTranslator:
         defined after the module's function declarations, so they can call anything."""
         out = []
         if info.doc:
-            out += [("/// " + line).rstrip() for line in inspect.cleandoc(info.doc).splitlines()]
+            d = info.node.body[0]
+            out += [("/// " + line).rstrip() + source_mark(d.lineno, d.end_lineno)
+                    for line in inspect.cleandoc(info.doc).splitlines()]
         kind = "NamedTuple" if info.namedtuple else "class" if info.plain else \
             ("frozen dataclass" if info.frozen else "dataclass")
-        out.append(f"struct {info.cpp} {{  // {kind}")
+        cls = info.node.lineno
+        top = min([cls] + [d.lineno for d in info.node.decorator_list])
+        start = len(out)
+        out.append(f"struct {info.cpp} {{  // {kind}" + source_mark(top, cls))
         for f in info.fields:
             note = "" if f.init else "  // init=False: set by __post_init__ or its default"
-            out.append(f"    {f.type.cpp()} {f.cpp}{{}};{note}")
+            ln = getattr(f.annotation, "lineno", None)
+            out.append(f"    {f.type.cpp()} {f.cpp}{{}};{note}" + (source_mark(ln, getattr(f.annotation, "end_lineno", ln)) if ln else ""))
         out.append("")
         params = self._ctor_params(info, defaults=True)
         if params or not info.plain:
@@ -1223,6 +1235,10 @@ class ModuleTranslator:
             out.append(f"    bool operator==(const {info.cpp}& other) const;")
             out.append(f"    bool operator!=(const {info.cpp}& other) const {{ return !(*this == other); }}")
         out.append("};")
+        # the struct's other lines (constructors, member declarations, the closing brace) belong
+        # with the class line in the source map; fields carry their own lines
+        mark = source_mark(cls, cls)
+        out[start:] = [l if not l.strip() or "\x1f" in l else l + mark for l in out[start:]]
         out.append("")
         return out
 
@@ -1242,11 +1258,13 @@ class ModuleTranslator:
         body = bodies.get(post.key) if post is not None else None
         if inits:
             head += "\n    : " + ", ".join(inits)
-        out.append(head + (" {" if body else " {}"))
+        cls = info.node.lineno
+        at = (post.fdef.lineno, post.fdef.lineno) if post is not None and info.plain else (cls, cls)
+        out.append((head + (" {" if body else " {}")).replace("\n", source_mark(*at) + "\n") + source_mark(*at))
         if body:
-            out.append("    // __init__" if info.plain else "    // __post_init__")
+            out.append(("    // __init__" if info.plain else "    // __post_init__") + source_mark(post.fdef.lineno, post.fdef.lineno))
             out += body
-            out.append("}")
+            out.append("}" + (source_mark(post.fdef.end_lineno, post.fdef.end_lineno) if post is not None else ""))
         out.append("")
         for m in info.methods.values():
             if m.key not in bodies or m.kind in ("post_init", "init"):
@@ -1259,15 +1277,18 @@ class ModuleTranslator:
                                                    name=f"{info.cpp}::{sig.cpp}")
             if m.kind not in ("static", "class") and sig.const:
                 line += " const"
-            out.append(line + " {")
+            fd = m.fdef
+            first = min([fd.lineno] + [d.lineno for d in fd.decorator_list])
+            out.append(line + " {" + source_mark(first, fd.body[0].lineno - 1 if fd.body[0].lineno > fd.lineno else fd.lineno))
             out += bodies[m.key]
-            out.append("}")
+            out.append("}" + source_mark(fd.end_lineno, fd.end_lineno))
             out.append("")
         if info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields):
             terms = [f"{f.cpp} == other.{f.cpp}" for f in info.fields if f.compare]
-            out.append(f"inline bool {info.cpp}::operator==(const {info.cpp}& other) const {{")
-            out.append(f"    return {' && '.join(terms)};")
-            out.append("}")
+            eq_mark = source_mark(cls, cls)  # dataclass equality: from the class itself
+            out.append(f"inline bool {info.cpp}::operator==(const {info.cpp}& other) const {{" + eq_mark)
+            out.append(f"    return {' && '.join(terms)};" + eq_mark)
+            out.append("}" + eq_mark)
             out.append("")
         return out
 
@@ -1286,7 +1307,7 @@ class ModuleTranslator:
                 for line in self.attached_comments(c.lineno) if c.lineno else []:
                     out.append("// " + line)
                 tail = f"  // {self.inline_comments[c.lineno]}" if c.lineno in self.inline_comments else ""
-                out.append(f"inline const {c.type.cpp()} {c.cpp} = {c.code};{tail}")
+                out.append(f"inline const {c.type.cpp()} {c.cpp} = {c.code};{tail}" + (source_mark(c.lineno, c.lineno) if c.lineno else ""))
             out.append("")
 
         live = [self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None]
@@ -1306,14 +1327,18 @@ class ModuleTranslator:
         for n in names:
             f, sig = self.fdefs[n], self.sigs[n]
             first = min([f.lineno] + [d.lineno for d in f.decorator_list])
-            for c in self.attached_comments(first):
-                out.append("// " + c)
+            for k, c in enumerate(self.attached_comments(first)):
+                ln = first - len(self.attached_comments(first)) + k
+                out.append("// " + c + source_mark(ln, ln))
+            head_end = f.body[0].lineno - 1 if f.body[0].lineno > f.lineno else f.lineno
             if sig.doc:
-                out += [("/// " + line).rstrip() for line in sig.doc.splitlines()]
+                d = f.body[0]
+                out += [("/// " + line).rstrip() + source_mark(d.lineno, d.end_lineno) for line in sig.doc.splitlines()]
             used = _used_params(f, bodies[n], sig)
-            out.append("inline " + self.cpp_signature(sig, defaults=not forward, used_params=used) + " {")
+            out.append("inline " + self.cpp_signature(sig, defaults=not forward, used_params=used) + " {"
+                       + source_mark(first, head_end))
             out += bodies[n]
-            out.append("}")
+            out.append("}" + source_mark(f.end_lineno, f.end_lineno))
             out.append("")
 
         out.append(f"}}  // namespace {ns}")
@@ -1337,7 +1362,8 @@ class ModuleTranslator:
             inc_lines.append('#include "qtrans_runtime.hpp"')
         for d in self.project_deps:  # the modules of the project it imports from
             inc_lines.append(f'#include "{d}.hpp"  // from {d} import ...')
-        return text.replace("@@INCLUDES@@", "\n".join(inc_lines))
+        text, self.line_map = strip_marks(text.replace("@@INCLUDES@@", "\n".join(inc_lines)))
+        return text
 
 
 def translate_source(source: str, module_name: str = "module", filename: str = "<input>") -> TranslationResult:

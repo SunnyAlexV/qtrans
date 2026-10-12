@@ -222,6 +222,27 @@ def _evaluated(code: str, t) -> str:
     return f"({code}).eval()"
 
 
+# --- the source map ---------------------------------------------------------------------------
+# Each emitted C++ line carries, until the header is assembled, an invisible mark naming the
+# Python lines it came from; ModuleTranslator.render strips the marks into TranslationResult.line_map.
+_MARK = "\x1f"
+_MARK_RE = re.compile("\x1f(\\d+):(\\d+)\x1f")
+
+
+def source_mark(first: int, last: int) -> str:
+    return f"{_MARK}{first}:{last}{_MARK}"
+
+
+def strip_marks(text: str):
+    """(clean text, per line: (first, last) Python line or None)."""
+    lines, spans = [], []
+    for line in text.split("\n"):
+        found = _MARK_RE.findall(line)
+        spans.append((int(found[-1][0]), int(found[-1][1])) if found else None)
+        lines.append(_MARK_RE.sub("", line))
+    return "\n".join(lines), spans
+
+
 def python_reads(fdef) -> set:
     """Names the function reads. `x = x` is not a read: its translation is a comment (Clang
     warns on a self-assignment), so a name read only there is unused in the C++."""
@@ -945,7 +966,9 @@ class FunctionTranslator(ExprTranslator):
                             raise Unsupported(n, f"'{x}' and '{y}' share memory in NumPy (assignment, slices "
                                                  f"and .T are views, not copies) and '{which}' is modified in "
                                                  "place, so a C++ copy would give different results",
-                                              f"if you want an independent array, write {x} = ....copy()")
+                                              f"if you want an independent array, write {x} = "
+                                              + (f"{ast.unparse(value)}.copy()" if isinstance(value, (ast.Name, ast.Subscript, ast.Attribute))
+                                                 else f"({ast.unparse(value)}).copy()"))
                         if isinstance(types.get(y), StructType) and not isinstance(types.get(x), StructType):
                             rel = f"'{x}' is part of '{y}' in Python (an object's fields are shared, not copied)"
                         elif isinstance(types.get(x), StructType) and not isinstance(types.get(y), StructType):
@@ -1370,14 +1393,37 @@ class FunctionTranslator(ExprTranslator):
         if self._tail:
             line += self._tail
             self._tail = None
-        self.lines.append("    " * self.depth + line)
+        src = getattr(self, "cur_src", None)
+        if line.strip() == "}" and getattr(self, "_last_end", None):
+            src = (self._last_end, self._last_end)  # a block's closing brace: with its last line
+        elif src:
+            self._last_end = src[1]
+        self.lines.append("    " * self.depth + line + (source_mark(*src) if src else ""))
 
     def flush_comments(self, upto_line):
         full = self.mod.full_comments
         for ln in range(self.comment_floor + 1, upto_line):
             if ln in full:
-                self.lines.append("    " * self.depth + "// " + full[ln])
+                self.lines.append("    " * self.depth + "// " + full[ln] + source_mark(ln, ln))
         self.comment_floor = max(self.comment_floor, upto_line - 1)
+
+    def _header_src(self, s):
+        """The Python lines of a statement's own text: a compound statement's header only."""
+        if isinstance(s, (ast.If, ast.While)):
+            return (s.lineno, s.test.end_lineno)
+        if isinstance(s, ast.For):
+            return (s.lineno, s.iter.end_lineno)
+        if isinstance(s, ast.Try):
+            return (s.lineno, s.lineno)
+        return (s.lineno, s.end_lineno)
+
+    def _keyword_line(self, after, before, word):
+        """The line of `else:` (or another keyword) between two statements, for the source map."""
+        lines = self.mod.source.splitlines()
+        for ln in range(after + 1, before):
+            if lines[ln - 1].strip().startswith(word):
+                return ln
+        return after + 1
 
     def emit_block(self, stmts):
         for s in stmts:
@@ -1386,6 +1432,8 @@ class FunctionTranslator(ExprTranslator):
     def emit_stmt(self, s):
         self.current = s
         self.flush_comments(s.lineno)
+        prev = getattr(self, "cur_src", None)
+        self.cur_src = self._header_src(s)  # a declaration hoisted here belongs to this statement
         for n in self.hoist_at.get(id(s), ()):
             t = self.local_types[n]
             self.emit(f"{self._unused(n)}{t.cpp()} {self.ident(n)} = {t.zero()};" if isinstance(t, Scalar)
@@ -1396,6 +1444,7 @@ class FunctionTranslator(ExprTranslator):
         self._tail = ("  // " + "; ".join(texts)) if texts else None
         self.comment_floor = last
         getattr(self, "s_" + type(s).__name__)(s)
+        self.cur_src = prev
         self._tail = None
 
     def _block(self, stmts):
@@ -1724,10 +1773,13 @@ class FunctionTranslator(ExprTranslator):
             self.flush_comments(elif_.lineno)
             self.comment_floor = elif_.lineno
             c = self.cond(elif_.test)
+            self.cur_src = (elif_.lineno, elif_.test.end_lineno)
             self.emit(f"}} else if ({c.code}) {{")
             self._block(elif_.body)
             orelse = elif_.orelse
         if orelse:
+            ln = self._keyword_line(getattr(self, "_last_end", None) or s.lineno, orelse[0].lineno, "else")
+            self.cur_src = (ln, ln)
             self.emit("} else {")
             self._block(orelse)
         self.emit("}")
@@ -1742,6 +1794,7 @@ class FunctionTranslator(ExprTranslator):
             self.current = h
             self.flush_comments(h.lineno)
             self.comment_floor = h.lineno
+            self.cur_src = (h.lineno, h.lineno)
             self.emit(f"}} catch (const {self._handler_class(h)}&) {{  // except {ast.unparse(h.type)}")
             self._block(h.body)
         self.emit("}")
