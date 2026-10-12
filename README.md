@@ -158,7 +158,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (485 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (506 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -358,6 +358,17 @@ x     |1234.568|42 2.67
   loop reads exactly the same values, even when the body changes elements; a loop that changes
   the length of what it goes through, or rebinds it, is refused, and so is `zip(strict=True)`.
   An index that can't leave the list (`range(len(xs))`, `zip`) reads `xs[i]` without a check.
+- Dicts with `str` or `int` keys and `float`, `int` or `str` values are `qt::py::dict`, which
+  keeps keys in the order they were first added, as Python's dict does (printing and loops
+  follow it): literals, `{}` typed by what is stored or by `dict[str, float]`, `d[k]` (KeyError
+  when absent), `d[k] = v`, `d[k] += v`, `in`, `len`, `get(k, default)`, `pop`, `del d[k]`,
+  `setdefault`, `update`, `copy`, `dict(d)`, `clear`, `==`, loops over `d`, `d.keys()`,
+  `d.values()` and `d.items()`, dict comprehensions, `sum(d.values())`, `sorted(d)`, dict
+  parameters and returns (also through the Python bindings), and printing as Python prints a
+  dict. A loop that may add or delete a key of the dict it goes through is refused (Python
+  raises RuntimeError there), and so is the sharing a copy would break, as for lists;
+  `d.get(k)` without a default (None when missing) and a float key in an int-keyed dict are
+  refused with hints.
 - Generators: `sum`, `min`, `max`, `sorted`, `list` and `", ".join(...)` read a generator to the
   end, so `sum(x * w for x, w in zip(xs, ws))` is the comprehension it is equal to; `any(...)`
   and `all(...)` stop at the first element that decides, as in Python (the elements after it
@@ -671,7 +682,7 @@ holds for methods of an imported class, a generator passed on to an imported fun
 draws from it, an argument an imported function may hand back, and `try: ... except
 ValueError` around an imported function that may raise a math domain error. Calling an imported
 function that could not be translated is refused with its own reason ("calls bad(): bad (in
-rates) could not be translated: module variable 'TABLE' was not translated: dicts are not
+rates) could not be translated: module variable 'TABLE' was not translated: sets are not
 supported").
 
 **Imports understood:** `from m import f`, `from m import f as g`, `from m import *` (public
@@ -1097,18 +1108,20 @@ Each is listed in the per-module report next to the functions it affects.
 
 - **Types:** `float`, `int`, `bool`, `str`, `Vec`, `Mat`, `np.random.Generator`, `tuple[...]`
   of those, `X | None` (also `Optional[X]`) for a number or array, `@dataclass` and `NamedTuple`
-  classes, `list[...]` of floats, ints or strings, and `-> None`.
+  classes, `list[...]` of floats, ints or strings, `dict[...]` with str or int keys, and `-> None`.
   Parameters and returns are annotated, or typed from how the file calls the function (one
   version per kind of call where calls differ); locals are inferred.
 - **Programs:** top-level code and `if __name__ == "__main__":` as `int main()`; `print`,
   f-strings, `str`, `repr`, `format`, `"...".format`, `%` formatting, `round(x, n)`, `sys.exit`,
   exception messages built with any of them; printing objects (dataclass repr, `__repr__`,
   `__str__`).
-- **Lists:** `list[float]`, `list[int]`, `list[str]` as `std::vector` (see
+- **Lists and dicts:** `list[float]`, `list[int]`, `list[str]` as `std::vector`; `dict[str, float]`
+  and the like as `qt::py::dict`, in insertion order (see
   [Programs](#programs-a-script-becomes-a-c-program) for what is supported and refused).
 - **Statements:** assignment (including tuple unpacking, swaps, `a[i] = x`, `a[i:j] = v`,
   `A[i] = row`, `A[:, j] = col`), augmented assignment, `if`/`elif`/`else`, `while`,
-  `for` over `range(...)`, a `Vec`, a list or a literal list, `enumerate(...)`, `zip(...)`, `break`, `continue`, `return`, `raise` with a
+  `for` over `range(...)`, a `Vec`, a list, a dict or a literal list, `enumerate(...)`, `zip(...)`,
+  `.items()`, `del d[k]`, `break`, `continue`, `return`, `raise` with a
   message, `assert`, `try`/`except np.linalg.LinAlgError` or `ValueError`, `with np.errstate(...)`.
 - **Scalar library:** `math.*`, scalar NumPy functions, `scipy.stats.norm.cdf/pdf/ppf/sf`
   with `loc`/`scale`, `scipy.special.erf/erfc/ndtr/ndtri`, and the builtins `abs`, `min`,
@@ -1173,6 +1186,7 @@ qtrans/
   expressions.py     scalar expressions, Python semantics, library calls
   printing.py        print, f-strings, str/repr/format, % formatting: Python's text, exactly
   lists.py           lists as std::vector, comprehensions, any/all, str.join
+  dicts.py           dicts as qt::py::dict (insertion order, KeyError)
   loops.py           enumerate / zip loops rewritten as index loops, before translation
   origins.py         which values are Python's and which NumPy's (they repr and round differently)
   arrays.py          array expressions: arithmetic, broadcasting, indexing, NumPy functions
@@ -1189,12 +1203,12 @@ qtrans/
   runtime/qtrans_arrays.hpp    array helpers on Eigen, NumPy algorithms ported
   runtime/qtrans_random.hpp    NumPy's Generator (SeedSequence + PCG64 + ziggurat)
   runtime/qtrans_print.hpp     Python's repr and format mini-language, NumPy's array printing
-  runtime/qtrans_list.hpp      lists: indexes, slices, sum, sorted, ... with Python's rules
+  runtime/qtrans_list.hpp      lists (indexes, slices, sum, sorted, ...) and dicts, with Python's rules
   runtime/qtrans_pybind.hpp    the bindings' conversions, write-backs and exceptions
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               485 tests: generated text, refusals, compiled semantics, every example,
+tests/               506 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
@@ -1223,9 +1237,11 @@ run_examples.py      press-Run entry point
    ([Python and C++ side by side](#python-and-c-side-by-side)). **0.10 so far**: `qtrans live`, the
    editor with the C++ updating as you type; programs, with Python's printing reproduced
    exactly, types taken from how a script calls its functions, lists, `enumerate`/`zip` loops,
-   generators, and objects printed ([Programs](#programs-a-script-becomes-a-c-program)).
-   **Next**: dictionaries; the editor inside VS Code; traceable headers (source hash, Python line references, CMake); a reproducible
-   benchmark protocol.
+   generators, dicts, and objects printed ([Programs](#programs-a-script-becomes-a-c-program)).
+   **Next**: your own C++ for a function, verified against the Python and kept across
+   re-translations, with tuning hints written in the Python; CMake export; then lists of tuples,
+   string methods, `key=`; the editor inside VS Code; traceable headers (source hash, Python
+   line references); a reproducible benchmark protocol.
 8. **Later (1.0)**: a plugin API mapping approved Python functions to existing C++ (QuantLib,
    in-house libraries), integer arrays (the bootstrap), a written specification of the
    supported subset. Not planned: pandas, all of Python, GPU backends.

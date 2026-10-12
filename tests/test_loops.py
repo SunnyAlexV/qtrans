@@ -142,7 +142,7 @@ def test_loops_read_like_cpp():
     # zip: one index up to the shorter length, each element read by it, unchecked (always in range)
     assert "for (long long i = 0, i_end = std::min(static_cast<long long>(xs.size()), " \
            "static_cast<long long>(ws.size())); i < i_end; ++i) {" in h
-    assert "        double x = xs[i];\n        double w = ws[i];\n" in h
+    assert "        double x = xs[static_cast<std::size_t>(i)];\n        double w = ws[static_cast<std::size_t>(i)];\n" in h
     # enumerate: its own index is the loop index
     assert "for (long long i = 0, i_end = static_cast<long long>(xs.size()); i < i_end; ++i) {" in h
     assert "item(" not in h.split("first_negative")[1].split("changes")[0]

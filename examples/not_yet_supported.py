@@ -25,8 +25,8 @@ def safe_log(x: float) -> float:
 
 
 def lookup(x: float) -> float:
-    rates = {"base": x}  # dicts
-    return rates["base"]
+    rates = {x, 2 * x}  # sets
+    return max(rates)
 
 
 def no_annotations(x, y):

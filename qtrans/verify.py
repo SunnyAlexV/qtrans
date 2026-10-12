@@ -50,7 +50,7 @@ import numpy as np
 
 from .translator import (ARRAYS_HEADER, LIST_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
                          library_tree, translate_file)
-from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, ListType, OptionalType, StructType, TupleType
+from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, DictType, ListType, OptionalType, StructType, TupleType
 
 # Which Python exceptions a given C++ exception class stands for.
 CPP_EXC_MATCHES = {
@@ -375,7 +375,15 @@ class VerifyReport:
         if self.warnings:
             lines += ["", "  Compiler warnings in generated code:"] + [f"    {w}" for w in self.warnings[:10]]
         bad = len(self.mismatches) + (0 if self.program is None or self.program.ok else 1)
-        lines += ["", "  RESULT: " + ("PASS (no mismatches)" if self.ok else f"FAIL ({bad} mismatches)")]
+        result = "PASS (no mismatches)" if self.ok else f"FAIL ({bad} mismatches)"
+        skipped = [f.name for f in t.rejected]
+        if skipped and self.ok:
+            checked = len(self.functions) + (self.program is not None)
+            what = ", ".join("the program (main)" if n == "(program)" else f"{n}()" for n in skipped[:6])
+            what += f" and {len(skipped) - 6} more" if len(skipped) > 6 else ""
+            result = ("NOTHING CHECKED" if checked == 0 else "PASS for what was translated") + \
+                f"; not translated, so not checked: {what}"
+        lines += ["", "  RESULT: " + result]
         return "\n".join(lines)
 
 
@@ -410,6 +418,13 @@ def random_value(rng, t, n=3, shape=None):
     if isinstance(t, ListType):  # a list of 0 to 6 elements (empty lists are where sum() is the int 0)
         k = int(rng.integers(0, 7)) if rng.random() < 0.9 else 0
         return [random_value(rng, t.elem) for _ in range(k)]
+    if isinstance(t, DictType):  # 0 to 5 entries; keys from a small set, so lookups hit and miss
+        k = int(rng.integers(0, 6)) if rng.random() < 0.9 else 0
+        out = {}
+        for _ in range(k):
+            key = str(rng.choice(_STRINGS)) if t.key == STR else int(rng.integers(-3, 8))
+            out[key] = random_value(rng, t.val)
+        return out
     if isinstance(t, StructType):
         info, cls = _CLASSES[t.name]
         for _ in range(30):
@@ -538,6 +553,8 @@ def _encode(v, t):
         return "S" + str(v).encode("utf-8").hex()
     if isinstance(t, ListType):
         return " ".join([str(len(v))] + [_encode(x, t.elem) for x in v])
+    if isinstance(t, DictType):  # its length, then key and value, in order
+        return " ".join([str(len(v))] + [f"{_encode(k, t.key)} {_encode(x, t.val)}" for k, x in v.items()])
     if isinstance(t, OptionalType):
         return "N" if v is None else _encode(v, t.inner)
     if t == RNG:
@@ -603,6 +620,12 @@ def _has_complex(v):
 
 
 def _py_value(v, t):
+    if isinstance(t, DictType):
+        if not isinstance(v, dict):
+            raise TypeError(f"expected a dict, got {type(v).__name__}")
+        if t.val == FLOAT and any(type(x) is int for x in v.values()):
+            raise TypeError("a dict of floats holding an int (Python prints it as one)")
+        return {_py_value(k, t.key): _py_value(x, t.val) for k, x in v.items()}
     if isinstance(t, ListType):
         if not isinstance(v, list):
             raise TypeError(f"expected a list, got {type(v).__name__}")
@@ -1044,6 +1067,19 @@ static std::vector<T> qtrans_list(Reader& r, Fn f) {
     for (long long i = 0; i < n; ++i) v.push_back(f(r));
     return v;
 }
+#ifdef QTRANS_LIST_HPP
+// a dict arrives as its length, then each key and value
+template <class K, class V, class FK, class FV>
+static qt::py::dict<K, V> qtrans_dict(Reader& r, FK fk, FV fv) {
+    const long long n = std::strtoll(r.next().c_str(), nullptr, 10);
+    qt::py::dict<K, V> d;
+    for (long long i = 0; i < n; ++i) {
+        K k = fk(r);
+        d[k] = fv(r);
+    }
+    return d;
+}
+#endif
 // an argument that may be None arrives as N
 template <class T, class Fn>
 static std::optional<T> qtrans_optional(Reader& r, Fn f) {
@@ -1065,6 +1101,15 @@ static void out(const std::vector<T>& v) {
 }
 template <class T>
 static double num(const std::vector<T>& v) { return v.empty() ? 0.0 : num(v[0]); }
+#ifdef QTRANS_LIST_HPP
+template <class K, class V>
+static void out(const qt::py::dict<K, V>& d) {
+    std::printf(" %lld", d.size());
+    for (const auto& [k, v] : d) { out(k); out(v); }
+}
+template <class K, class V>
+static double num(const qt::py::dict<K, V>& d) { return d.empty() ? 0.0 : num(d.begin()->second); }
+#endif
 template <class T>
 static void out(const std::optional<T>& x) {
     if (x) out(*x); else std::printf(" N");
@@ -1227,7 +1272,7 @@ def _branch(key, sig, namespace) -> str:
     def read(i, p, volatile):
         if p.type == RNG:
             return f"qt::Rng p{i}(I(r));"
-        if isinstance(p.type, (OptionalType, StructType, ListType)):
+        if isinstance(p.type, (OptionalType, StructType, ListType, DictType)):
             return f"auto p{i} = {_reader(p.type, namespace)};"
         if volatile and p.type in _CTYPE:
             return f"volatile {_CTYPE[p.type]} p{i} = {_PARSE[p.type]}(r);"
@@ -1261,6 +1306,9 @@ def _reader(t, ns, r="r") -> str:
         return (f"qtrans_optional<{inner.cpp()}>({r}, [](Reader& rr) {{ return {_reader(inner, ns, 'rr')}; }})")
     if isinstance(t, ListType):
         return f"qtrans_list<{t.elem.cpp()}>({r}, [](Reader& rr) {{ return {_reader(t.elem, ns, 'rr')}; }})"
+    if isinstance(t, DictType):
+        return (f"qtrans_dict<{t.key.cpp()}, {t.val.cpp()}>({r}, [](Reader& rr) {{ return {_reader(t.key, ns, 'rr')}; }}, "
+                f"[](Reader& rr) {{ return {_reader(t.val, ns, 'rr')}; }})")
     return f"{_PARSE[t]}({r})"
 
 
@@ -1340,6 +1388,13 @@ def _parse_cpp_line(line, out_t):
 
 
 def _parse_value(t, toks):
+    if isinstance(t, DictType):
+        n = int(next(toks))
+        out = {}
+        for _ in range(n):
+            k = _parse_value(t.key, toks)
+            out[k] = _parse_value(t.val, toks)
+        return out
     if isinstance(t, ListType):
         n = int(next(toks))
         return [_parse_value(t.elem, toks) for _ in range(n)]
@@ -1512,6 +1567,10 @@ def _compare_values(pv, cv, t, rtol, atol):
     """-> (equal, rel_err, ulps)"""
     if t == VOID:
         return (True, 0.0, 0)
+    if isinstance(t, DictType):  # the same keys in the same order (it shows when printed), values close
+        if list(pv) != list(cv):
+            return (False, math.inf, 0)
+        return _compare_values(list(pv.values()), list(cv.values()), ListType(t.val), rtol, atol)
     if isinstance(t, ListType):
         if len(pv) != len(cv):
             return (False, math.inf, 0)

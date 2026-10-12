@@ -58,6 +58,16 @@ def _defined(tree) -> set:
     return out
 
 
+def _items_of(target, it):
+    """`for k, v in d.items()`: (k, v, d) -- k / v names, d a name -- or None."""
+    if isinstance(target, ast.Tuple) and len(target.elts) == 2 and all(isinstance(e, ast.Name) for e in target.elts) \
+            and isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr == "items" \
+            and not it.args and not it.keywords and isinstance(it.func.value, ast.Name) \
+            and target.elts[0].id != target.elts[1].id:
+        return target.elts[0].id, target.elts[1].id, it.func.value.id
+    return None
+
+
 def _call_of(node, name):
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
 
@@ -292,6 +302,22 @@ class Rewriter(ast.NodeTransformer):
     # --- for-loops ----------------------------------------------------------------------------
     def visit_For(self, node):
         self.generic_visit(node)
+        items = _items_of(node.target, node.iter)
+        if items is not None:
+            # for k, v in d.items():  ->  for k in d: v = d[k]  (the value the iterator would give)
+            k, v, d = items
+            if k == "_":
+                k = self.fresh_index(node)
+            body = list(node.body)
+            if v != "_" or "_" in self._scope_names_outside(node):
+                body.insert(0, _loc(ast.Assign(targets=[_name(v, True)],
+                                               value=ast.Subscript(value=_name(d), slice=_name(k), ctx=ast.Load())),
+                                    node))
+            loop = ast.For(target=_name(k, True), iter=_name(d), body=body, orelse=node.orelse, type_comment=None)
+            _loc(loop, node)
+            loop.end_lineno, loop.end_col_offset = node.end_lineno, node.end_col_offset
+            loop.qt_items = d
+            return loop
         p = _plan(node.target, node.iter, self.builtins_ok)
         if p is None:
             return node
@@ -359,6 +385,32 @@ class Rewriter(ast.NodeTransformer):
         if len(node.generators) != 1:
             return node
         g = node.generators[0]
+        items = _items_of(g.target, g.iter)
+        if items is not None:
+            k, v, d = items
+            parts = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+            if not any(isinstance(n, (ast.NamedExpr, ast.Lambda, ast.ListComp, ast.GeneratorExp, ast.SetComp,
+                                      ast.DictComp)) for e in parts + list(g.ifs) for n in ast.walk(e)):
+                if k == "_":
+                    k = self.fresh_index(node)
+
+                class SubV(ast.NodeTransformer):
+                    def visit_Name(self, n):
+                        if n.id == v and isinstance(n.ctx, ast.Load):
+                            return ast.copy_location(ast.Subscript(value=_name(d), slice=_name(k), ctx=ast.Load()), n)
+                        return n
+                g.ifs = [SubV().visit(c) for c in g.ifs]
+                if isinstance(node, ast.DictComp):
+                    node.key, node.value = SubV().visit(node.key), SubV().visit(node.value)
+                else:
+                    node.elt = SubV().visit(node.elt)
+                g.target, g.iter = _name(k, True), _name(d)
+                g.qt_items = d
+                for n in ast.walk(node):
+                    if "lineno" in n._attributes and not hasattr(n, "lineno"):
+                        n.lineno, n.col_offset, n.end_lineno, n.end_col_offset = \
+                            node.lineno, node.col_offset, node.end_lineno, node.end_col_offset
+            return node
         p = _plan(g.target, g.iter, self.builtins_ok)
         if p is None:
             return node

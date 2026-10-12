@@ -8,7 +8,7 @@ from qtrans.typing import Vec
 
 DAYS = 252
 DEFAULT_RF: float = 0.04
-TABLE = {"a": 1}
+TABLE = {1, 2}  # a set: not supported
 
 
 def discount(r: float, t: float) -> float:
@@ -32,7 +32,7 @@ def noisy(rng: np.random.Generator, n: int) -> Vec:
 
 
 def bad(x: float) -> float:
-    return TABLE["a"] * x
+    return len(TABLE) * x
 
 
 @dataclass(frozen=True)

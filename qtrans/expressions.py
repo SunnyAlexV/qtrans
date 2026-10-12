@@ -20,8 +20,9 @@ from .errors import Unsupported
 from .arrays import STACKERS, ArrayOps
 from .structs import StructOps
 from .printing import TextOps
+from .dicts import DictOps, dict_of
 from .lists import ListOps, list_of
-from .types import (ListType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
+from .types import (ListType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
 from .core import cpp_string
@@ -102,7 +103,7 @@ def _outer_call(code: str):
     return None
 
 
-class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
+class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
@@ -292,6 +293,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
                 base = None
             if base is not None and list_of(base.type):
                 return self.list_subscript(node, base)
+            if base is not None and dict_of(base.type):
+                return self.dict_subscript(node, base)
         return self.array_subscript(node)
 
     def e_Attribute(self, node):
@@ -389,6 +392,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
         (qt::iadd, ...): the exact result, or OverflowError where Python's unbounded int would
         leave 64 bits."""
         r = iv_op(sym, iv_of(L), iv_of(R))
+        self._beyond_64_bits(r)
         if L.int_lit and R.int_lit:
             L = Expr(self.as_type(L, INT, False).code, P_ATOM, INT, iv=L.iv)
         if iv_fits(r):
@@ -399,6 +403,18 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
         # (qt::iadd takes long long: an Index converts, no cast needed)
         return Expr(f"qt::{fn}({self.as_type(L, INT, False).code}, {self.as_type(R, INT, False).code})", P_ATOM, INT,
                     iv=iv_clip(r))
+
+    def _beyond_64_bits(self, r):
+        """An int that is surely outside 64 bits whatever happens at run time (2 ** 100): Python
+        has the number, the C++ could only stop with OverflowError, so refuse it now."""
+        lo, hi = r
+        if lo > 2 ** 63 - 1 or hi < -2 ** 63:
+            v = lo if lo == hi else None
+            what = f"is {v}" if v is not None and len(str(v)) <= 40 else "has more than 64 bits"
+            raise Unsupported(self.current, f"this int {what}: Python's ints have no size limit, but C++'s "
+                                            "long long stops at about ±9.2e18 (the program would stop with "
+                                            "OverflowError where Python prints the number)",
+                              "use a float if an approximate value is enough (2.0 ** 100)")
 
     def power(self, node, L: Expr, R: Expr) -> Expr:
         node = node or self.current
@@ -416,6 +432,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
                 lo, hi = iv_of(L)
                 ends = [lo ** n, hi ** n]
                 r = (0 if n % 2 == 0 and lo <= 0 <= hi else min(ends), max(ends)) if n else (1, 1)
+                self._beyond_64_bits(r)
                 if iv_fits(r):
                     if n == 2 and L.simple and not str(L.value or "").startswith("-"):
                         return Expr(f"{a.code} * {a.code}", P_MUL, INT, iv=r)
@@ -490,10 +507,19 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
             return self._is_none(node)
         if any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
             if len(node.ops) == 1 and not isinstance(node.comparators[0], (ast.Tuple, ast.List, ast.Set)):
+                d = self.expr(node.comparators[0])
+                if dict_of(d.type):
+                    return self.dict_contains(node, node.left, d, isinstance(node.ops[0], ast.NotIn))
                 return self.list_contains(node, node.left, node.comparators[0], isinstance(node.ops[0], ast.NotIn))
             return self._in_literals(node)
         vals = [node.left] + list(node.comparators)
         exprs = [self.expr(v) for v in vals]
+        if any(dict_of(e.type) for e in exprs):
+            if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Eq, ast.NotEq)) \
+                    or not all(dict_of(e.type) for e in exprs) or exprs[0].type != exprs[1].type:
+                raise Unsupported(node, "dicts compare with == and != only, against a dict of the same types")
+            sym = "==" if isinstance(node.ops[0], ast.Eq) else "!="
+            return Expr(f"{wrap(exprs[0], P_EQ)} {sym} {wrap(exprs[1], P_EQ - 1)}", P_EQ, BOOL)
         if any(e.type == STR for e in exprs):
             return self._compare_strings(node, vals, exprs)
         if any(isinstance(e.type, StructType) for e in exprs):
@@ -663,6 +689,12 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
                 return self.call_library(node, self.mod.imports[name])
             if name in ("str", "repr", "format"):
                 return self.text_value(node)
+            if name == "dict" and not node.args and not node.keywords:
+                return Expr("{}", P_ATOM, DictType(None, None), value={}, simple=True)
+            if name in ("len", "sum", "min", "max", "sorted", "list", "dict") and len(node.args) == 1:
+                e = self.dict_builtin(node, name)
+                if e is not None:
+                    return e
             if name in ("len", "sum", "min", "max", "sorted", "list") and len(node.args) == 1:
                 e = self.list_builtin(node, name)
                 if e is not None:
@@ -700,6 +732,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
                 return self.array_method(node, base, f.attr)
             if list_of(base.type):
                 return self.list_method(node, base, f.attr)
+            if dict_of(base.type):
+                return self.dict_method(node, base, f.attr)
             if base.type == RNG:
                 return self.rng_method(node, base, f.attr)
             if base.type == STR and f.attr == "join":
@@ -806,6 +840,11 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps):
             if not isinstance(e.type, ListType) or e.type.elem not in (None, p.type.elem):
                 raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
             return f"{p.type.cpp()}{{}}" if e.type.elem is None else e.code
+        if isinstance(p.type, DictType):  # passed as `const qt::py::dict<K, V>&`
+            e = self.expr(a)
+            if not assignable(p.type, e.type):
+                raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
+            return f"{p.type.cpp()}{{}}" if e.type.key is None else e.code
         e = self.expr(a)
         self.need_scalar(e, a, f"argument '{p.name}' of {display}()")
         if not assignable(p.type, e.type):

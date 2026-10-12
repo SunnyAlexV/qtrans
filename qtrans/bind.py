@@ -58,7 +58,7 @@ import numpy as np
 
 from . import verify as V
 from .translator import ARRAYS_HEADER, LIST_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
-from .types import (ListType, BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
+from .types import (ListType, DictType, BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
                     VoidType)
 
 PYBIND_HEADER = Path(__file__).parent / "runtime" / "qtrans_pybind.hpp"
@@ -92,7 +92,7 @@ def _native(t) -> bool:
     """Passed straight through pybind11's own conversions."""
     inner = t.inner if isinstance(t, OptionalType) else t
     # a list is copied in (pybind11's list caster): a function never changes a list passed to it
-    return isinstance(inner, Scalar) or inner == STR or isinstance(inner, ListType)
+    return isinstance(inner, Scalar) or inner == STR or isinstance(inner, (ListType, DictType))
 
 
 def _cstr(s: str) -> str:

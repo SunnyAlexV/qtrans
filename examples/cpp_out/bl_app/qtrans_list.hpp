@@ -1,11 +1,13 @@
 // qtrans_list.hpp: Python lists of numbers or strings as std::vector, with Python's rules where
 // a plain std::vector differs: negative indexes and IndexError, slices, sum() as CPython adds
 // floats, min() / max() / sorted() as Python picks, and printing as Python prints a list.
+// Also Python's dict, as qt::py::dict: keys kept in the order they were first added.
 //
 // A list is a std::vector<double>, std::vector<long long> or std::vector<std::string>; the
 // translator only uses these helpers where Python's behaviour needs them (xs.size() and
 // xs.push_back(x) are written as they are).
 #pragma once
+#define QTRANS_LIST_HPP 1  // lets other code see that qt::py::dict is here
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +15,8 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "qtrans_print.hpp"
@@ -236,6 +240,136 @@ std::string repr(const std::vector<T>& xs, bool numpy = false) {
 }
 template <class T>
 std::string str(const std::vector<T>& xs) { return repr(xs); }
+
+// --- dict ------------------------------------------------------------------------------------
+// Python's dict: a key's position is the order it was first added (changing its value keeps the
+// position; deleting and adding again puts it last), lookups by hash. Keys are str or int.
+class KeyError : public std::out_of_range {
+  public:
+    using std::out_of_range::out_of_range;
+};
+
+template <class K>
+std::string key_text(const K& k) { return repr(k); }  // KeyError's message: the key's repr
+
+template <class K, class V>
+class dict {
+  public:
+    using value_type = std::pair<K, V>;
+    dict() = default;
+    dict(std::initializer_list<value_type> items) {
+        for (const auto& kv : items) (*this)[kv.first] = kv.second;  // a repeated key: the last value wins
+    }
+
+    long long size() const { return static_cast<long long>(items_.size()); }
+    bool empty() const { return items_.empty(); }
+    bool contains(const K& k) const { return index_.count(k) != 0; }
+
+    // d[k]: KeyError if absent
+    const V& at(const K& k) const {
+        auto it = index_.find(k);
+        if (it == index_.end()) throw KeyError(key_text(k));
+        return items_[it->second].second;
+    }
+    V& at(const K& k) {
+        auto it = index_.find(k);
+        if (it == index_.end()) throw KeyError(key_text(k));
+        return items_[it->second].second;
+    }
+    // d[k] = v: an existing key keeps its place, a new one goes last
+    V& operator[](const K& k) {
+        auto it = index_.find(k);
+        if (it != index_.end()) return items_[it->second].second;
+        index_.emplace(k, items_.size());
+        items_.emplace_back(k, V{});
+        return items_.back().second;
+    }
+    V get(const K& k, const V& dflt) const {
+        auto it = index_.find(k);
+        return it == index_.end() ? dflt : items_[it->second].second;
+    }
+    V& setdefault(const K& k, const V& dflt) {
+        auto it = index_.find(k);
+        if (it != index_.end()) return items_[it->second].second;
+        return (*this)[k] = dflt;
+    }
+    V pop(const K& k) {
+        auto it = index_.find(k);
+        if (it == index_.end()) throw KeyError(key_text(k));
+        return erase_at(it->second);
+    }
+    V pop(const K& k, const V& dflt) {
+        auto it = index_.find(k);
+        return it == index_.end() ? dflt : erase_at(it->second);
+    }
+    void erase(const K& k) { pop(k); }  // del d[k]
+    void clear() { items_.clear(); index_.clear(); }
+    void update(const dict& other) {
+        for (const auto& kv : other.items_) (*this)[kv.first] = kv.second;
+    }
+
+    // in order: for (const auto& [k, v] : d), d.keys(), d.values()
+    typename std::vector<value_type>::const_iterator begin() const { return items_.begin(); }
+    typename std::vector<value_type>::const_iterator end() const { return items_.end(); }
+    std::vector<K> keys() const {
+        std::vector<K> out;
+        out.reserve(items_.size());
+        for (const auto& kv : items_) out.push_back(kv.first);
+        return out;
+    }
+    std::vector<V> values() const {
+        std::vector<V> out;
+        out.reserve(items_.size());
+        for (const auto& kv : items_) out.push_back(kv.second);
+        return out;
+    }
+    bool operator==(const dict& o) const {  // Python: same keys and values, in any order
+        if (size() != o.size()) return false;
+        for (const auto& kv : items_) {
+            if (!o.contains(kv.first)) return false;
+            if constexpr (std::is_floating_point_v<V>) {
+                // Python compares the values with `is` first: a NaN equals the very same NaN
+                // object, which a copy may or may not be -- not reproduced
+                if (std::isnan(kv.second) || std::isnan(o.at(kv.first)))
+                    throw std::runtime_error("qtrans: comparing dicts holding NaN is not reproduced");
+            }
+            if (!(o.at(kv.first) == kv.second)) return false;
+        }
+        return true;
+    }
+    bool operator!=(const dict& o) const { return !(*this == o); }
+
+  private:
+    V erase_at(size_t i) {
+        V v = std::move(items_[i].second);
+        index_.erase(items_[i].first);
+        items_.erase(items_.begin() + static_cast<std::ptrdiff_t>(i));
+        for (size_t j = i; j < items_.size(); ++j) index_[items_[j].first] = j;
+        return v;
+    }
+    std::vector<value_type> items_;
+    std::unordered_map<K, size_t> index_;
+};
+
+// printing: {'a': 1.0, 'b': 2}, {1: 'x'}, {}
+template <class K, class V>
+std::string repr(const dict<K, V>& d, bool numpy = false) {
+    std::string out = "{";
+    bool first = true;
+    for (const auto& [k, v] : d) {
+        if (!first) out += ", ";
+        first = false;
+        out += repr(k) + ": ";
+        if constexpr (std::is_same_v<V, double> || std::is_same_v<V, long long>) {
+            out += numpy ? repr(np(v)) : repr(v);
+        } else {
+            out += repr(v);
+        }
+    }
+    return out + "}";
+}
+template <class K, class V>
+std::string str(const dict<K, V>& d) { return repr(d); }
 
 }  // namespace py
 }  // namespace qt

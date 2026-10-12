@@ -9,10 +9,11 @@
 #include <cmath>
 #include <vector>
 #include <string>
-#include "qtrans_list.hpp"  // lists, and print(), str(), repr(), format() as Python writes them
+#include "qtrans_list.hpp"  // lists, dicts, and print(), str(), repr(), format() as Python writes them
 
 namespace bl_config {
 
+inline const qt::py::dict<std::string, long long> FREQ_PER_YEAR = {{"Daily", 252LL}, {"Weekly", 52LL}, {"Monthly", 12LL}};
 // A single young ticker must not truncate everyone else. Keep a name only if it
 // covers at least this share of the chosen window.
 inline const double MIN_HISTORY_COVERAGE = 0.95;
@@ -29,5 +30,6 @@ inline const double DEFAULT_VIEW_CONFIDENCE = 75.0;  // Idzorek confidence: tilt
 inline const double DEFAULT_VOL_TARGET_PCT = 12.0;  // absolute-mode target, when the user picks a fixed number
 inline const long long DEFAULT_VOL_TARGET_FRAC_PCT = 75;  // relative-mode default: run at 75% of the book's own risk
 inline const std::vector<std::string> VIEW_TYPES = {"Absolute", "Relative"};
+inline const qt::py::dict<std::string, std::string> ENGINE_NOTES = {{"momentum", "Ranks assets on their return over the past 12 months, skipping the most recent month (the skip avoids short-term reversal contaminating the signal). Expects past winners to keep beating past losers. The most robust anomaly in the literature, and also among the most crowded."}, {"reversal", "Ranks on the last month's return and bets the other way \342\200\224 recent losers bounce. Works at short horizons where momentum does not, and is the reason momentum skips the most recent month."}, {"trend", "Compares each asset's price to its own 200-day average. Above = hold, below = expect weakness. A time-series signal rather than a cross-sectional one: it can be bearish on everything at once."}, {"lowvol", "Ranks on realised volatility and expects the calmer assets to deliver better risk-adjusted returns \342\200\224 the low-volatility anomaly. Note this partly duplicates what the optimiser already does, so its views often add little."}};
 
 }  // namespace bl_config

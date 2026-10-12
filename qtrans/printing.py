@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from .core import P_ADD, P_ATOM, Expr, cpp_string, wrap
 from .errors import Unsupported
 from .origins import NP, PY
-from .types import (ArrayType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
+from .types import (ArrayType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, is_array)
 
 _SAMPLE = {"float": 1.5, "int": 7, "bool": True}  # a value of each type, to try a format spec on
@@ -219,6 +219,12 @@ class TextOps:
         empty = self._empty_comprehension_sum(node)
         if empty:
             return empty
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "sum" \
+                and len(node.args) == 1 and isinstance(node.args[0], ast.Call) and not node.args[0].args \
+                and isinstance(node.args[0].func, ast.Attribute) and node.args[0].func.attr == "values" \
+                and isinstance(node.args[0].func.value, ast.Name) and not self.is_variable("sum") \
+                and isinstance(self._quiet_type(node.args[0].func.value), DictType) and t == FLOAT:
+            return f"{self.ident(node.args[0].func.value.id)}.empty()"  # sum(d.values()) of no values: the int 0
         return False if self.maybe_int(node) else None
 
     def _empty_comprehension_sum(self, node):
@@ -231,6 +237,9 @@ class TextOps:
         if len(comp.generators) != 1 or comp.generators[0].ifs or self._quiet_type(node) != FLOAT:
             return None
         it = comp.generators[0].iter
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr in ("keys", "values") \
+                and not it.args and isinstance(it.func.value, ast.Name):
+            it = it.func.value  # sum(v for v in d.values()): empty exactly when d is
         if isinstance(it, ast.Name):
             names = [it]
         elif isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" \
@@ -255,10 +264,11 @@ class TextOps:
         conds = []
         for n, cut in names:
             t = self._quiet_type(n)
-            if not (isinstance(t, ListType) or t == ArrayType(1)):
+            if not (isinstance(t, (ListType, DictType)) or t == ArrayType(1)):
                 return None
             x = self.ident(n.id)
-            conds.append(f"{x}.size() <= {cut}" if cut else f"{x}.empty()" if isinstance(t, ListType) else f"{x}.size() == 0")
+            conds.append(f"{x}.size() <= {cut}" if cut else f"{x}.empty()" if isinstance(t, (ListType, DictType))
+                         else f"{x}.size() == 0")
         return " || ".join(dict.fromkeys(conds))
 
     def _empty_sum(self, node) -> bool:
@@ -443,7 +453,7 @@ class TextOps:
         if isinstance(t, OptionalType) and isinstance(t.inner, Scalar) or is_array(t):
             c = f"qt::py::str({e.code})"
             return Piece(code=c, stream=c)
-        if isinstance(t, TupleType) or isinstance(t, ListType):
+        if isinstance(t, (TupleType, ListType, DictType)):
             return self.repr_piece(node, e)
         if isinstance(t, StructType):
             return self.struct_text(node, e, "str")
@@ -491,6 +501,20 @@ class TextOps:
                 numpy = eo == NP
                 if t.elem == FLOAT and self.maybe_int(node):
                     raise Unsupported(node, "an element of the list may be a Python int", "0.0 rather than 0")
+            c = f"qt::py::repr({e.code}{', true' if numpy else ''})"
+            return Piece(code=c, stream=c)
+        if isinstance(t, DictType):
+            if e.value == {}:
+                return _lit("{}")
+            self._need_dict(e, node, "printing")
+            numpy = False
+            if t.val in (FLOAT, INT):
+                o = self.origin(node)
+                vo = o[1] if isinstance(o, tuple) and o[0] == "dict" else None
+                if vo not in (PY, NP):
+                    raise Unsupported(node, self._origin_message(node, "the dict's values"),
+                                      "convert them with float(...) / int(...) as they go in")
+                numpy = vo == NP
             c = f"qt::py::repr({e.code}{', true' if numpy else ''})"
             return Piece(code=c, stream=c)
         if isinstance(t, TupleType):

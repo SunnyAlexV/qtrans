@@ -57,7 +57,7 @@ def test_in_place_changes_cross_modules(toy):
 def test_rejections_say_why_across_modules(toy):
     why = {f.name: f.reason for f in toy.modules["core"].report.rejected}
     assert "bad (in rates) could not be translated" in why["uses_bad"]
-    assert "dicts are not supported" in why["uses_bad"]
+    assert "sets are not supported" in why["uses_bad"]
     assert "R.TABLE" in why["uses_table"] and "(in rates)" in why["uses_table"]
     # rates.safe_log may raise a math domain error: catching ValueError around it is refused
     assert "except ValueError" in why["guarded"]

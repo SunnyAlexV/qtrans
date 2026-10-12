@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import ast
 
-from .types import RNG, ArrayType, Scalar, TupleType, is_array
+from .types import RNG, ArrayType, DictType, ListType, Scalar, TupleType, is_array
 
 PY, NP, RNG_ = "py", "np", "rng"
 _BOTTOM = "bottom"  # no assignment seen yet (the start of the fixpoint)
@@ -35,8 +35,8 @@ def join(a, b):
         return b
     if b == _BOTTOM:
         return a
-    if isinstance(a, tuple) and isinstance(b, tuple) and a[0] == b[0] == "list":
-        return ("list", join(a[1], b[1]))
+    if isinstance(a, tuple) and isinstance(b, tuple) and a[0] == b[0] and a[0] in ("list", "dict"):
+        return (a[0], join(a[1], b[1]))  # a list's elements / a dict's values
     if isinstance(a, tuple) and isinstance(b, tuple) and a[0] == b[0] == "tuple" and len(a[1]) == len(b[1]):
         return ("tuple", tuple(join(x, y) for x, y in zip(a[1], b[1])))
     return a if a == b else None
@@ -70,6 +70,10 @@ def of_type(t):
         return RNG_
     if isinstance(t, TupleType):
         return ("tuple", tuple(of_type(e) for e in t.elts))
+    if isinstance(t, ListType):
+        return ("list", PY)
+    if isinstance(t, DictType):
+        return ("dict", PY)
     return None
 
 
@@ -138,7 +142,11 @@ class _FunctionOrigins:
         for n in _own_nodes(self.fdef):
             if isinstance(n, ast.Assign):
                 for t in n.targets:
-                    recs.append((t, lambda v=n.value: self.of(v), n.value))
+                    if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and not isinstance(t.slice, ast.Slice):
+                        # xs[i] = v, d[k] = v: the list / dict now also holds v
+                        recs.append((t.value, lambda v=n.value: ("item", self.of(v)), None))
+                    else:
+                        recs.append((t, lambda v=n.value: self.of(v), n.value))
             elif isinstance(n, ast.AnnAssign) and n.value is not None:
                 recs.append((n.target, lambda v=n.value: self.of(v), n.value))
             elif isinstance(n, ast.AugAssign):
@@ -158,6 +166,14 @@ class _FunctionOrigins:
                 arg = c.args[-1] if c.func.attr == "insert" else c.args[0]
                 ext = c.func.attr == "extend"
                 recs.append((c.func.value, lambda a=arg, ext=ext: self._as_list(a, ext), None))
+            elif isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute) \
+                    and isinstance(n.value.func.value, ast.Name) and n.value.func.attr == "setdefault" \
+                    and len(n.value.args) == 2:
+                recs.append((n.value.func.value, lambda a=n.value.args[1]: ("item", self.of(a)), None))
+            elif isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute) \
+                    and isinstance(n.value.func.value, ast.Name) and n.value.func.attr == "update" \
+                    and len(n.value.args) == 1:
+                recs.append((n.value.func.value, lambda a=n.value.args[0]: self.of(a), None))
             elif isinstance(n, ast.ExceptHandler) and n.name:
                 recs.append((ast.Name(id=n.name, ctx=ast.Store()), lambda: None, None))
         return recs
@@ -180,6 +196,8 @@ class _FunctionOrigins:
         o = self.of(it)
         if o == NP:
             return NP
+        if isinstance(o, tuple) and o[0] == "dict":
+            return PY  # a dict's keys (str or int): Python's
         if isinstance(o, tuple) and o[0] == "list":
             return o[1]
         if isinstance(o, tuple) and len(set(o[1])) == 1:
@@ -187,6 +205,13 @@ class _FunctionOrigins:
         return None if o != _BOTTOM else _BOTTOM
 
     def _store(self, env, target, origin, value):
+        if isinstance(target, ast.Name) and isinstance(origin, tuple) and origin[0] == "item":
+            old = env.get(target.id, _BOTTOM)
+            if isinstance(old, tuple) and old[0] in ("list", "dict"):
+                env[target.id] = (old[0], join(old[1], origin[1]))
+            elif old != _BOTTOM:
+                env[target.id] = None
+            return
         if isinstance(target, ast.Name):
             env[target.id] = join(env.get(target.id, _BOTTOM), origin)
         elif isinstance(target, (ast.Tuple, ast.List)):
@@ -268,11 +293,19 @@ class _FunctionOrigins:
             for e in node.elts:
                 out = join(out, self.of(e))
             return ("list", out)
-        if isinstance(node, ast.ListComp) and len(node.generators) == 1 and isinstance(node.generators[0].target, ast.Name):
+        if isinstance(node, ast.Dict):
+            out = _BOTTOM
+            for v in node.values:
+                out = join(out, self.of(v))
+            return ("dict", out)
+        if isinstance(node, (ast.ListComp, ast.DictComp)) and len(node.generators) == 1 \
+                and isinstance(node.generators[0].target, ast.Name):
             g = node.generators[0]
             saved = self.env.get(g.target.id, "<unset>")
             self.env[g.target.id] = self._element(g.iter)
             try:
+                if isinstance(node, ast.DictComp):
+                    return ("dict", self.of(node.value))
                 return ("list", self.of(node.elt))
             finally:
                 if saved == "<unset>":
@@ -302,6 +335,8 @@ class _FunctionOrigins:
                 return NP
             if isinstance(base, tuple) and base[0] == "list":
                 return base if isinstance(node.slice, ast.Slice) else base[1]
+            if isinstance(base, tuple) and base[0] == "dict":
+                return base[1]
             if isinstance(base, tuple) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
                 k = node.slice.value
                 return base[1][k] if -len(base[1]) <= k < len(base[1]) else None
@@ -321,6 +356,8 @@ class _FunctionOrigins:
                 return ("list", PY)  # its ints are Python's (list(range(n)), for i in range(n))
             if f.id in ("sum", "min", "max", "sorted", "list") and len(node.args) == 1:
                 o = self.of(node.args[0])
+                if isinstance(o, tuple) and o[0] == "dict":  # over its keys
+                    return ("list", PY) if f.id in ("sorted", "list") else PY
                 if isinstance(o, tuple) and o[0] == "list":
                     if f.id in ("sorted", "list"):
                         return o
@@ -359,6 +396,16 @@ class _FunctionOrigins:
                 sized = len(node.args) > k or any(a.arg == "size" and not (
                     isinstance(a.value, ast.Constant) and a.value.value is None) for a in node.keywords)
                 return NP if sized else PY  # a draw without size is a Python float
+            if isinstance(base, tuple) and base[0] == "dict":
+                if f.attr in ("get", "pop", "setdefault"):
+                    return base[1] if len(node.args) < 2 else join(base[1], self.of(node.args[1]))
+                if f.attr == "copy":
+                    return base
+                if f.attr == "values":
+                    return ("list", base[1])
+                if f.attr == "keys":
+                    return ("list", PY)
+                return None
             if isinstance(base, tuple) and base[0] == "list":
                 if f.attr == "pop":
                     return base[1]

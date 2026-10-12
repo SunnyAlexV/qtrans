@@ -22,7 +22,7 @@ These only matter on inputs where Python would raise an exception or overflow.
   - Hint: annotate with Vec (1-D) or Mat (2-D): `from qtrans.typing import Vec, Mat`
 - `safe_log` (line 20). line 23: except ValueError around math.sqrt / math.log / ...: Python raises ValueError outside their domain, C++ returns NaN, so the handler would run in Python but not in C++
   - Hint: test the argument before the call instead
-- `lookup` (line 27). line 28: dicts are not supported in stage 1
+- `lookup` (line 27). line 28: sets are not supported in stage 1
 - `no_annotations` (line 32). line 32: parameter 'x' has no type annotation, and no call in this file shows its type
   - Hint: write `x: float` (or int / bool) for a number, or `x: Vec` / `x: Mat` for a 1-D / 2-D float array (from qtrans.typing import Vec, Mat)
 - `uses_annuity` (line 36). line 37: calls annuity(), which could not be translated

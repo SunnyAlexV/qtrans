@@ -152,6 +152,26 @@ class ListType:
 
 
 @dataclass(frozen=True)
+class DictType:
+    """A Python dict with str or int keys and float, int or str values, as qt::py::dict (keys in
+    the order they were added). key / val None: an empty dict whose types come from what is
+    stored in it later (`d = {}`, then d["a"] = 1.5)."""
+    key: object
+    val: object
+
+    def cpp(self) -> str:
+        k = self.key.cpp() if self.key is not None else "std::string"
+        v = self.val.cpp() if self.val is not None else "double"
+        return f"qt::py::dict<{k}, {v}>"
+
+    def zero(self) -> str:
+        return "{}"
+
+    def __str__(self) -> str:
+        return f"dict[{self.key if self.key is not None else '?'}, {self.val if self.val is not None else '?'}]"
+
+
+@dataclass(frozen=True)
 class NoneValueType:
     """The value None, before it is stored anywhere (it then becomes part of an OptionalType)."""
 
@@ -226,6 +246,10 @@ def join(a, b):
         if a.elem is None or b.elem is None:
             return a if b.elem is None else b
         return a if a.elem == b.elem else None
+    if isinstance(a, DictType) and isinstance(b, DictType):
+        if a.key is None or b.key is None:
+            return a if b.key is None else b
+        return a if a == b else None
     return None
 
 
@@ -245,6 +269,8 @@ def assignable(target, value) -> bool:
         return False
     if isinstance(target, ListType) and isinstance(value, ListType):
         return value.elem is None or value.elem == target.elem
+    if isinstance(target, DictType) and isinstance(value, DictType):
+        return value.key is None or value == target
     if isinstance(target, TupleType) and isinstance(value, TupleType):
         return len(target.elts) == len(value.elts) and all(
             assignable(t, v) for t, v in zip(target.elts, value.elts)

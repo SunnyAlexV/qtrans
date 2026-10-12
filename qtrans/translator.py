@@ -27,7 +27,7 @@ from .functions import FunctionTranslator, is_docstring, python_reads, source_ma
 from .origins import Origins
 from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
-                    StructType, TupleType, ListType, assignable, is_array)
+                    StructType, TupleType, ListType, DictType, assignable, is_array)
 
 VERSION = "0.9.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
@@ -304,6 +304,14 @@ class ModuleTranslator:
                 if elem in (FLOAT, INT, STR):
                     return ListType(elem)
                 raise Unsupported(node, f"'{ast.unparse(node)}': lists of float, int or str are supported")
+            if bname in ("dict", "Dict"):
+                kv = node.slice.elts if isinstance(node.slice, ast.Tuple) else []
+                if len(kv) == 2:
+                    k, v = self.parse_annotation(kv[0]), self.parse_annotation(kv[1])
+                    if k in (STR, INT) and v in (FLOAT, INT, STR):
+                        return DictType(k, v)
+                raise Unsupported(node, f"'{ast.unparse(node)}': dicts with str or int keys and float, int or str "
+                                        "values are supported")
             if bname in ("tuple", "Tuple"):
                 elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
                 ts = tuple(self.parse_annotation(e) for e in elts)
@@ -806,6 +814,7 @@ class ModuleTranslator:
                 self._register_class(node)
             elif isinstance(node, ast.AsyncFunctionDef):
                 self.report.module_notes.append(f"line {node.lineno}: async function `{node.name}` skipped")
+                self.skipped_globals[node.name] = "it is an async function (coroutines are not supported)"
             else:
                 self.report.module_notes.append(f"line {node.lineno}: module-level "
                                                 f"{type(node).__name__} statement skipped")
@@ -1470,7 +1479,8 @@ class ModuleTranslator:
         tr = _ConstTranslator(self)
         try:
             e = tr.expr(node.value)
-            if isinstance(e.type, ListType) and e.type.elem is not None:
+            if (isinstance(e.type, ListType) and e.type.elem is not None) or \
+                    (isinstance(e.type, DictType) and e.type.key is not None):
                 e = Expr(e.code[len(e.type.cpp()):] if e.code.startswith(e.type.cpp() + "{") else e.code,
                          P_ATOM, e.type)  # inline const std::vector<double> RATES = {0.01, 0.02};
             elif not isinstance(e.type, Scalar) and e.type != STR:
@@ -1516,7 +1526,7 @@ class ModuleTranslator:
                 e.missing_annotation = True
                 raise e
             t = given[arg.arg] if arg.annotation is None else self.parse_annotation(arg.annotation)
-            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType, ListType)) and t != STR:
+            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType, ListType, DictType)) and t != STR:
                 raise Unsupported(arg, f"parameter '{arg.arg}': {t} parameters are not supported; "
                                        "use float, int, bool, Vec, Mat or np.random.Generator")
             if d is not None and isinstance(t, RngType):
@@ -1751,7 +1761,7 @@ class ModuleTranslator:
         parts = []
         for p in sig.params:
             attr = "[[maybe_unused]] " if used_params is not None and p.name not in used_params else ""
-            if isinstance(p.type, ListType):
+            if isinstance(p.type, (ListType, DictType)):
                 ty = f"const {p.type.cpp()}&"  # a function never changes a list passed to it (check_lists)
             elif is_array(p.type) or p.type in (RNG, STR) or _optional_array(p.type) or isinstance(p.type, StructType):
                 ty = {"cref": f"const {p.type.cpp()}&", "ref": f"{p.type.cpp()}&"}.get(p.mode, p.type.cpp())
@@ -1980,8 +1990,8 @@ class ModuleTranslator:
         elif "qt::" in code.replace("qt::py::", ""):
             inc_lines.append('#include "qtrans_runtime.hpp"')
         if "std::vector<" in code or re.search(r"qt::py::(item|slice|sum|sum_left|min|max|sorted|sort|pop|insert|index|"
-                                                r"count|contains|concat|range_list|repeat|len|none)\b", code):
-            inc_lines.append('#include "qtrans_list.hpp"  // lists, and print(), str(), repr(), format() as Python writes them')
+                                                r"count|contains|concat|range_list|repeat|len|none|join|dict|KeyError)\b", code):
+            inc_lines.append('#include "qtrans_list.hpp"  // lists, dicts, and print(), str(), repr(), format() as Python writes them')
         elif "qt::py::" in code:
             inc_lines.append('#include "qtrans_print.hpp"  // print(), str(), repr(), format() as Python writes them')
         for d in self.project_deps:  # the modules of the project it imports from

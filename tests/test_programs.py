@@ -311,9 +311,9 @@ def test_print_and_format_read_naturally():
 
 
 def test_what_isnt_translated_says_why_at_its_line():
-    r = translate_source("import numpy as np\n\nvalues = {'a': 1.0}\nprint(values)\n", "m", "m.py")
+    r = translate_source("import numpy as np\n\nvalues = {1.0, 2.0}\nprint(values)\n", "m", "m.py")
     prog = next(f for f in r.report.functions if f.name == "(program)")
-    assert not prog.translated and prog.reason_line == 3 and "dicts" in prog.reason
+    assert not prog.translated and prog.reason_line == 3 and "sets" in prog.reason
     r = translate_source("print(twice(2))\n\n\ndef twice(x: int) -> int:\n    return 2 * x\n", "m", "m.py")
     prog = next(f for f in r.report.functions if f.name == "(program)")
     assert not prog.translated and "NameError" in prog.reason and prog.reason_line == 1

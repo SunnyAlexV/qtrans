@@ -30,6 +30,11 @@ from .translator import PROGRAM, VERSION
 # (pattern in the C++ of a row, kind, why). The pattern is what the reason is about, so a reason
 # is only ever shown next to C++ that contains it (tests/test_explain.py checks this).
 RULES = [
+    (r"qt::py::dict<", "dict",
+     "a Python dict: qt::py::dict keeps keys in the order they were first added (as Python does: "
+     "printing and loops follow it) and finds them by hash"),
+    (r"\.at\(", "dict",
+     "d[k] reads with .at(k): a missing key raises KeyError, as in Python (d[k] = v adds it)"),
     (r"qt::broadcast_into\(", "broadcasting",
      "updated in place with NumPy's broadcasting rules: the sizes can't be shown equal here, so a "
      "length-1 side stretches and any other mismatch raises ValueError, at run time"),

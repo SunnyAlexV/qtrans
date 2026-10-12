@@ -9,6 +9,7 @@
 
 ## Module constants
 
+- `FREQ_PER_YEAR: dict[str, int]`
 - `MIN_HISTORY_COVERAGE: float`
 - `TARGET_OBS_PER_ASSET: int`
 - `AUTO_HOLDINGS: int`
@@ -20,14 +21,13 @@
 - `DEFAULT_VOL_TARGET_PCT: float`
 - `DEFAULT_VOL_TARGET_FRAC_PCT: int`
 - `VIEW_TYPES: list[str]`
+- `ENGINE_NOTES: dict[str, str]`
 
 ## Module-level notes
 
-- line 5: `FREQ_PER_YEAR` not translated: dicts are not supported in stage 1
-- line 6: `FREQ_RULE` not translated: dicts are not supported in stage 1
-- line 28: `HORIZON_CFG` not translated: dicts are not supported in stage 1
-- line 51: `BENCHMARKS` not translated: dicts are not supported in stage 1
-- line 67: `MARKET_DEFAULTS` not translated: dicts are not supported in stage 1
-- line 97: `MARKETS` not translated: dicts are not supported in stage 1
-- line 252: `VIEW_ENGINES` not translated: dicts are not supported in stage 1
-- line 260: `ENGINE_NOTES` not translated: dicts are not supported in stage 1
+- line 6: `FREQ_RULE` not translated: a dict holding None among its values is not supported (yet)
+- line 28: `HORIZON_CFG` not translated: a dict whose values have several types (int, str): Python keeps each one's type (an int prints as 1, a float as 1.0), the C++ dict has one
+- line 51: `BENCHMARKS` not translated: dict values of type tuple[str, str] are not supported
+- line 67: `MARKET_DEFAULTS` not translated: dict values of type dict[str, float] are not supported
+- line 97: `MARKETS` not translated: a dict whose values have several types (bool, list[str], str): Python keeps each one's type (an int prints as 1, a float as 1.0), the C++ dict has one
+- line 252: `VIEW_ENGINES` not translated: a dict holding None among its values is not supported (yet)

@@ -153,7 +153,7 @@ def test_includes_only_what_is_used():
     ("def f(a: int, b: int) -> int:\n    return a ** b\n", "non-constant exponent"),
     ("def f(a: float, b: float) -> bool:\n    return a and b\n", "`and`/`or` on non-bool"),
     ("def f(n: int) -> int:\n    n = n / 2\n    return n\n", "declared int but gets a float"),
-    ("def f(x: float) -> float:\n    return {'a': x}['a']\n", "not supported"),
+    ("def f(x: float) -> float:\n    return len({x, 1.0}) * x\n", "not supported"),
     ("def f(x: float) -> float:\n    try:\n        return 1.0 / x\n    except ZeroDivisionError:\n        return 0.0\n",
      "catching ZeroDivisionError is not supported: x / 0.0 raises it in Python but gives inf in C++"),
     ("def f(x: float) -> float:\n    raise ValueError('bad', x)\n", "several arguments"),
@@ -166,8 +166,25 @@ def test_rejections(src, expected):
 
 
 def test_rejection_propagates_to_callers():
-    r = translate_source("def bad(x: float) -> float:\n    return {'a': x}['a']\n\n"
+    r = translate_source("def bad(x: float) -> float:\n    return len({x, 1.0}) * x\n\n"
                          "def good(x: float) -> float:\n    return bad(x) + 1\n", "m")
     reasons = {f.name: f.reason for f in r.report.rejected}
     assert "calls bad()" in reasons["good"]
     assert "good" not in r.header and "bad" not in r.header.split("namespace")[1]
+
+
+@pytest.mark.parametrize("src, line, words", [
+    ("print(2 ** 100)\n", 1, "this int is 1267650600228229401496703205376"),
+    ("x = 9223372036854775807 + 1\nprint(x)\n", 1, "no size limit"),
+    ("def f() -> int:\n    return 3 ** 50 * 2\n", 2, "this int is"),
+    ("async def f() -> float:\n    return 1.0\n\nprint(f())\n", 4, "async function"),
+])
+def test_ints_surely_beyond_64_bits_and_async_calls_are_refused(src, line, words):
+    r = translate_source(src, "m", "m.py")
+    bad = [f for f in r.report.functions if not f.translated]
+    assert bad and bad[0].reason_line == line and words in bad[0].reason, r.report.to_text()
+
+
+def test_ints_that_fit_stay_plain():
+    h = translate_source("def f() -> int:\n    return 2 ** 62 + (2 ** 62 - 1)\n", "m").header
+    assert "return " in h and "Unsupported" not in h

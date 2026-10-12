@@ -17,7 +17,7 @@ import sys
 
 from .core import P_ATOM, P_UNARY, Expr, wrap
 from .errors import Unsupported
-from .types import BOOL, FLOAT, INT, STR, VOID, ArrayType, ListType, Scalar, is_array
+from .types import BOOL, FLOAT, INT, STR, VOID, ArrayType, DictType, ListType, Scalar, is_array
 
 ELEMS = (FLOAT, INT, STR)
 MUTATORS = {"append", "extend", "insert", "pop", "sort", "reverse", "clear", "remove"}
@@ -73,7 +73,7 @@ class ListOps:
         if i.type not in (INT, BOOL):
             raise Unsupported(sl, f"list indices must be ints (Python raises TypeError for a {i.type})")
         if self.index_in_range(node.value, sl):  # for i in range(len(xs)): xs[i] -- no check needed
-            return Expr(f"{wrap(base, P_ATOM)}[{i.code}]", P_ATOM, base.type.elem)
+            return Expr(f"{wrap(base, P_ATOM)}[static_cast<std::size_t>({i.code})]", P_ATOM, base.type.elem)
         return Expr(f"qt::py::item({base.code}, {self.as_type(i, INT).code})", P_ATOM, base.type.elem)
 
     # --- for k in range(len(xs)): xs[k] is always in range ------------------------------------
@@ -304,7 +304,7 @@ class ListOps:
         if getattr(g, "qt_rewritten", False):
             self.note("indexloop", "enumerate() / zip() become an index loop: Python's iterator reads element k by position, so "
                   "xs[k] is the same value; zip stops at the shorter sequence (the min of the lengths)")
-        if mode != "list":
+        if mode in ("any", "all"):
             self.note("anyall", f"{mode}() of a generator stops at the first element that decides, in C++ "
                                 "too: a loop that returns there, so later elements are never computed")
         is_range = isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" \
@@ -325,6 +325,9 @@ class ListOps:
             vt = INT
         else:
             src = self.expr(it)
+            if isinstance(src.type, DictType):  # over a dict: its keys
+                self._need_dict(src, it, "a comprehension")
+                src = Expr(f"{src.code}.keys()", P_ATOM, ListType(src.type.key))
             if list_of(src.type):
                 self._need_list(src, it, "a comprehension")
                 vt = src.type.elem
@@ -337,9 +340,13 @@ class ListOps:
         outer = self.__dict__.setdefault("comp_vars", {})
         saved = outer.get(var)
         outer[var] = (vt, ident)
-        safe_saved = self._safe_index_push(var, self.range_over_len(it, [node.elt] + list(g.ifs)) if is_range else set())
+        parts = [node.key, node.value] if mode == "dict" else [node.elt]
+        safe_saved = self._safe_index_push(var, self.range_over_len(it, parts + list(g.ifs)) if is_range else set())
         try:
-            e = self.expr(node.elt)
+            if mode == "dict":
+                ke, e = self.expr(node.key), self.expr(node.value)
+            else:
+                e = self.expr(node.elt)
             conds = [self.truth(self.expr(c), c) for c in g.ifs]
         finally:
             self._safe_index_pop(var, safe_saved)
@@ -347,7 +354,13 @@ class ListOps:
                 outer.pop(var, None)
             else:
                 outer[var] = saved
-        if mode != "list":
+        if mode == "dict":
+            kt = self._one_type(node.key, [ke], "keys", (STR, INT))
+            vt_ = self._one_type(node.value, [e], "values", ELEMS)
+            if self._list_maybe_int(node.value, e.type):
+                raise Unsupported(node.value, "this value may be a Python int for some keys and a float for others",
+                                  "make it a float on every path (0.0 rather than 0)")
+        elif mode != "list":
             test = self.truth(e, node.elt)
         elif e.type not in ELEMS:
             raise Unsupported(node.elt, f"a list of {e.type} values is not supported", "lists of float, int or str are")
@@ -364,12 +377,22 @@ class ListOps:
         else:
             decl = "const std::string&" if vt == STR else vt.cpp()
             loop = f"for ({decl} {ident} : {src.code})"
-        if mode != "list":
+        if mode in ("any", "all"):
             hit = wrap(test, 13) if mode == "any" else "!" + wrap(test, P_UNARY)
             if not conds and mode == "any":
                 hit = test.code
             body = f"if ({' && '.join([wrap(c, 13) for c in conds] + [hit])}) return {'true' if mode == 'any' else 'false'};"
             return Expr(f"[&] {{ {loop} {body} return {'false' if mode == 'any' else 'true'}; }}()", P_ATOM, BOOL)
+        if mode == "dict":
+            # Python computes the key, then the value (C++'s `out[k] = v` computes v first)
+            k_code = self._key(ke, kt, node.key).code
+            v_code = self._val(e, vt_).code
+            body = f"{out}[{k_code}] = {v_code};" if ke.simple or e.simple else \
+                f"{{ {kt.cpp()} key = {k_code}; {out}[key] = {v_code}; }}"
+            if conds:
+                body = f"if ({' && '.join(wrap(c, 13) for c in conds)}) {body}"
+            t = DictType(kt, vt_)
+            return Expr(f"[&] {{ {t.cpp()} {out}; {loop} {body} return {out}; }}()", P_ATOM, t)
         body = f"{out}.push_back({e.code});"
         if conds:
             body = f"if ({' && '.join(wrap(c, 13) for c in conds)}) {body}"

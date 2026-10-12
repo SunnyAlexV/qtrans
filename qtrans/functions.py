@@ -25,7 +25,7 @@ from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown
 from .structs import THIS
 from .classes import member_safe_name
 from .types import VEC as VEC_T
-from .types import RNG, STR, ListType
+from .types import RNG, STR, DictType, ListType
 from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
@@ -558,8 +558,11 @@ class FunctionTranslator(ExprTranslator):
         given a list changes the caller's, a loop sees appends made while it runs. The C++ copies
         instead, so wherever that sharing would show it is refused."""
         types = {**self.local_types, **self.params}
-        lists = {n for n, t in types.items() if isinstance(t, ListType)}
-        globals_ = {n for n, c in self.mod.constants.items() if isinstance(c.type, ListType)}
+        lists = {n for n, t in types.items() if isinstance(t, (ListType, DictType))}  # dicts are shared alike
+        globals_ = {n for n, c in self.mod.constants.items() if isinstance(c.type, (ListType, DictType))}
+        kind = {n: "dict" if isinstance(t, DictType) else "list" for n, t in types.items()}
+        kind.update({n: "dict" if isinstance(c.type, DictType) else "list" for n, c in self.mod.constants.items()
+                     if n not in kind})
         if not lists and not globals_:
             return
         mutated = {}  # name -> the first statement that changes it in place
@@ -570,7 +573,8 @@ class FunctionTranslator(ExprTranslator):
             for e in self._own_exprs(st):  # the statement's own expressions, not its nested blocks'
                 for n in ast.walk(e) if e is not None else ():
                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) \
-                            and n.func.attr in ("append", "extend", "insert", "pop", "sort", "reverse", "clear", "remove"):
+                            and n.func.attr in ("append", "extend", "insert", "pop", "sort", "reverse", "clear", "remove",
+                                                "setdefault", "update", "popitem"):
                         mark(n.func.value.id, st)
             if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
                 targets = st.targets if isinstance(st, (ast.Assign, ast.Delete)) else [st.target]
@@ -581,27 +585,31 @@ class FunctionTranslator(ExprTranslator):
                         mark(t.id, st)  # xs += ys extends xs in place
         for name, st in mutated.items():
             if name in globals_ and name not in lists:
-                raise Unsupported(st, f"this changes the module's list '{name}', which the C++ holds as a constant",
-                                  "copy it first: xs = list(" + name + ")")
+                k = kind.get(name, "list")
+                raise Unsupported(st, f"this changes the module's {k} '{name}', which the C++ holds as a constant",
+                                  f"copy it first: x = {k}({name})")
             if name in self.params and name in lists:
-                raise Unsupported(st, f"this changes the list '{name}' passed in, which in Python changes the caller's "
-                                      "list too; the C++ function gets its own copy",
-                                  f"work on a copy: {name} = list({name}), and return it")
+                k = kind.get(name, "list")
+                raise Unsupported(st, f"this changes the {k} '{name}' passed in, which in Python changes the caller's "
+                                      f"{k} too; the C++ function gets its own copy",
+                                  f"work on a copy: {name}2 = {k}({name}), and return it")
         for st in (x for x in ast.walk(self.fdef) if isinstance(x, (ast.Assign, ast.AnnAssign))):
             value = st.value
             targets = st.targets if isinstance(st, ast.Assign) else [st.target]
             for t in targets:
                 if isinstance(t, ast.Name) and t.id in lists and isinstance(value, ast.Name) and value.id != t.id \
                         and (value.id in lists or value.id in globals_) and (t.id in mutated or value.id in mutated):
-                    raise Unsupported(st, f"'{t.id}' and '{value.id}' are one list in Python (assignment shares it) and "
+                    k = kind.get(t.id, "list")
+                    raise Unsupported(st, f"'{t.id}' and '{value.id}' are one {k} in Python (assignment shares it) and "
                                           f"'{t.id if t.id in mutated else value.id}' is changed, which would show "
-                                          "through the other name; the C++ copies", f"{t.id} = list({value.id}) for a copy")
+                                          f"through the other name; the C++ copies", f"{t.id} = {k}({value.id}) for a copy")
         for st in (x for x in ast.walk(self.fdef) if isinstance(x, ast.Return)):
             if isinstance(st.value, ast.Name) and st.value.id in self.params and st.value.id in lists:
-                raise Unsupported(st, f"returning the list '{st.value.id}' passed in: Python hands back the caller's own "
-                                      "list (the same object), the C++ a copy", f"return list({st.value.id})")
+                k = kind.get(st.value.id, "list")
+                raise Unsupported(st, f"returning the {k} '{st.value.id}' passed in: Python hands back the caller's own "
+                                      f"{k} (the same object), the C++ a copy", f"return {k}({st.value.id})")
         for loop in (x for x in ast.walk(self.fdef) if isinstance(x, ast.For)):
-            if isinstance(loop.iter, ast.Name) and loop.iter.id in mutated:
+            if isinstance(loop.iter, ast.Name) and loop.iter.id in mutated and kind.get(loop.iter.id) != "dict":
                 inside = {id(x) for b in loop.body for x in ast.walk(b)}
                 if id(mutated[loop.iter.id]) in inside:
                     raise Unsupported(loop, f"the loop changes '{loop.iter.id}' while going through it (Python's loop "
@@ -689,11 +697,15 @@ class FunctionTranslator(ExprTranslator):
 
     def scan(self, stmts):
         allowed = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.If, ast.While,
-                   ast.For, ast.Break, ast.Continue, ast.Pass, ast.Expr, ast.Raise, ast.Assert, ast.Try)
+                   ast.For, ast.Break, ast.Continue, ast.Pass, ast.Expr, ast.Raise, ast.Assert, ast.Try, ast.Delete)
         for s in stmts:
             if not isinstance(s, allowed):
                 what, hint = _STATEMENT_MESSAGES.get(type(s).__name__, (type(s).__name__, None))
                 raise Unsupported(s, f"{what} are not supported in stage 1", hint)
+            if isinstance(s, ast.Delete) and not all(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                                                     and not isinstance(t.slice, ast.Slice) for t in s.targets):
+                raise Unsupported(s, "del is supported for a dict's key: del d[k]",
+                                  "a name can't be deleted in C++; for a list, use xs.pop(i)")
             if isinstance(s, ast.For):
                 if not isinstance(s.target, ast.Name):
                     why = getattr(s, "qt_why", None)
@@ -865,6 +877,10 @@ class FunctionTranslator(ExprTranslator):
             if t.elem is None:
                 raise _Unknown(name) if self.inferring else Unsupported(it, "the list's element type is not known")
             return t.elem
+        if isinstance(t, DictType):  # a loop over a dict goes through its keys
+            if t.key is None:
+                raise _Unknown(name) if self.inferring else Unsupported(it, "the dict's key type is not known")
+            return t.key
         return FLOAT
 
     @staticmethod
@@ -1021,6 +1037,35 @@ class FunctionTranslator(ExprTranslator):
                                   "make them one type: 1.0 rather than 1")
         return changed
 
+    def _dict_entry_types(self) -> bool:
+        """`d = {}`, then d["a"] = 1.5 (or d.setdefault("a", 1.5)): the key and value types come
+        from what is stored."""
+        changed = False
+        for st in ast.walk(self.fdef):
+            pairs = []
+            if isinstance(st, ast.Assign):
+                pairs = [(t.value.id, t.slice, st.value) for t in st.targets
+                         if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)]
+            elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Attribute) \
+                    and st.value.func.attr == "setdefault" and isinstance(st.value.func.value, ast.Name) \
+                    and len(st.value.args) == 2:
+                pairs = [(st.value.func.value.id, st.value.args[0], st.value.args[1])]
+            for name, key_node, val_node in pairs:
+                t = self.local_types.get(name)
+                if not isinstance(t, DictType) or t.key is not None or name in self.annotated:
+                    continue
+                self.current = st
+                try:
+                    kt, vt = self.expr(key_node).type, self.expr(val_node).type
+                except (_Unknown, Unsupported):
+                    continue
+                if kt not in (STR, INT) or vt not in (FLOAT, INT, STR):
+                    raise Unsupported(st, f"a dict of {kt} keys and {vt} values is not supported",
+                                      "dicts with str or int keys and float, int or str values are")
+                self.local_types[name] = DictType(kt, vt)
+                changed = True
+        return changed
+
     def event_type(self, ev):
         self.current = ev.stmt
         e = self.expr_raw(ev.payload) if ev.kind == "expr" else self.expr(ev.payload)
@@ -1061,6 +1106,7 @@ class FunctionTranslator(ExprTranslator):
                         self.local_types[ev.name] = new
                         changed = True
                 changed = self._list_element_types() or changed
+                changed = self._dict_entry_types() or changed
                 if not changed:
                     break
         finally:
@@ -1260,6 +1306,8 @@ class FunctionTranslator(ExprTranslator):
             elif isinstance(bt, ListType) and f.attr in ("append", "extend", "insert", "pop", "sort", "reverse",
                                                           "clear", "remove"):
                 roots.add(subscript_root(f.value))  # xs.pop() changes xs
+            elif isinstance(bt, DictType) and f.attr in ("pop", "popitem", "setdefault", "update", "clear"):
+                roots.add(subscript_root(f.value))  # d.pop(k) changes d
             elif isinstance(bt, StructType) and bt.name in self.mod.classes:
                 m = self.mod.classes[bt.name].methods.get(f.attr)
                 if m is not None and m.key in self.mod.sigs:
@@ -1796,7 +1844,7 @@ class FunctionTranslator(ExprTranslator):
         if (is_array(vt) or (isinstance(vt, OptionalType) and is_array(vt.inner))) and \
                 self._needs_eval(value_node, name, whole_array=True):
             code = f"({code}).eval()"  # Eigen is lazy: read all of the old value before overwriting it
-        if isinstance(vt, ListType) and code.startswith(vt.cpp() + "{"):
+        if isinstance(vt, (ListType, DictType)) and code.startswith(vt.cpp() + "{"):
             code = code[len(vt.cpp()):]  # std::vector<double> xs = {1.0, 2.0};
         if name in inline_set:
             self.emit(f"{self._unused(name)}{vt.cpp()} {self.ident(name)} = {code};")
@@ -1876,6 +1924,8 @@ class FunctionTranslator(ExprTranslator):
         lt = self.var_type(root) if root and (root in self.params or root in self.local_types) else None
         if isinstance(lt, ListType):
             return self.store_list_item(t, value_node, s, sym, lt)
+        if isinstance(lt, DictType):
+            return self.store_dict_item(t, value_node, s, sym, lt)
         if isinstance(self.var_type(root) if root else None, OptionalType):
             raise Unsupported(s, f"'{root}' may be None, and storing into it is not supported",
                               f"after the None check, work on a new name: {root}_ = {root}.copy()")
@@ -1915,6 +1965,45 @@ class FunctionTranslator(ExprTranslator):
                 self.emit(f"qt::store({code}, {rhs}{op});")
                 return
         self.emit(f"{code} {sym} {rhs};")
+
+    def store_dict_item(self, t, value_node, s, sym, dt):
+        """d[k] = v (a new key goes last, an existing one keeps its place), d[k] += v (KeyError if absent)."""
+        if dt.key is None:
+            raise _Unknown(t.value.id) if self.inferring else Unsupported(s, "the dict's types are not known")
+        d = self.expr(t.value)
+        k = self._key(self.expr(t.slice), dt.key, t.slice)
+        v = self.expr(value_node)
+        if v.type != dt.val and not (sym != "=" and dt.val == FLOAT and v.type in (INT, BOOL)):
+            raise Unsupported(s, f"storing a {v.type} in a dict of {dt.val}: Python keeps each value's type "
+                                 "(an int prints as 1, a float as 1.0)")
+        if sym == "/=" and dt.val == INT:
+            raise Unsupported(s, "d[k] /= ... makes a float in a dict of ints: Python keeps each value's type")
+        if dt.val == FLOAT and self.maybe_int(value_node) and sym == "=":
+            raise Unsupported(s, "this value may be a Python int here, in a dict of floats",
+                              "make it a float on every path (0.0 rather than 0)")
+        if sym == "=":
+            code = self.as_double(v).code if dt.val == FLOAT else self.as_type(v, INT).code if dt.val == INT else v.code
+            self.emit(f"{d.code}[{k.code}] = {code};")
+            return
+        item = f"{d.code}.at({k.code})"
+        if sym in ("+=", "-=", "*=") and dt.val == INT:
+            op = {"+=": "qt::iadd", "-=": "qt::isub", "*=": "qt::imul"}[sym]
+            self.emit(f"{item} = {op}({item}, {self.as_type(v, INT).code});")
+            return
+        if dt.val == STR and sym != "+=":
+            raise Unsupported(s, f"{sym} on a str value is not supported")
+        code = self.as_double(v).code if dt.val == FLOAT else v.code
+        self.emit(f"{item} {sym} {code};")
+
+    def s_Delete(self, s):
+        for t in s.targets:
+            dt = self.var_type(t.value.id) if isinstance(t.value, ast.Name) else None
+            if not isinstance(dt, DictType):
+                raise Unsupported(s, "del is supported for a dict's key: del d[k]", "for a list, use xs.pop(i)")
+            if dt.key is None:
+                raise Unsupported(s, "the dict's types are not known")
+            k = self._key(self.expr(t.slice), dt.key, t.slice)
+            self.emit(f"{self.expr(t.value).code}.erase({k.code});")
 
     def store_list_item(self, t, value_node, s, sym, lt):
         """xs[i] = x (and xs[i] += x): the element keeps the list's one type, as Python's would."""
@@ -2141,6 +2230,14 @@ class FunctionTranslator(ExprTranslator):
             return
         if not self._is_range(it):
             arr = self.expr(it)
+            owner = it.func.value if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) \
+                and it.func.attr in ("keys", "values") and not it.args else it
+            if isinstance(owner, ast.Name) and isinstance(self.var_type(owner.id), DictType):
+                self._dict_loop_check(s, owner.id)
+            elif getattr(s, "qt_items", None):
+                raise Unsupported(s, "`.items()` is supported on a dict")
+            if isinstance(arr.type, DictType):  # for k in d: its keys, in order
+                arr = Expr(f"{arr.code}.keys()", P_ATOM, ListType(arr.type.key))
             if isinstance(arr.type, ListType) and arr.type.elem is not None:
                 decl = "const std::string&" if arr.type.elem == STR else arr.type.elem.cpp()
                 self.emit(f"for ({decl} {self.ident(s.target.id)} : {arr.code}) {{")
@@ -2209,6 +2306,31 @@ class FunctionTranslator(ExprTranslator):
             if risky:
                 self.loop_ends.pop()
         self.emit("}")
+
+    def _dict_loop_check(self, loop, name):
+        """Python raises RuntimeError when a dict changes size while a loop goes through it (and
+        iterates the old dict if the name is rebound); the C++ loop goes through a copy of the
+        keys. So a loop that may add or delete a key of the dict it goes through is refused."""
+        key = loop.target.id if isinstance(loop.target, ast.Name) else None
+        why = None
+        for n in (x for b in loop.body for x in ast.walk(b)):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) \
+                    and n.func.value.id == name and n.func.attr in ("pop", "popitem", "clear", "setdefault", "update"):
+                why = f"d.{n.func.attr}()"
+            elif isinstance(n, ast.Delete) and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                                                   and t.value.id == name for t in n.targets):
+                why = "del"
+            elif isinstance(n, ast.Assign) and any(
+                    isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == name
+                    and not (key and isinstance(t.slice, ast.Name) and t.slice.id == key
+                             and not getattr(loop.iter, "attr", None)) for t in n.targets):
+                why = "storing a key other than the loop's own"
+            elif isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store):
+                why = "assigning the name"
+            if why:
+                raise Unsupported(loop, f"the loop may change the size of '{name}' while going through it ({why}): "
+                                        "Python raises RuntimeError (dictionary changed size during iteration)",
+                                  f"loop over a copy of the keys: for k in list({name})")
 
     def s_Return(self, s):
         ret = self.sig.ret

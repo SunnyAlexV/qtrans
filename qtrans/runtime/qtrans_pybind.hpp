@@ -32,6 +32,41 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "qtrans_list.hpp"
+
+// qt::py::dict <-> a Python dict, key order kept both ways
+namespace pybind11 {
+namespace detail {
+template <class K, class V>
+struct type_caster<qt::py::dict<K, V>> {
+    using Dict = qt::py::dict<K, V>;  // (a comma inside the macro's argument would split it)
+    PYBIND11_TYPE_CASTER(Dict, const_name("dict[") + make_caster<K>::name + const_name(", ")
+                                   + make_caster<V>::name + const_name("]"));
+    bool load(handle src, bool convert) {
+        if (!isinstance<pybind11::dict>(src)) return false;
+        value.clear();
+        for (auto item : reinterpret_borrow<pybind11::dict>(src)) {
+            make_caster<K> kc;
+            make_caster<V> vc;
+            if (!kc.load(item.first, convert) || !vc.load(item.second, convert)) return false;
+            value[cast_op<K&&>(std::move(kc))] = cast_op<V&&>(std::move(vc));
+        }
+        return true;
+    }
+    static handle cast(const qt::py::dict<K, V>& src, return_value_policy policy, handle parent) {
+        pybind11::dict out;
+        for (const auto& [k, v] : src) {
+            auto ko = reinterpret_steal<object>(make_caster<K>::cast(k, policy, parent));
+            auto vo = reinterpret_steal<object>(make_caster<V>::cast(v, policy, parent));
+            if (!ko || !vo) return handle();
+            out[ko] = vo;
+        }
+        return out.release();
+    }
+};
+}  // namespace detail
+}  // namespace pybind11
+
 #if defined(__GNUG__) && !defined(_WIN32)
 #define QTB_HIDDEN __attribute__((visibility("hidden")))  // as pybind11's own types, which Leaf holds
 #else
