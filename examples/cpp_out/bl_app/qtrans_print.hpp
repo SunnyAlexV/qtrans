@@ -13,6 +13,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <algorithm>
 #include <cstdlib>
@@ -851,7 +852,118 @@ double math1(F f, double x, const msg::DomainText* text, bool can_overflow, bool
     }
     return r;
 }
-// gamma and lgamma are CPython's own: a domain error at 0, -1, -2, ... (and -inf for gamma)
+// gamma and lgamma are CPython's own (Modules/mathmodule.c: Lanczos' approximation, with the
+// same coefficients and the same order of operations), not the C library's, so the values are
+// Python's on every platform: the C libraries differ (Windows' lgamma(5e-324) is inf, Python's
+// 744.44). A domain error at 0, -1, -2, ... (and -inf for gamma)
+namespace cpython_gamma {
+inline constexpr double pi = 3.141592653589793238462643383279502884197;
+inline constexpr double lanczos_g = 6.024680040776729583740234375;
+inline constexpr double lanczos_g_minus_half = 5.524680040776729583740234375;
+inline constexpr double lanczos_num[13] = {
+    23531376880.410759688572007674451636754734846804940,
+    42919803642.649098768957899047001988850926355848959,
+    35711959237.355668049440185451547166705960488635843,
+    17921034426.037209699919755754458931112671403265390,
+    6039542586.3520280050642916443072979210699388420708,
+    1439720407.3117216736632230727949123939715485786772,
+    248874557.86205415651146038641322942321632125127801,
+    31426415.585400194380614231628318205362874684987640,
+    2876370.6289353724412254090516208496135991145378768,
+    186056.26539522349504029498971604569928220784236328,
+    8071.6720023658162106380029022722506138218516325024,
+    210.82427775157934587250973392071336271166969580291,
+    2.5066282746310002701649081771338373386264310793408};
+inline constexpr double lanczos_den[13] = {0.0, 39916800.0, 120543840.0, 150917976.0, 105258076.0, 45995730.0,
+                                           13339535.0, 2637558.0, 357423.0, 32670.0, 1925.0, 66.0, 1.0};
+inline constexpr double factorials[23] = {
+    1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0, 3628800.0, 39916800.0, 479001600.0,
+    6227020800.0, 87178291200.0, 1307674368000.0, 20922789888000.0, 355687428096000.0, 6402373705728000.0,
+    121645100408832000.0, 2432902008176640000.0, 51090942171709440000.0, 1124000727777607680000.0};
+
+inline double lanczos_sum(double x) {
+    double num = 0.0, den = 0.0;
+    if (x < 5.0) {
+        for (int i = 13; --i >= 0;) {
+            num = num * x + lanczos_num[i];
+            den = den * x + lanczos_den[i];
+        }
+    } else {
+        for (int i = 0; i < 13; i++) {
+            num = num / x + lanczos_num[i];
+            den = den / x + lanczos_den[i];
+        }
+    }
+    return num / den;
+}
+
+inline double sinpi(double x) {  // sin(pi * x), exact at the integers and half-integers
+    const double y = std::fmod(std::fabs(x), 2.0);
+    const int n = static_cast<int>(std::round(2.0 * y));
+    double r = 0.0;
+    switch (n) {
+        case 0: r = std::sin(pi * y); break;
+        case 1: r = std::cos(pi * (y - 0.5)); break;
+        case 2: r = std::sin(pi * (1.0 - y)); break;
+        case 3: r = -std::cos(pi * (y - 1.5)); break;
+        default: r = std::sin(pi * (y - 2.0)); break;
+    }
+    return std::copysign(1.0, x) * r;
+}
+
+inline double tgamma(double x) {  // (the domain errors are checked before)
+    if (!std::isfinite(x)) return x;
+    if (x == std::floor(x) && x <= 23.0) return factorials[static_cast<int>(x) - 1];
+    const double absx = std::fabs(x);
+    if (absx < 1e-20) return 1.0 / x;
+    if (absx > 200.0) return x < 0.0 ? 0.0 / sinpi(x) : std::numeric_limits<double>::infinity();
+    const double y = absx + lanczos_g_minus_half;
+    double z;
+    if (absx > lanczos_g_minus_half) {
+        const double q = y - absx;
+        z = q - lanczos_g_minus_half;
+    } else {
+        const double q = y - lanczos_g_minus_half;
+        z = q - absx;
+    }
+    z = z * lanczos_g / y;
+    double r;
+    if (x < 0.0) {
+        r = -pi / sinpi(absx) / absx * std::exp(y) / lanczos_sum(absx);
+        r -= z * r;
+        if (absx < 140.0) {
+            r /= std::pow(y, absx - 0.5);
+        } else {
+            const double sqrtpow = std::pow(y, absx / 2.0 - 0.25);
+            r /= sqrtpow;
+            r /= sqrtpow;
+        }
+    } else {
+        r = lanczos_sum(absx) / std::exp(y);
+        r += z * r;
+        if (absx < 140.0) {
+            r *= std::pow(y, absx - 0.5);
+        } else {
+            const double sqrtpow = std::pow(y, absx / 2.0 - 0.25);
+            r *= sqrtpow;
+            r *= sqrtpow;
+        }
+    }
+    return r;
+}
+
+inline double lgamma(double x) {  // (the domain errors are checked before)
+    if (!std::isfinite(x)) return std::isnan(x) ? x : std::numeric_limits<double>::infinity();
+    if (x == std::floor(x) && x <= 2.0) return 0.0;  // lgamma(1) = lgamma(2) = 0
+    const double absx = std::fabs(x);
+    if (absx < 1e-20) return -std::log(absx);
+    double r = std::log(lanczos_sum(absx)) - lanczos_g;
+    r += (absx - 0.5) * (std::log(absx + lanczos_g - 0.5) - 1);
+    if (x < 0.0) r = std::log(pi) - std::log(std::fabs(sinpi(absx))) - std::log(absx) - r;  // reflection
+    return r;
+}
+}  // namespace cpython_gamma
+
 template <class F>
 double gamma_like(F f, double x, const msg::DomainText* text, bool is_gamma, bool from_int) {
     if ((x <= 0 && std::isfinite(x) && x == std::floor(x)) || (is_gamma && x == -qt::inf))
@@ -894,13 +1006,13 @@ QT_PY_MATH(cbrt, std::cbrt, false)
 QT_PY_MATH(exp2, std::exp2, true)
 QT_PY_MATH(fabs, std::fabs, false)
 #undef QT_PY_MATH
-inline double math_gamma(double x) { return pyerr::gamma_like([](double v) { return std::tgamma(v); }, x, msg::gamma_float, true, false); }
+inline double math_gamma(double x) { return pyerr::gamma_like([](double v) { return pyerr::cpython_gamma::tgamma(v); }, x, msg::gamma_float, true, false); }
 inline double math_gamma(long long x) {
-    return pyerr::gamma_like([](double v) { return std::tgamma(v); }, static_cast<double>(x), msg::gamma_int, true, true);
+    return pyerr::gamma_like([](double v) { return pyerr::cpython_gamma::tgamma(v); }, static_cast<double>(x), msg::gamma_int, true, true);
 }
-inline double math_lgamma(double x) { return pyerr::gamma_like([](double v) { return std::lgamma(v); }, x, msg::lgamma_float, false, false); }
+inline double math_lgamma(double x) { return pyerr::gamma_like([](double v) { return pyerr::cpython_gamma::lgamma(v); }, x, msg::lgamma_float, false, false); }
 inline double math_lgamma(long long x) {
-    return pyerr::gamma_like([](double v) { return std::lgamma(v); }, static_cast<double>(x), msg::lgamma_int, false, true);
+    return pyerr::gamma_like([](double v) { return pyerr::cpython_gamma::lgamma(v); }, static_cast<double>(x), msg::lgamma_int, false, true);
 }
 
 // math.pow(x, y): CPython's rules (errors only for finite x and y)
