@@ -52,6 +52,13 @@ def _package(name, minimum=None, needed_for="", required=False):
 
 
 def _eigen_version(folder: Path) -> str:
+    try:  # Eigen 5: Eigen/Version holds the version ("5.0.1"); Eigen 3: three macros in Macros.h
+        m = re.search(r'#define EIGEN_VERSION_STRING\s+"([^"]+)"',
+                      (folder / "Eigen" / "Version").read_text(encoding="utf-8", errors="replace"))
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
     macros = folder / "Eigen" / "src" / "Core" / "util" / "Macros.h"
     try:
         text = macros.read_text(encoding="utf-8", errors="replace")

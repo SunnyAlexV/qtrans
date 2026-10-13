@@ -190,7 +190,8 @@ def main(argv=None) -> int:
                 print(f"wrote {out / (m + '.hpp')}")
             if r.program is not None:
                 print(f"wrote {out / (m + '.cpp')}: the program, with main(); build it with")
-                print(f"  g++ -std=c++17 -O2 -I {out}{' -I <Eigen>' if r.uses_arrays else ''} {out / (m + '.cpp')} -o {m}")
+                from .verify import build_hint
+                print("  " + build_hint(out / (m + ".cpp"), m, out, r.uses_arrays))
         return 0 if not any(project.modules[m].report.rejected for m in project.requested) else 1
     report = verify_project(inputs, n_random=args.cases, seed=args.seed, rtol=args.rtol, atol=args.atol,
                             bench=args.bench, compiler=args.cxx, build_dir=args.build, all_modules=args.all,

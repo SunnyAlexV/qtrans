@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.3
+
+From setting qtrans up on a fresh Windows PC (a new user's steps, with the console check of
+0.11.1 passing there: `straße οδος CAFÉ` from Python and from the C++, in code page 437):
+
+- `qtrans translate` prints the command that builds a program as verify built it: the compiler
+  qtrans found, by its full path when it isn't on the PATH (it printed a bare `g++`, which cmd
+  can't run then), `-ffp-contract=off` (without it a compiler may fuse a * b + c into one
+  rounding, and the results stop being Python's), `-static` with MinGW (the .exe then runs
+  without MinGW's DLLs on the PATH), and the Eigen folder it found; for MSVC, the `cl` command.
+- With no compiler, `qtrans doctor` says which winlibs.com download to take (newest GCC, UCRT,
+  Win64, Zip archive) and that it can be unzipped anywhere: C:\, the Desktop or Downloads,
+  inside the extra folder Windows' Extract All makes; qtrans finds it in all of these.
+- Eigen 5 (what `conda install -c conda-forge eigen` now installs): `qtrans doctor` shows its
+  version (it showed `?`), the whole test suite passes with Eigen 5.0.1 as with 3.4.0, and
+  `run_examples.py --check` reproduces all 87 rows with it. CI's latest-packages job now uses it.
+
 ## 0.11.2
 
 - A Python file saved with a UTF-8 byte-order mark (Windows Notepad, and Windows PowerShell 5's

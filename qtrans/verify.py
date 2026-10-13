@@ -197,11 +197,54 @@ def find_compiler(explicit: str | None = None) -> Compiler:
             # compiler's own DLLs (libstdc++, libgcc) next to it or on the PATH to start
             os.environ["PATH"] = str(exe.parent) + os.pathsep + os.environ.get("PATH", "")
             return Compiler(str(exe), "gnu")
-    raise RuntimeError(
-        "No C++ compiler found. On Windows the simplest is GCC from winlibs.com: download the "
-        "UCRT 64-bit zip, unzip it so that C:\\mingw64\\bin\\g++.exe exists, and qtrans finds it "
-        "(no PATH changes needed); or MSYS2's mingw-w64-ucrt-x86_64-gcc. On Linux: apt install g++; "
-        "on macOS: xcode-select --install. Or set the CXX environment variable to the compiler's path.")
+    raise RuntimeError(NO_COMPILER)
+
+
+NO_COMPILER = (
+    "No C++ compiler found. On Windows the simplest is GCC from winlibs.com: under Release versions, "
+    "UCRT runtime, take the newest GCC (with POSIX threads) and, on its Win64 line, the 'Zip archive' "
+    "(not 7-Zip, not Win32). Extract it anywhere: C:\\, your Desktop or Downloads (Windows' Extract All "
+    "adds a folder named after the zip; that's fine), and qtrans finds mingw64\\bin\\g++.exe there, "
+    "no PATH changes needed. Or MSYS2's mingw-w64-ucrt-x86_64-gcc, or Visual Studio Build Tools. "
+    "On Linux: apt install g++; on macOS: xcode-select --install. Or set the CXX environment variable "
+    "to the compiler's path.")
+
+
+def build_hint(cpp, exe_name: str, include_dir, arrays: bool = False) -> str:
+    """The command that builds a translated program as verify built it: the compiler qtrans would
+    use (its full path when it isn't on the PATH), C++17, and no fused multiply-add (the results
+    are Python's only without it)."""
+    path_before = os.environ.get("PATH", "")
+    try:
+        comp = find_compiler()
+    except RuntimeError:
+        comp = None
+    eigen = None
+    if arrays:
+        try:
+            eigen = str(find_eigen())
+        except RuntimeError:
+            eigen = "<the folder holding Eigen/Dense>"
+
+    def q(x):
+        x = str(x)
+        return f'"{x}"' if " " in x else x
+    windows = os.name == "nt"
+    exe = exe_name + (".exe" if windows else "")
+    if comp is not None and comp.kind == "msvc":
+        return " ".join(["cl /nologo /std:c++17 /EHsc /O2 /fp:precise", f"/I {q(include_dir)}"]
+                        + ([f"/I {q(eigen)}"] if eigen else []) + [q(cpp), f"/Fe:{exe}"])
+    if comp is None:
+        cxx = "g++"
+    else:
+        name = Path(comp.path).name
+        on_path = shutil.which(name, path=path_before)
+        cxx = name if on_path and Path(on_path).resolve() == Path(comp.path).resolve() else q(comp.path)
+        if cxx.lower().endswith(".exe") and cxx == name:
+            cxx = name[:-4]
+    flags = ["-std=c++17", "-O2", "-ffp-contract=off"] + (["-static"] if windows else [])
+    return " ".join([cxx] + flags + [f"-I {q(include_dir)}"] + ([f"-I {q(eigen)}"] if eigen else [])
+                    + [q(cpp), "-o", exe])
 
 
 # --- results ---------------------------------------------------------------------------
