@@ -13,6 +13,7 @@ import ast
 import copy
 import inspect
 import io
+import functools
 import re
 import tokenize
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from pathlib import Path
 
 from . import library as lib
 from .errors import Unsupported
+from .unicode_tables import header_path as unicode_header_path
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
 from . import loops
@@ -31,7 +33,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, assignable, is_array)
 
-VERSION = "0.10.1"
+VERSION = "0.11.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -42,6 +44,20 @@ ARRAYS_HEADER = Path(__file__).parent / "runtime" / "qtrans_arrays.hpp"
 RANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_random.hpp"
 PRINT_HEADER = Path(__file__).parent / "runtime" / "qtrans_print.hpp"
 LIST_HEADER = Path(__file__).parent / "runtime" / "qtrans_list.hpp"
+UNICODE_HEADER = unicode_header_path()  # qtrans_list.hpp includes it: this Python's Unicode tables
+
+
+@functools.lru_cache(maxsize=None)
+def _list_names() -> frozenset:
+    """The qt::py names qtrans_list.hpp defines (code using one includes it)."""
+    text = LIST_HEADER.read_text(encoding="utf-8")
+    names = set(re.findall(r"^(?:inline |template <[^>]*>\s*)?[\w:<>,&* ]+?\b(\w+)\(", text, re.M))
+    names |= set(re.findall(r"^(?:struct|class) (\w+)", text, re.M)) | {"none", "dict"}
+    printing = set(re.findall(r"\b(\w+)\(", (LIST_HEADER.parent / "qtrans_print.hpp").read_text(encoding="utf-8")))
+    names = (names - printing) | {"item", "slice", "sum", "sum_left", "min", "max", "sorted", "sort", "pop", "insert",
+                                  "index", "count", "contains", "concat", "range_list", "repeat", "len", "none",
+                                  "join", "dict", "KeyError", "isdigit"}
+    return frozenset(n for n in names if n not in ("if", "for", "while", "return", "switch"))
 
 
 @dataclass
@@ -259,6 +275,24 @@ FAST_MATH_GUARD = """#if defined(__FAST_MATH__) || defined(_M_FP_FAST)
 #error "built with fast-math (-ffast-math, /fp:fast), which changes floating-point results: this C++ matches Python only without it"
 #endif"""
 
+# Names the C and C++ standard libraries declare at global scope (<cmath>, <cstdlib>, <cstdio>,
+# ...): a module's namespace can't take one of them (a file named nan.py, exp.py or time.py)
+C_GLOBALS = frozenset("""
+abs acos acosh asin asinh atan atan2 atanh cbrt ceil copysign cos cosh erf erfc exp exp2 expm1 fabs
+fdim floor fma fmax fmin fmod frexp hypot ilogb ldexp lgamma llrint llround log log10 log1p log2
+logb lrint lround modf nan nearbyint nextafter nexttoward pow remainder remquo rint round scalbln
+scalbn sin sinh sqrt tan tanh tgamma trunc isnan isinf isfinite signbit fpclassify
+abort atexit atof atoi atol atoll bsearch calloc div exit free getenv labs ldiv llabs malloc
+qsort rand realloc srand strtod strtof strtol strtoul system
+clock difftime mktime time asctime ctime gmtime localtime strftime
+fclose feof ferror fflush fgetc fgets fopen fprintf fputc fputs fread freopen fscanf fseek ftell
+fwrite getc getchar perror printf putc putchar puts remove rename rewind scanf setbuf snprintf
+sprintf sscanf tmpfile tmpnam ungetc
+memchr memcmp memcpy memmove memset strcat strchr strcmp strcpy strerror strlen strncat strncmp
+strncpy strstr strtok
+signal raise errno assert main std qt
+""".split())
+
 USE_OVERRIDES = [True]  # off while verify builds qtrans's own translation to compare against
 
 
@@ -312,6 +346,8 @@ class ModuleTranslator:
         self.deps: dict = dict(deps or {})
         ns = cpp_ident(re.sub(r"\W", "_", module_name) or "module")
         self.ns = "m_" + ns if ns[0].isdigit() else ns
+        if self.ns in C_GLOBALS:  # nan.py: namespace nan would clash with C's nan()
+            self.ns += "_"
         self.imported: dict = {}           # local name -> (owner module, name there, kind)
         self.module_aliases: dict = {}     # `import bl_core as C` -> {"C": "bl_core"}
         self.project_deps: list = []       # project modules imported (their headers are included)
@@ -358,7 +394,8 @@ class ModuleTranslator:
             bname = base.id if isinstance(base, ast.Name) else getattr(base, "attr", None)
             if bname in ("list", "List"):
                 elem = self.parse_annotation(node.slice)
-                if elem in (FLOAT, INT, STR):
+                if elem in (FLOAT, INT, STR) or (isinstance(elem, TupleType) and all(
+                        e in (FLOAT, INT, STR, BOOL) for e in elem.elts)):
                     return ListType(elem)
                 raise Unsupported(node, f"'{ast.unparse(node)}': lists of float, int or str are supported")
             if bname in ("dict", "Dict"):
@@ -2162,9 +2199,8 @@ class ModuleTranslator:
             inc_lines.append('#include "qtrans_arrays.hpp"  // Eigen, plus NumPy semantics')
         elif "qt::" in code.replace("qt::py::", ""):
             inc_lines.append('#include "qtrans_runtime.hpp"')
-        if "std::vector<" in code or re.search(r"qt::py::(item|slice|sum|sum_left|min|max|sorted|sort|pop|insert|index|"
-                                                r"count|contains|concat|range_list|repeat|len|none|join|dict|KeyError)\b", code):
-            inc_lines.append('#include "qtrans_list.hpp"  // lists, dicts, and print(), str(), repr(), format() as Python writes them')
+        if "std::vector<" in code or re.search(r"qt::py::(" + "|".join(sorted(_list_names())) + r")\b", code):
+            inc_lines.append('#include "qtrans_list.hpp"  // lists, dicts, text, and print(), str(), repr(), format() as Python writes them')
         elif "qt::py::" in code:
             inc_lines.append('#include "qtrans_print.hpp"  // print(), str(), repr(), format() as Python writes them')
         for d in self.project_deps:  # the modules of the project it imports from
@@ -2238,6 +2274,6 @@ def translate_file(path, out_dir=None) -> TranslationResult:
         if result.uses_random or "qtrans_random.hpp" in everything:
             (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
         if re.search(r"qtrans_(print|list)\.hpp", result.header + (result.program or "")):
-            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER):
+            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
                 (out / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")
     return result

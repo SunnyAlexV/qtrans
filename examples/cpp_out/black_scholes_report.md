@@ -37,7 +37,4 @@ These only matter on inputs where Python would raise an exception or overflow.
 ## Module constants
 
 - `TRADING_DAYS: int`
-
-## Module-level notes
-
-- line 96: `_GRID` not translated: a list of tuple[float, float, float, float, float, float] values is not supported
+- `_GRID: list[tuple[float, float, float, float, float, float]]`

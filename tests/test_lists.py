@@ -133,7 +133,7 @@ def test_lists_read_like_cpp():
     assert "inline std::vector<double> cumulative(const std::vector<double>& xs) {" in h
     assert "    for (double x : xs) {" in h and "        out.push_back(total);" in h
     assert "return qt::py::slice(qt::py::sorted(xs, true), qt::py::none, k);" in h
-    assert "return qt::py::item(xs, -1LL);" in h
+    assert "return qt::py::item(xs, -1);" in h
 
 
 @pytest.mark.parametrize("src, line, words", [

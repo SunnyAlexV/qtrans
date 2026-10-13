@@ -55,6 +55,8 @@ jobs:
           test "$(./hello)" = "$(/tmp/env/bin/python hello.py)"
           printf 'prices = {"AAPL": 190.5, "MSFT": 410.25}\nfor i, (k, v) in enumerate(prices.items()):\n    print(i, k, f"{v:.2f}")\nprint(sum(v for v in prices.values()), sorted(prices))\n' > dicts_demo.py
           /tmp/env/bin/qtrans verify dicts_demo.py | tee v.txt && grep -q "output identical" v.txt
+          printf 'line = " AAPL, 190.5 ,straße "\nparts = [p.strip() for p in line.split(",")]\nprint(parts, float(parts[1]), parts[2].upper(), "ΟΔΟΣ".lower(), repr("a\\u00a0b"))\n' > text_demo.py
+          /tmp/env/bin/qtrans verify text_demo.py | tee v.txt && grep -q "output identical" v.txt
           /tmp/env/bin/qtrans override black_scholes.py d1
           /tmp/env/bin/qtrans verify black_scholes.py --cases 30 | tee v.txt && grep -q "your C++ against qtrans's" v.txt
           /tmp/env/bin/qtrans export black_scholes.py -o bs_cpp --cases 20 | tee e.txt && grep -q "ctest tests passed" e.txt

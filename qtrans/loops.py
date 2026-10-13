@@ -190,13 +190,17 @@ def _plan(target, it, builtins_ok) -> _Plan | None:
         bind(t, ("item", len(p.seqs) - 1))
 
     def bind(t, how):
+        if how[0] == "item" and isinstance(t, ast.Tuple) and t.elts and all(isinstance(e, ast.Name) for e in t.elts):
+            p.binds.append((tuple(e.id for e in t.elts), how))  # for i, (a, b) in enumerate(pairs)
+            return
         if not isinstance(t, ast.Name):
             p.why = p.why or "the loop must unpack into plain names"
             return
         p.binds.append((t.id, how))
 
     add(target, it)
-    if p.why is None and len({n for n, _ in p.binds if n != "_"}) != len([n for n, _ in p.binds if n != "_"]):
+    flat = [x for n, _ in p.binds for x in (n if isinstance(n, tuple) else (n,)) if x != "_"]
+    if p.why is None and len(set(flat)) != len(flat):
         p.why = "a name appears twice in the loop target"
     return p
 
@@ -367,7 +371,7 @@ class Rewriter(ast.NodeTransformer):
             return loop
         p = _plan(node.target, node.iter, self.builtins_ok)
         if p is None:
-            return node
+            return self._unpack_loop(node)
         if p.why is None:
             for s in p.seqs:
                 if isinstance(s, ast.Name):
@@ -394,7 +398,7 @@ class Rewriter(ast.NodeTransformer):
                 continue
             # zip(xs[1:], xs[:-1]), enumerate(f(x)): Python evaluates the sequence once, before
             # the loop; so does a named copy
-            owner = next((n for n, how in p.binds if how == ("item", k) and n != "_"), "seq")
+            owner = next((n if isinstance(n, str) else n[0] for n, how in p.binds if how == ("item", k) and n != "_"), "seq")
             tmp = self.fresh(f"{owner}_values")
             value = ast.List(elts=s.elts, ctx=ast.Load()) if isinstance(s, ast.Tuple) else s
             before.append(_loc(ast.Assign(targets=[_name(tmp, True)], value=value), node))
@@ -410,6 +414,11 @@ class Rewriter(ast.NodeTransformer):
             k = self.fresh_index(node)
         assigns = []
         for name, how in p.binds:
+            if isinstance(name, tuple):  # (a, b) = pairs[k]
+                value = ast.Subscript(value=seqs[how[1]], slice=_name(k), ctx=ast.Load())
+                target = ast.Tuple(elts=[_name(x, True) for x in name], ctx=ast.Store())
+                assigns.append(_loc(ast.Assign(targets=[target], value=value), node))
+                continue
             if name == "_" and "_" not in outside:
                 continue
             if how[0] == "item":
@@ -432,6 +441,34 @@ class Rewriter(ast.NodeTransformer):
                     a.value.right = _name(tmp)
         loop = ast.For(target=_name(k, True), iter=ast.Call(func=_name("range"), args=[self._length(seqs)], keywords=[]),
                        body=assigns + node.body, orelse=node.orelse, type_comment=None)
+        _loc(loop, node)
+        loop.end_lineno, loop.end_col_offset = node.end_lineno, node.end_col_offset
+        loop.qt_rewritten = ast.unparse(node.iter)
+        return before + [loop] if before else loop
+
+    def _unpack_loop(self, node):
+        """for a, b in pairs:  ->  for k in range(len(pairs)): a, b = pairs[k]  (a list of tuples:
+        element k read by position, as Python's iterator reads it)."""
+        t = node.target
+        if not (isinstance(t, ast.Tuple) and t.elts and all(isinstance(e, ast.Name) for e in t.elts)
+                and self.builtins_ok) or isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)):
+            return node
+        before = []
+        seq = node.iter
+        if isinstance(seq, ast.Name):
+            why = _changes(node.body + node.orelse, seq.id)
+            if why:
+                setattr(node, WHY, why)
+                return node
+        else:  # a computed sequence: computed once, before the loop, as Python does
+            tmp = self.fresh(f"{t.elts[0].id}_items")
+            before.append(_loc(ast.Assign(targets=[_name(tmp, True)], value=seq), node))
+            seq = _name(tmp)
+        k = self.fresh_index(node)
+        unpack = _loc(ast.Assign(targets=[ast.Tuple(elts=[_name(e.id, True) for e in t.elts], ctx=ast.Store())],
+                                 value=ast.Subscript(value=_name(seq.id), slice=_name(k), ctx=ast.Load())), node)
+        loop = ast.For(target=_name(k, True), iter=ast.Call(func=_name("range"), args=[self._length([seq])], keywords=[]),
+                       body=[unpack] + node.body, orelse=node.orelse, type_comment=None)
         _loc(loop, node)
         loop.end_lineno, loop.end_col_offset = node.end_lineno, node.end_col_offset
         loop.qt_rewritten = ast.unparse(node.iter)
@@ -471,7 +508,7 @@ class Rewriter(ast.NodeTransformer):
             return node
         p = _plan(g.target, g.iter, self.builtins_ok)
         if p is None:
-            return node
+            return self._unpack_comprehension(node, g)
         views = [_name_view(s) for s in p.seqs]
         if p.why is None and None in views:
             p.why = ("in a comprehension, enumerate() and zip() take names or plain slices of them "
@@ -492,6 +529,15 @@ class Rewriter(ast.NodeTransformer):
         k = index[0] if index_zero and index[0] not in {s.id for s in p.seqs} else self.fresh_index(node)
         subst = {}
         for name, how in p.binds:
+            if isinstance(name, tuple):  # [a + b for i, (a, b) in enumerate(pairs)]: pairs[k][j]
+                for j, x in enumerate(name):
+                    def part(view=views[how[1]], j=j):
+                        name_, lo, _ = view
+                        at = _name(k) if lo == 0 else ast.BinOp(left=_name(k), op=ast.Add(), right=ast.Constant(lo))
+                        return ast.Subscript(value=ast.Subscript(value=_name(name_), slice=at, ctx=ast.Load()),
+                                             slice=ast.Constant(j), ctx=ast.Load())
+                    subst[x] = part
+                continue
             if name == k:
                 continue
             if how[0] == "item":
@@ -526,6 +572,40 @@ class Rewriter(ast.NodeTransformer):
             lens.append(n)
         g.iter = ast.Call(func=_name("range"), args=[lens[0] if len(lens) == 1 else
                                                      ast.Call(func=_name("min"), args=lens, keywords=[])], keywords=[])
+        for n in ast.walk(node):
+            if "lineno" in n._attributes and not hasattr(n, "lineno"):
+                n.lineno, n.col_offset, n.end_lineno, n.end_col_offset = \
+                    node.lineno, node.col_offset, node.end_lineno, node.end_col_offset
+        return node
+
+    def _unpack_comprehension(self, node, g):
+        """[a * b for a, b in pairs]  ->  [pairs[k][0] * pairs[k][1] for k in range(len(pairs))]"""
+        t = g.target
+        if not (isinstance(t, ast.Tuple) and t.elts and all(isinstance(e, ast.Name) for e in t.elts)
+                and isinstance(g.iter, ast.Name) and self.builtins_ok):
+            return node
+        parts = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        if any(isinstance(n, (ast.NamedExpr, ast.Lambda, ast.ListComp, ast.GeneratorExp, ast.SetComp, ast.DictComp))
+               for e in parts + list(g.ifs) for n in ast.walk(e)):
+            return node
+        k = self.fresh_index(node)
+        pos = {e.id: i for i, e in enumerate(t.elts)}
+        seq = g.iter.id
+
+        class Sub(ast.NodeTransformer):
+            def visit_Name(self, n):
+                if n.id in pos and isinstance(n.ctx, ast.Load):
+                    item = ast.Subscript(value=_name(seq), slice=_name(k), ctx=ast.Load())
+                    return ast.copy_location(ast.Subscript(value=item, slice=ast.Constant(pos[n.id]), ctx=ast.Load()), n)
+                return n
+        g.ifs = [Sub().visit(c) for c in g.ifs]
+        if isinstance(node, ast.DictComp):
+            node.key, node.value = Sub().visit(node.key), Sub().visit(node.value)
+        else:
+            node.elt = Sub().visit(node.elt)
+        g.target = _name(k, True)
+        g.iter = ast.Call(func=_name("range"), args=[self._length([_name(seq)])], keywords=[])
+        g.qt_rewritten = True
         for n in ast.walk(node):
             if "lineno" in n._attributes and not hasattr(n, "lineno"):
                 n.lineno, n.col_offset, n.end_lineno, n.end_col_offset = \

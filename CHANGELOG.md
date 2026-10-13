@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.0
+
+- **Strings:** Python's str methods (`split`, `strip`, `replace`, `find`, `count`, `startswith`,
+  `upper`, `title`, `casefold`, `isdigit` and the other tests, `zfill`, `center`, ...), `s[i]`,
+  `s[a:b:c]`, `for ch in s`, `"x" in s`, `s * n`, and `float(s)` / `int(s)` with Python's syntax
+  and error messages. Indexes count characters. Case, character classes, digits and `repr()`
+  are exact for every Unicode character: `qtrans_unicode.hpp` is written from the running
+  Python (shipped for Unicode 15.1; written once into the user's cache for another version).
+  `repr()` of text now escapes what Python escapes (`'\xa0'`, `'\u200b'`), where it used to
+  keep every non-ASCII character as it was.
+- **Tuples in lists:** `list[tuple[str, float, int]]` parameters and returns, `for a, b in
+  pairs`, `sorted(pairs)` / `min` / `max` ordering tuples as Python does (NaN in them stops the
+  C++, since Python's answer then depends on its sort algorithm), `list(zip(...))`,
+  `list(enumerate(...))`, `dict(zip(keys, values))`.
+- **`key=`:** `sorted(xs, key=...)`, `xs.sort(key=..., reverse=...)`, `min` / `max` with `key`
+  and `default`; a key is a lambda, a function or `d.get`, called once per element as Python
+  does.
+- **`for ... else` and `while ... else`:** the `else` runs when the loop wasn't left by `break`.
+- **Lists and dicts as conditions:** `if not xs:`, `while queue:`.
+- A module-level name that is also a C library name (`nan`, `exp`) no longer clashes.
+
 ## 0.10.1
 
 Found by looking at what a user sees (`tools/screenshots.py`, new: screenshots of `qtrans live`,

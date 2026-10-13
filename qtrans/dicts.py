@@ -17,7 +17,7 @@ import ast
 
 from .core import P_ATOM, P_UNARY, Expr
 from .errors import Unsupported
-from .types import BOOL, FLOAT, INT, STR, DictType, ListType
+from .types import BOOL, FLOAT, INT, STR, DictType, ListType, TupleType
 
 KEYS = (STR, INT)
 VALUES = (FLOAT, INT, STR)
@@ -157,9 +157,22 @@ class DictOps:
     # --- len(d), list(d), sorted(d), dict(d) ------------------------------------------------------
     def dict_builtin(self, node, name):
         """None if the argument isn't a dict. Python goes through a dict's keys."""
-        if len(node.args) != 1 or node.keywords:
+        if len(node.args) != 1 or (node.keywords and name not in ("min", "max", "sorted")):
             return None
         arg = node.args[0]
+        if name != "dict" and isinstance(arg, ast.Call) and (
+                getattr(arg.func, "id", None) in ("zip", "enumerate") or getattr(arg.func, "attr", None) == "items"):
+            return None  # list(zip(...)), sorted(d.items()): lists of tuples (lists.pairs_iterable)
+        if name == "dict":  # dict(zip(keys, values)), dict(pairs): from (key, value) pairs
+            pairs = self.pairs_iterable(arg) or (self.expr(arg) if not isinstance(arg, (ast.Dict, ast.DictComp))
+                                                 and not (isinstance(arg, ast.Name) and dict_of(self.expr(arg).type))
+                                                 else None)
+            if pairs is not None and isinstance(pairs.type, ListType) and isinstance(pairs.type.elem, TupleType) \
+                    and len(pairs.type.elem.elts) == 2:
+                k, v = pairs.type.elem.elts
+                if k not in KEYS or v not in VALUES:
+                    raise Unsupported(node, f"a dict of {k} keys and {v} values is not supported")
+                return Expr(f"qt::py::dict_from({pairs.code})", P_ATOM, DictType(k, v))
         if isinstance(arg, (ast.ListComp, ast.List, ast.GeneratorExp)) or (
                 isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "range"):
             return None  # list(range(n)), sum([...]): not a dict
@@ -174,7 +187,7 @@ class DictOps:
         # sum / min / max / sorted / list of a dict: of its keys
         keys = ast.copy_location(ast.Call(func=ast.Attribute(value=node.args[0], attr="keys", ctx=ast.Load()),
                                           args=[], keywords=[]), node.args[0])
-        call = ast.copy_location(ast.Call(func=node.func, args=[keys], keywords=[]), node)
+        call = ast.copy_location(ast.Call(func=node.func, args=[keys], keywords=node.keywords), node)
         return self.expr(call)
 
     # --- k in d -----------------------------------------------------------------------------------

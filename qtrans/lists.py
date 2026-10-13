@@ -17,9 +17,14 @@ import sys
 
 from .core import P_ATOM, P_UNARY, Expr, wrap
 from .errors import Unsupported
-from .types import BOOL, FLOAT, INT, STR, VOID, ArrayType, DictType, ListType, Scalar, is_array
+from .types import BOOL, FLOAT, INT, STR, VOID, ArrayType, DictType, ListType, Scalar, TupleType, is_array
 
 ELEMS = (FLOAT, INT, STR)
+
+
+def list_elem_ok(t) -> bool:
+    """What a list may hold: floats, ints or strings, or tuples of those (and bools)."""
+    return t in ELEMS or (isinstance(t, TupleType) and bool(t.elts) and all(e in ELEMS + (BOOL,) for e in t.elts))
 MUTATORS = {"append", "extend", "insert", "pop", "sort", "reverse", "clear", "remove"}
 
 
@@ -40,8 +45,9 @@ class ListOps:
                                     "(an int prints as 1, a float as 1.0), a std::vector has one",
                               "make the elements one type: 1.0 rather than 1")
         t = types.pop()
-        if t not in ELEMS:
-            raise Unsupported(node, f"a list of {t} values is not supported", "lists of float, int or str are")
+        if not list_elem_ok(t):
+            raise Unsupported(node, f"a list of {t} values is not supported",
+                              "lists of float, int or str (or tuples of them) are")
         codes = [self.as_type(e, t).code if t == INT else e.code for e in items]
         return Expr(f"std::vector<{t.cpp()}>{{{', '.join(codes)}}}", P_ATOM, ListType(t))
 
@@ -65,7 +71,7 @@ class ListOps:
                     e = self.expr(b)
                     if e.type not in (INT, BOOL):
                         raise Unsupported(b, f"slice indices must be ints (Python raises TypeError for a {e.type})")
-                    parts.append(self.as_type(e, INT).code)
+                    parts.append(self.int_arg(e).code)
             if parts[2] == "qt::py::none":
                 parts = parts[:2]
             return Expr(f"qt::py::slice({base.code}, {', '.join(parts)})", P_ATOM, base.type)
@@ -74,7 +80,7 @@ class ListOps:
             raise Unsupported(sl, f"list indices must be ints (Python raises TypeError for a {i.type})")
         if self.index_in_range(node.value, sl):  # for i in range(len(xs)): xs[i] -- no check needed
             return Expr(f"{wrap(base, P_ATOM)}[static_cast<std::size_t>({i.code})]", P_ATOM, base.type.elem)
-        return Expr(f"qt::py::item({base.code}, {self.as_type(i, INT).code})", P_ATOM, base.type.elem)
+        return Expr(f"qt::py::item({base.code}, {self.int_arg(i).code})", P_ATOM, base.type.elem)
 
     # --- for k in range(len(xs)): xs[k] is always in range ------------------------------------
     @staticmethod
@@ -129,7 +135,7 @@ class ListOps:
     def list_method(self, node, base, name):
         t = base.type
         args = node.args
-        if node.keywords and not (name == "sort" and all(k.arg == "reverse" for k in node.keywords)):
+        if node.keywords and not (name == "sort" and all(k.arg in ("reverse", "key") for k in node.keywords)):
             raise Unsupported(node, f"keyword arguments to list.{name}() are not supported")
 
         def elem_arg(a):
@@ -177,7 +183,12 @@ class ListOps:
             return Expr(f"{t.cpp()}({base.code})", P_ATOM, t)
         if name == "sort":
             self._arity(node, args, 0)
+            key = next((k.value for k in node.keywords if k.arg == "key"), None)
             rev = self._reverse_kw(node)
+            if key is not None and not (isinstance(key, ast.Constant) and key.value is None):
+                keys = self._keys(node, base, key)
+                return Expr(f"{base.code} = qt::py::sorted_by({base.code}, {keys}{', true' if rev else ''})",
+                            P_ATOM, VOID)
             return Expr(f"qt::py::sort({base.code}{', true' if rev else ''})", P_ATOM, VOID)
         if name == "reverse":
             self._arity(node, args, 0)
@@ -190,6 +201,8 @@ class ListOps:
 
     def _reverse_kw(self, node) -> bool:
         for k in node.keywords:
+            if k.arg == "key":
+                continue
             if k.arg == "reverse":
                 if not (isinstance(k.value, ast.Constant) and isinstance(k.value.value, bool)):
                     raise Unsupported(k.value, "reverse= must be True or False")
@@ -214,7 +227,10 @@ class ListOps:
                 raise Unsupported(r, "range() takes 1 to 3 int arguments")
             codes = ["0LL"] + [v.code for v in vals] if len(vals) == 1 else [v.code for v in vals]
             return Expr(f"qt::py::range_list({', '.join(codes)})", P_ATOM, ListType(INT))
-        a = self.expr(node.args[0])
+        a = self.pairs_iterable(node.args[0]) if name in ("list", "sorted", "min", "max") else None
+        if a is not None and name == "list" and len(node.args) == 1:
+            return a  # list(zip(...)): the list it makes is already a new one
+        a = a or self.expr(node.args[0])
         if not list_of(a.type):
             return None
         self._need_list(a, node.args[0], f"{name}()")
@@ -237,16 +253,144 @@ class ListOps:
                 return Expr(f"{fn}({a.code})", P_ATOM, FLOAT)
             return Expr(f"qt::py::sum({a.code})", P_ATOM, INT)
         if name in ("min", "max"):
-            if len(node.args) != 1 or node.keywords:
-                raise Unsupported(node, f"{name}() of a list with more arguments (key=, default=) is not supported")
-            return Expr(f"qt::py::{name}({a.code})", P_ATOM, t.elem)
+            if len(node.args) != 1 or any(k.arg not in ("key", "default") for k in node.keywords):
+                raise Unsupported(node, f"{name}() of a list takes key= and default=")
+            key = next((k.value for k in node.keywords if k.arg == "key"), None)
+            dflt = next((k.value for k in node.keywords if k.arg == "default"), None)
+            keyed = key is not None and not (isinstance(key, ast.Constant) and key.value is None)
+
+            def pick(xs):
+                return f"qt::py::{name}_by({xs.code}, {self._keys(node, xs, key)})" if keyed else f"qt::py::{name}({xs.code})"
+            if dflt is None:
+                return Expr(self._items_once(a, pick) if keyed else pick(a), P_ATOM, t.elem)
+            d = self.expr(dflt)  # an empty list gives the default instead of ValueError
+            if d.type != t.elem:
+                raise Unsupported(dflt, f"default= is a {d.type} for a list of {t.elem}: Python returns it as it "
+                                        "is, a value of another type", "give a default of the list's type")
+            if t.elem == FLOAT and self.maybe_int(dflt):
+                raise Unsupported(dflt, "the default may be a Python int here", "write it as a float: 0.0")
+            return Expr(self._items_once(Expr(a.code, P_ATOM, a.type, simple=False),
+                                   lambda xs: f"{xs.code}.empty() ? {t.elem.cpp()}({d.code}) : {pick(xs)}"),
+                        P_ATOM, t.elem)
         if name == "sorted":
             self._arity(node, node.args, 1)
             rev = self._reverse_kw(node)
+            key = next((k.value for k in node.keywords if k.arg == "key"), None)
+            if key is not None and not (isinstance(key, ast.Constant) and key.value is None):
+                return Expr(self._items_once(a, lambda xs: f"qt::py::sorted_by({xs.code}, {self._keys(node, xs, key)}"
+                                                     f"{', true' if rev else ''})"), P_ATOM, t)
             return Expr(f"qt::py::sorted({a.code}{', true' if rev else ''})", P_ATOM, t)
         if name == "list":
             self._arity(node, node.args, 1)
             return Expr(f"{t.cpp()}({a.code})", P_ATOM, t)
+        return None
+
+    def _keys(self, node, items, key) -> str:
+        """The C++ for the list of keys key=... gives the elements of `items`, computed once each, in
+        order: key=lambda x: ..., key=abs / len / a function of the module, key=d.get (over d)."""
+        elem = items.type.elem
+        if isinstance(key, ast.Lambda):
+            a = key.args
+            if len(a.args) != 1 or a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg or a.defaults:
+                raise Unsupported(key, "a key function takes one argument: key=lambda x: ...")
+            var, body = a.args[0].arg, key.body
+        elif isinstance(key, ast.Name):
+            var = "x"
+            while self.is_variable(var) or var in getattr(self, "comp_vars", {}):
+                var += "_"
+            body = ast.Call(func=ast.Name(id=key.id, ctx=ast.Load()), args=[ast.Name(id=var, ctx=ast.Load())],
+                            keywords=[])
+        elif isinstance(key, ast.Attribute) and key.attr == "get" and isinstance(key.value, ast.Name) \
+                and isinstance(self.expr(key.value).type, DictType):
+            # max(d, key=d.get): over d's own keys, every lookup finds its value
+            var = "k"
+            while self.is_variable(var) or var in getattr(self, "comp_vars", {}):
+                var += "_"
+            body = ast.Subscript(value=ast.Name(id=key.value.id, ctx=ast.Load()),
+                                 slice=ast.Name(id=var, ctx=ast.Load()), ctx=ast.Load())
+            if not self._is_keys_of(node.args[0] if node.args else None, key.value.id):
+                raise Unsupported(key, "key=d.get is supported over d itself (max(d, key=d.get)): elsewhere a "
+                                       "missing key gives None")
+        else:
+            raise Unsupported(key, "key= takes a lambda, a function's name, or d.get",
+                              "key=lambda x: x[1]")
+        for n in ast.walk(body):
+            if isinstance(n, (ast.Lambda, ast.NamedExpr, ast.Yield, ast.Await)):
+                raise Unsupported(n, "a key function holding a lambda or := is not supported")
+        ast.copy_location(body, key)
+        for n in ast.walk(body):
+            if "lineno" in n._attributes and not hasattr(n, "lineno"):
+                ast.copy_location(n, key)
+        ident = var if not self._clashes(var) else var + "_"
+        outer = self.__dict__.setdefault("comp_vars", {})
+        saved = outer.get(var)
+        outer[var] = (elem, ident)
+        try:
+            k = self.expr(body)
+        finally:
+            if saved is None:
+                outer.pop(var, None)
+            else:
+                outer[var] = saved
+        if not list_elem_ok(k.type) and k.type != BOOL:
+            raise Unsupported(key, f"a key of type {k.type} can't be compared as Python compares it")
+        decl = "const std::string&" if elem == STR else ("const auto&" if isinstance(elem, TupleType) else elem.cpp())
+        kt = ListType(k.type).cpp()
+        return (f"[&] {{ {kt} qt_keys; qt_keys.reserve({wrap(items, P_ATOM)}.size()); for ({decl} {ident} : {items.code}) "
+                f"qt_keys.push_back({k.code}); return qt_keys; }}()")
+
+    @staticmethod
+    def _items_once(a, make) -> str:
+        """make(items) where items is `a` evaluated once: a variable as it is, anything else (a call,
+        sorted(d.items())) into one named copy first, as Python evaluates it once."""
+        if a.simple:
+            return make(a)
+        tmp = Expr("qt_items", P_ATOM, a.type, simple=True)
+        return f"[&] {{ const auto qt_items = {a.code}; return {make(tmp)}; }}()"
+
+    @staticmethod
+    def _is_keys_of(arg, d) -> bool:
+        if isinstance(arg, ast.Name) and arg.id == d:
+            return True
+        return isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute) and arg.func.attr == "keys" \
+            and isinstance(arg.func.value, ast.Name) and arg.func.value.id == d
+
+    def pairs_iterable(self, it):
+        """zip(xs, ys) / enumerate(xs) / d.items(), read to the end by list() / sorted() / dict() /
+        min() / max(): the list of tuples Python's iterator gives. None if `it` is none of these."""
+        if not isinstance(it, ast.Call) or it.keywords and not (
+                isinstance(it.func, ast.Name) and it.func.id == "enumerate" and all(k.arg == "start" for k in it.keywords)):
+            return None
+        f = it.func
+        if isinstance(f, ast.Name) and f.id == "zip" and not self.is_variable("zip") and it.args:
+            parts = [self.expr(a) for a in it.args]
+            for a, n in zip(parts, it.args):
+                if not list_of(a.type):
+                    raise Unsupported(n, f"zip() of a {a.type} as a value is supported for lists",
+                                      "loop over it directly: for a, b in zip(xs, ys)")
+                self._need_list(a, n, "zip()")
+            t = ListType(TupleType(tuple(a.type.elem for a in parts)))
+            return Expr(f"qt::py::zip({', '.join(a.code for a in parts)})", P_ATOM, t)
+        if isinstance(f, ast.Name) and f.id == "enumerate" and not self.is_variable("enumerate") \
+                and 1 <= len(it.args) + len(it.keywords) <= 2 and it.args:
+            xs = self.expr(it.args[0])
+            if not list_of(xs.type):
+                raise Unsupported(it.args[0], f"enumerate() of a {xs.type} as a value is supported for lists",
+                                  "loop over it directly: for i, x in enumerate(xs)")
+            self._need_list(xs, it.args[0], "enumerate()")
+            start = it.args[1] if len(it.args) == 2 else (it.keywords[0].value if it.keywords else None)
+            extra = ""
+            if start is not None:
+                st = self.expr(start)
+                if st.type not in (INT, BOOL):
+                    raise Unsupported(start, "enumerate()'s start must be an int")
+                extra = f", {self.as_type(st, INT).code}"
+            return Expr(f"qt::py::enumerate({xs.code}{extra})", P_ATOM, ListType(TupleType((INT, xs.type.elem))))
+        if isinstance(f, ast.Attribute) and f.attr == "items" and not it.args:
+            d = self.expr(f.value)
+            if isinstance(d.type, DictType):
+                self._need_dict(d, f.value, "items()")
+                return Expr(f"qt::py::items({d.code})", P_ATOM, ListType(TupleType((d.type.key, d.type.val))))
         return None
 
     def _sum_from(self, node, a, t):
@@ -352,6 +496,8 @@ class ListOps:
             if isinstance(src.type, DictType):  # over a dict: its keys
                 self._need_dict(src, it, "a comprehension")
                 src = Expr(f"{src.code}.keys()", P_ATOM, ListType(src.type.key))
+            if src.type == STR:  # over a str: its characters
+                src = self.str_chars(src)
             if list_of(src.type):
                 self._need_list(src, it, "a comprehension")
                 vt = src.type.elem
@@ -386,7 +532,7 @@ class ListOps:
                                   "make it a float on every path (0.0 rather than 0)")
         elif mode != "list":
             test = self.truth(e, node.elt)
-        elif e.type not in ELEMS:
+        elif not list_elem_ok(e.type):
             raise Unsupported(node.elt, f"a list of {e.type} values is not supported", "lists of float, int or str are")
         if mode == "list" and self._list_maybe_int(node.elt, e.type):
             raise Unsupported(node.elt, "this value may be a Python int for some elements and a float for others",

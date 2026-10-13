@@ -26,6 +26,7 @@ from .structs import THIS
 from .classes import member_safe_name
 from .types import VEC as VEC_T
 from .types import RNG, STR, DictType, ListType
+from .lists import list_elem_ok
 from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
@@ -137,6 +138,21 @@ def _contains_break(stmts) -> bool:
             return True
         if isinstance(s, ast.Try) and (_contains_break(s.body) or any(_contains_break(h.body) for h in s.handlers)):
             return True
+    return False
+
+
+def _contains_break_of(stmts) -> bool:
+    """A break that leaves this loop (not one of an inner loop)."""
+    for s in stmts:
+        if isinstance(s, ast.Break):
+            return True
+        if isinstance(s, ast.If) and (_contains_break_of(s.body) or _contains_break_of(s.orelse)):
+            return True
+        if isinstance(s, ast.Try) and (_contains_break_of(s.body) or any(_contains_break_of(h.body) for h in s.handlers)
+                                       or _contains_break_of(s.orelse) or _contains_break_of(s.finalbody)):
+            return True
+        if isinstance(s, (ast.For, ast.While)) and _contains_break_of(s.orelse):
+            return True  # an inner loop's else breaks out of this one
     return False
 
 
@@ -713,8 +729,7 @@ class FunctionTranslator(ExprTranslator):
                         raise Unsupported(s, f"this enumerate() / zip() loop is not supported: {why}")
                     raise Unsupported(s, "for-loops must use a single loop variable",
                                       "unpacking works for enumerate() and zip(): for i, x in enumerate(xs)")
-                if s.orelse:
-                    raise Unsupported(s, "for ... else is not supported")
+
                 if s.target.id in self.params or s.target.id == "self":
                     raise Unsupported(s, f"loop variable '{s.target.id}' shadows a parameter")
                 v = s.target.id
@@ -726,10 +741,10 @@ class FunctionTranslator(ExprTranslator):
                 self.loop_lb[v] = lb if v not in self.loop_lb else (
                     None if lb is None or self.loop_lb[v] is None else min(lb, self.loop_lb[v]))
                 self.scan(s.body)
+                self.scan(s.orelse)
             elif isinstance(s, ast.While):
-                if s.orelse:
-                    raise Unsupported(s, "while ... else is not supported")
                 self.scan(s.body)
+                self.scan(s.orelse)
             elif isinstance(s, ast.If):
                 self.scan(s.body)
                 self.scan(s.orelse)
@@ -877,6 +892,8 @@ class FunctionTranslator(ExprTranslator):
             if t.elem is None:
                 raise _Unknown(name) if self.inferring else Unsupported(it, "the list's element type is not known")
             return t.elem
+        if t == STR:  # a loop over a str goes through its characters
+            return STR
         if isinstance(t, DictType):  # a loop over a dict goes through its keys
             if t.key is None:
                 raise _Unknown(name) if self.inferring else Unsupported(it, "the dict's key type is not known")
@@ -972,6 +989,8 @@ class FunctionTranslator(ExprTranslator):
                     raise Unsupported(node, f"nested loops reuse the loop variable '{v}'")
                 for s in node.body:
                     walk(s, active | {v})
+                for s in node.orelse:  # Python's else sees the last value; the C++ loop variable is gone
+                    walk(s, active)
                 return
             if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
                 # [i * 2 for i in range(3)]: the comprehension's own i, not a loop variable
@@ -1027,7 +1046,7 @@ class FunctionTranslator(ExprTranslator):
             if elem is None:
                 continue
             if t.elem is None:
-                if elem not in (FLOAT, INT, STR):
+                if not list_elem_ok(elem):
                     raise Unsupported(st, f"a list of {elem} values is not supported", "lists of float, int or str are")
                 self.local_types[name] = ListType(elem)
                 changed = True
@@ -1074,7 +1093,7 @@ class FunctionTranslator(ExprTranslator):
             i, n = ev.index
             elts = self.unpack_types(t)
             if elts is None or len(elts) != n:
-                raise Unsupported(ev.stmt, f"cannot unpack a {t} value into {n} names")
+                raise Unsupported(ev.stmt, f"cannot unpack a {t} value into {n} names (Python raises TypeError)")
             t = elts[i]
         if t == VOID:
             raise Unsupported(ev.stmt, "assigning the result of a function that returns None")
@@ -1489,6 +1508,8 @@ class FunctionTranslator(ExprTranslator):
                 visit(orelse, stack)
         elif isinstance(s, (ast.While, ast.For)):
             visit(s.body, stack)
+            if s.orelse:
+                visit(s.orelse, stack)
         elif isinstance(s, ast.Try):
             visit(s.body, stack)
             for h in s.handlers:
@@ -1524,6 +1545,7 @@ class FunctionTranslator(ExprTranslator):
             if isinstance(s, (ast.While, ast.For)):
                 reads(s.test if isinstance(s, ast.While) else s.iter, A)
                 block(s.body, set(A))
+                block(s.orelse, set(A))  # (after zero iterations too; a break skips it)
                 return A
             if isinstance(s, (ast.Return, ast.Raise)):
                 reads(s, A)
@@ -1651,10 +1673,12 @@ class FunctionTranslator(ExprTranslator):
             if isinstance(s, ast.While):
                 check(s.test, A)
                 block(s.body, set(A))
+                block(s.orelse, set(A))
                 return A
             if isinstance(s, ast.For):
                 check(s.iter, A)
                 block(s.body, set(A))
+                block(s.orelse, set(A))
                 return A
             if isinstance(s, (ast.Return, ast.Raise)):
                 check(s, A)
@@ -1761,6 +1785,9 @@ class FunctionTranslator(ExprTranslator):
         pass
 
     def s_Break(self, s):
+        flags = getattr(self, "loop_flags", [])
+        if flags and flags[-1]:
+            self.emit(f"{flags[-1]} = true;")
         self.emit("break;")
 
     def s_Continue(self, s):
@@ -1897,7 +1924,7 @@ class FunctionTranslator(ExprTranslator):
         e = self.expr(s.value)
         elts = self.unpack_types(e.type)
         if elts is None or len(elts) != len(names):
-            raise Unsupported(s, f"cannot unpack a {e.type} value into {len(names)} names")
+            raise Unsupported(s, f"cannot unpack a {e.type} value into {len(names)} names (Python raises TypeError)")
 
         for n, et in zip(names, elts):
             if n not in self.ignored and not assignable(self.var_type(n), et):
@@ -2221,7 +2248,39 @@ class FunctionTranslator(ExprTranslator):
         if n:
             self.emit(f"QT_UNROLL({n})")  # (the `# qtrans: unroll` comment itself follows it)
 
+    def _with_else(self, s, emit_loop):
+        """for / while ... else: the else runs when the loop ends without a break. No break of
+        its own in the loop: the else simply follows it. Else a flag, set just before each break."""
+        flags = self.__dict__.setdefault("loop_flags", [])
+        own_break = s.orelse and _contains_break_of(s.body)
+        flag = None
+        if own_break:
+            flag = "broke"
+            while flag in self.all_names:
+                flag += "_"
+            self.all_names.add(flag)
+            self.emit(f"bool {flag} = false;  // set by a break: the loop's else doesn't run then")
+        flags.append(flag)
+        try:
+            emit_loop(s)
+        finally:
+            flags.pop()
+        if s.orelse:
+            ln = self._keyword_line(s.body[-1].end_lineno, s.orelse[0].lineno, "else")
+            self.cur_src = (ln, ln) if ln else self.cur_src
+            if flag:
+                self.emit(f"if (!{flag}) {{  // the loop's else: it ended without a break")
+                self._block(s.orelse)
+                self.emit("}")
+            else:
+                self.emit(f"// the loop's else: it has no break, so this always runs after it")
+                for b in s.orelse:
+                    self.emit_stmt(b)
+
     def s_While(self, s):
+        self._with_else(s, self._s_while)
+
+    def _s_while(self, s):
         self._unroll(s)
         cond = self.cond(s.test)
         self.emit(f"while ({cond.code}) {{")
@@ -2229,6 +2288,9 @@ class FunctionTranslator(ExprTranslator):
         self.emit("}")
 
     def s_For(self, s):
+        self._with_else(s, self._s_for)
+
+    def _s_for(self, s):
         self._unroll(s)
         it = s.iter
         lit = self._literal_items(it)
@@ -2249,6 +2311,8 @@ class FunctionTranslator(ExprTranslator):
                 raise Unsupported(s, "`.items()` is supported on a dict")
             if isinstance(arr.type, DictType):  # for k in d: its keys, in order
                 arr = Expr(f"{arr.code}.keys()", P_ATOM, ListType(arr.type.key))
+            if arr.type == STR:  # for ch in s: its characters
+                arr = self.str_chars(arr)
             if isinstance(arr.type, ListType) and arr.type.elem is not None:
                 decl = "const std::string&" if arr.type.elem == STR else arr.type.elem.cpp()
                 self.emit(f"for ({decl} {self.ident(s.target.id)} : {arr.code}) {{")

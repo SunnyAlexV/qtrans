@@ -168,7 +168,7 @@ def test_the_rewrite_is_python_that_means_the_same():
     ("xs = [1.0]\nfor a, b in zip(xs, xs, strict=True):\n    print(a)\n", 2, "strict=True"),
     ("xs = [1.0]\nfor i, x in zip(range(3), xs):\n    print(i)\n", 2, "range() inside"),
     ("xs = [1.0]\nfor a, b in zip(xs):\n    print(a)\n", 2, "unpack zip() into 1 names"),
-    ("xs = [1.0]\nfor a, b in xs:\n    print(a)\n", 2, "single loop variable"),
+    ("xs = [1.0]\nfor a, b in xs:\n    print(a)\n", 2, "cannot unpack a float value into 2 names"),
     ("xs = [1.0]\nprint([a * b for a, b in zip(xs, sorted(xs))])\n", 2, "take names or plain slices"),
     ("def zip(a, b):\n    return a\n\nxs = [1.0]\nfor a, b in zip(xs, xs):\n    print(a)\n", 5, "its own enumerate, zip"),
 ])
@@ -178,3 +178,56 @@ def test_loops_an_index_cannot_follow_are_refused_at_their_line(src, line, words
     assert bad, r.report.to_text()
     first = bad[-1]
     assert first.reason_line == line and (words in first.reason or words in (first.hint or "")), first.reason
+
+
+ELSE = '''
+def find(xs: list[float], target: float) -> int:
+    for i, x in enumerate(xs):
+        if x == target:
+            break
+    else:
+        return -1
+    return i
+
+
+def first_negative(xs: list[float]) -> float:
+    found = 0.0
+    for x in xs:
+        if x < 0:
+            found = x
+            break
+    else:
+        found = 1.0
+    return found
+
+
+def count_down(n: int) -> int:
+    steps = 0
+    while n > 0:
+        n -= 1
+        steps += 1
+        for k in range(3):
+            if k == 1:
+                break  # leaves the inner loop only: the outer loop's else still runs
+    else:
+        steps += 100
+    return steps
+'''
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_for_and_while_else_agree_with_python(tmp_path):
+    f = tmp_path / "loop_else.py"
+    f.write_text(ELSE)
+    rep = verify_file(f, n_random=80, build_dir=tmp_path / "build")
+    assert rep.ok and rep.warnings == [], rep.to_text()
+    h = translate_source(ELSE, "m").header
+    assert "bool broke = false;" in h and "if (!broke) {  // the loop's else" in h
+    # no break of its own (only the inner loop's): no flag, the else simply follows the loop
+    assert "// the loop's else: it has no break, so this always runs after it\n    steps = qt::iadd(steps, 100LL);" in h
+
+
+def test_a_loop_variable_read_in_the_else_is_refused():
+    r = translate_source("def f(n: int) -> int:\n    for i in range(n):\n        pass\n    else:\n        return i\n"
+                         "    return 0\n", "m")
+    assert not r.report.functions[0].translated and "used outside its for-loop" in r.report.functions[0].reason

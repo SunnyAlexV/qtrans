@@ -57,7 +57,7 @@ from pathlib import Path
 import numpy as np
 
 from . import verify as V
-from .translator import ARRAYS_HEADER, LIST_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
+from .translator import ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
 from .types import (ListType, DictType, BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
                     VoidType)
 
@@ -819,7 +819,7 @@ def build_extension(path, out_dir=None, build_dir=None, eigen=None, module_name=
     if not any(b.bound or b.bound_classes for b in binders.values()):
         raise RuntimeError(f"nothing in {first.name} could be translated and bound")
     path = first
-    for h in (RUNTIME_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, LIST_HEADER, PYBIND_HEADER):
+    for h in (RUNTIME_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER, PYBIND_HEADER):
         shutil.copy(h, build / h.name)
     cpp = build / f"{name}_bind.cpp"
     cpp.write_text(src, encoding="utf-8")

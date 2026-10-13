@@ -21,6 +21,7 @@ from .arrays import STACKERS, ArrayOps
 from .structs import StructOps
 from .printing import TextOps
 from .dicts import DictOps, dict_of
+from .strings import StrOps
 from .lists import ListOps, list_of
 from .types import (ListType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
@@ -103,7 +104,7 @@ def _outer_call(code: str):
     return None
 
 
-class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
+class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
@@ -164,6 +165,11 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
                 return Expr(f"static_cast<long long>({e.code})", P_ATOM, INT, iv=e.iv, dimtok=e.dimtok)
         return e
 
+    def int_arg(self, e: Expr) -> Expr:
+        """An int argument of a function whose parameter is a long long (not a template): a
+        literal goes in as it is (`item(xs, 0)`, not `0LL`)."""
+        return e if e.type == INT and e.int_lit else self.as_type(e, INT)
+
     def as_string(self, e: Expr) -> Expr:
         """A literal as std::string, so that member functions and + work on it."""
         if e.type == STR and isinstance(e.value, str):
@@ -194,6 +200,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
             return Expr(f"qt::truthy({e.code})", P_ATOM, BOOL)
         if e.type == STR:
             return Expr(f"!{wrap(self.as_string(e), P_ATOM)}.empty()", P_UNARY, BOOL)  # "" is falsy
+        if isinstance(e.type, (ListType, DictType)):  # an empty list / dict is falsy
+            if e.code == "{}":
+                return Expr("false", P_ATOM, BOOL, value=False, simple=True)
+            return Expr(f"!{wrap(e, P_ATOM)}.empty()", P_UNARY, BOOL)
         if e.type == BOOL:
             return e
         if e.type == INT:
@@ -295,6 +305,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
                 return self.list_subscript(node, base)
             if base is not None and dict_of(base.type):
                 return self.dict_subscript(node, base)
+            if base is not None and base.type == STR:
+                return self.str_subscript(node, base)
         return self.array_subscript(node)
 
     def e_Attribute(self, node):
@@ -332,11 +344,13 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
             raise Unsupported(node, f"{type(op).__name__} on a list is not supported", "lists join with +")
         node = node or self.current
         if STR in (L.type, R.type):
+            if isinstance(op, ast.Mult) and {L.type, R.type} in ({STR, INT}, {STR, BOOL}):
+                return self.str_repeat(node, *((L, R) if L.type == STR else (R, L)))
             if isinstance(op, ast.Add) and L.type == R.type == STR:
                 if isinstance(L.value, str) and isinstance(R.value, str):
                     return self.expr(ast.Constant(L.value + R.value))
                 return Expr(f"{wrap(self.as_string(L), P_ADD)} + {wrap(R, P_ADD - 1)}", P_ADD, STR)
-            raise Unsupported(node, "on strings only + (joining two strings) is supported",
+            raise Unsupported(node, "on strings only + (joining two strings) and * (repeating one) are supported",
                               "Python raises TypeError for str + number; formatting isn't supported")
         if any(is_array(e.type) or isinstance(e.type, MaskType) for e in (L, R)):
             return self.array_binop(node, op, L, R)
@@ -458,7 +472,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
     def e_UnaryOp(self, node):
         if isinstance(node.op, ast.Not):
             raw = self.expr_raw(node.operand)
-            if raw.type == STR:
+            if raw.type == STR or (isinstance(raw.type, (ListType, DictType)) and raw.code != "{}"):
                 return Expr(f"{wrap(self.as_string(raw), P_ATOM)}.empty()", P_ATOM, BOOL)
             return Expr(f"!{wrap(self.truth(raw, node.operand), P_ATOM)}", P_UNARY, BOOL)
         e = self.expr(node.operand)
@@ -510,6 +524,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
                 d = self.expr(node.comparators[0])
                 if dict_of(d.type):
                     return self.dict_contains(node, node.left, d, isinstance(node.ops[0], ast.NotIn))
+                if d.type == STR:
+                    return self.str_contains(node, self.expr(node.left), d, isinstance(node.ops[0], ast.NotIn))
                 return self.list_contains(node, node.left, node.comparators[0], isinstance(node.ops[0], ast.NotIn))
             return self._in_literals(node)
         vals = [node.left] + list(node.comparators)
@@ -737,8 +753,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
                 return self.dict_method(node, base, f.attr)
             if base.type == RNG:
                 return self.rng_method(node, base, f.attr)
-            if base.type == STR and f.attr == "join":
-                return self.str_join(node, base)
+            if base.type == STR:
+                return self.str_method(node, base, f.attr)
         if q is None:
             raise Unsupported(node, f"method call '{ast.unparse(f)}(...)' is not supported")
         return self.call_library(node, q)
@@ -887,17 +903,25 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
     def call_builtin(self, node, name):
         if node.keywords:
             raise Unsupported(node, f"keyword arguments to {name}() are not supported")
-        if name == "float" and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) \
+        if name in ("float", "int") and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) \
                 and isinstance(node.args[0].value, str):
-            v = node.args[0].value.strip().lower()
-            special = {"inf": "qt::inf", "infinity": "qt::inf", "+inf": "qt::inf",
-                       "-inf": "-qt::inf", "-infinity": "-qt::inf", "nan": "qt::nan"}
-            if v in special:
-                return Expr(special[v], P_UNARY if special[v][0] == "-" else P_ATOM, FLOAT)
-            try:
-                return self.expr(ast.copy_location(ast.Constant(float(v)), node))
-            except ValueError:
-                raise Unsupported(node, f"float({node.args[0].value!r}) is not a valid number")
+            try:  # a literal: Python's own reading of it
+                v = (float if name == "float" else int)(node.args[0].value)
+            except ValueError as ex:
+                raise Unsupported(node, f"Python raises ValueError here: {ex}")
+            if name == "float" and not math.isfinite(v):
+                code = ("-qt::inf" if v < 0 else "qt::inf") if math.isinf(v) else "qt::nan"
+                return Expr(code, P_UNARY if code[0] == "-" else P_ATOM, FLOAT)
+            if name == "int" and not -2**63 <= v < 2**63:
+                raise Unsupported(node, f"{name}({node.args[0].value!r}) is beyond 64 bits")
+            return self.expr(ast.copy_location(ast.Constant(v), node))
+        if name in ("float", "int") and len(node.args) == 1:
+            a = self.expr(node.args[0])
+            if a.type == STR:  # Python's syntax for a number, its errors (ValueError) word for word
+                self.note("parsenum", "float(s) / int(s) read text as Python does: spaces around it, _ between digits, "
+                                      "inf / nan; anything else raises ValueError with Python's message")
+                fn = "parse_float" if name == "float" else "parse_int"
+                return Expr(f"qt::py::{fn}({a.code})", P_ATOM, FLOAT if name == "float" else INT)
         args = [self.expr(a) for a in node.args]
         if name == "abs" and len(args) == 1 and is_array(args[0].type):
             return Expr(f"{wrap(args[0], P_ATOM)}.abs()", P_ATOM, args[0].type)

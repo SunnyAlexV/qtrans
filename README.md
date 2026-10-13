@@ -609,9 +609,28 @@ array (Python raises), array defaults without `default_factory` (Python refuses 
 `copy.copy` (shallow), assigning a field of a frozen object.
 
 **Strings:** `str` parameters, fields, locals and returns (`std::string`), `==`, `!=`, ordering,
-`+`, `s in ("a", "b")`, truthiness, string constants. Python orders strings by code point and
-`std::string` by UTF-8 byte, which agree. The verifier's random strings come from the
-module's own string literals, so branches like `if stance == "Long only":` run.
+`+`, `*`, `in`, truthiness, string constants. Python orders strings by code point and
+`std::string` by UTF-8 byte, which agree. Indexes count characters, as Python's do: `len(s)`,
+`s[i]` (IndexError), `s[a:b:c]`, `for ch in s`, `find`. The methods: `split()` / `split(sep,
+maxsplit)`, `strip` / `lstrip` / `rstrip` (with or without characters), `replace(old, new,
+count)`, `find` / `index` / `count` (with start and end), `startswith` / `endswith` (also of a
+tuple), `upper`, `lower`, `capitalize`, `title`, `swapcase`, `casefold`, `isdigit`, `isdecimal`,
+`isnumeric`, `isalpha`, `isalnum`, `isspace`, `isupper`, `islower`, `istitle`, `isprintable`,
+`zfill`, `ljust` / `rjust` / `center`, `join`; and `float(s)` / `int(s)` read text as Python
+does (spaces around it, `_` between digits, `inf` / `nan`, Unicode digits), raising ValueError
+with Python's message word for word.
+
+These are exact for every character, not just ASCII: case mapping (`"straße".upper()` is
+`STRASSE`, a capital sigma at the end of a word lowers to `ς`), character classes, digits and
+`repr()`'s escapes come from `qtrans_unicode.hpp`, which is written from the running Python
+itself, character by character, so the C++ answers as that Python does whatever its Unicode
+version. A test compares all 1,112,064 characters against Python. A method whose arguments are
+all literals is worked out when translating. Not supported, with the reason: `rsplit`,
+`partition`, `rfind`, `splitlines`, `expandtabs`, `translate`, `encode`.
+
+The verifier's random strings come from the module's own string literals, so branches like
+`if stance == "Long only":` run; code that takes text apart also gets text made to break it
+(padding, mixed case, `1_000.25`, `-nan`, `ΟΔΟΣ ΣΑΣ`, Arabic-Indic digits, no-break spaces).
 
 ## Tested on real code
 

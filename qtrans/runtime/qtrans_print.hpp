@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "qtrans_runtime.hpp"
+#include "qtrans_unicode.hpp"  // the Unicode tables of Python's str methods and repr()
 
 namespace qt {
 namespace py {
@@ -263,18 +264,27 @@ inline std::string repr(double x) { return format_float_short(x, 'r', 0, false, 
 inline std::string repr(long long x) { return std::to_string(x); }
 inline std::string repr(bool b) { return b ? "True" : "False"; }
 
-// repr of a str: single quotes unless the text has a ' and no ", backslash escapes for the
-// quote, \\, \t \n \r and other control characters (non-ASCII text is kept as it is)
+// repr of a str, as Python writes it: single quotes unless the text has a ' and no ", backslash
+// escapes for the quote, \\, \t \n \r and every character Python doesn't count as printable
+// (\x.., \u...., \U........ by its Unicode tables, qtrans_unicode.hpp); the rest as it is
 inline std::string repr(const std::string& s) {
     const char q = (s.find('\'') != std::string::npos && s.find('"') == std::string::npos) ? '"' : '\'';
     std::string out(1, q);
-    for (unsigned char c : s) {
-        if (c == static_cast<unsigned char>(q) || c == '\\') { out += '\\'; out += static_cast<char>(c); }
+    for (std::size_t k = 0; k < s.size();) {
+        std::size_t n = 1;
+        const char32_t c = uni::decode(s, k, &n);
+        if (c == static_cast<char32_t>(q) || c == '\\') { out += '\\'; out += static_cast<char>(c); }
         else if (c == '\n') out += "\\n";
         else if (c == '\t') out += "\\t";
         else if (c == '\r') out += "\\r";
-        else if (c < 0x20 || c == 0x7f) { char b[8]; std::snprintf(b, sizeof b, "\\x%02x", c); out += b; }
-        else out += static_cast<char>(c);
+        else if (!uni::in(uni::printable, c)) {
+            char b[16];
+            const unsigned v = static_cast<unsigned>(c);
+            std::snprintf(b, sizeof b, c <= 0xFF ? "\\x%02x" : c <= 0xFFFF ? "\\u%04x" : "\\U%08x", v);
+            out += b;
+        }
+        else out.append(s, k, n);
+        k += n;
     }
     out += q;
     return out;
@@ -397,7 +407,7 @@ inline Spec parse_spec(const std::string& s) {
 
 inline size_t text_width(const std::string& s) {  // characters, not bytes
     size_t n = 0;
-    for (unsigned char c : s) n += (c & 0xC0) != 0x80;
+    for (char ch : s) n += (static_cast<unsigned char>(ch) & 0xC0) != 0x80;
     return n;
 }
 

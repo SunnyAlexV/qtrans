@@ -48,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .translator import (ARRAYS_HEADER, LIST_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
+from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
                          library_tree, translate_file)
 from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, DictType, ListType, OptionalType, StructType, TupleType
 
@@ -436,6 +436,12 @@ class VerifyReport:
 
 # --- input generation -------------------------------------------------------------------
 _STRINGS = ["", "x"]  # replaced per module by the string literals it contains
+_TEXT_METHODS = {"upper", "lower", "capitalize", "title", "swapcase", "casefold", "istitle", "strip", "lstrip", "rstrip", "split", "replace", "find", "index",
+                 "count", "startswith", "endswith", "isdigit", "isdecimal", "isnumeric", "isalpha", "isalnum",
+                 "isspace", "isupper", "islower", "isprintable", "zfill", "ljust", "rjust", "center"}
+_TEXT_PROBES = ["  padded  ", "a,b,,c", "Mixed Case", "UPPER", "lower", "12", "-3.5", " 1_000.25 ", "1e3", "inf",
+                "-nan", "x1", "9223372036854775808", "é", "ÉCOLE", "straße", "ΟΔΟΣ ΣΑΣ", "\u00a0nbsp\u2003",
+                "١٢٣", "tab\there", "line\nbreak", "ǅ", "ﬁ"]
 _STRESS = False       # profile "stress": extreme floats and longer arrays (see random_value)
 _EXTREME = [math.inf, -math.inf, math.nan, 1e308, -1e308, 5e-324, -5e-324, 2.2250738585072014e-308,
             0.0, -0.0, 1e-300, 1e300, 1e-16, 1.0 + 2.0 ** -52, 0.49999999999999994, 2.5, -2.5]
@@ -465,6 +471,8 @@ def random_value(rng, t, n=3, shape=None):
     if isinstance(t, ListType):  # a list of 0 to 6 elements (empty lists are where sum() is the int 0)
         k = int(rng.integers(0, 7)) if rng.random() < 0.9 else 0
         return [random_value(rng, t.elem) for _ in range(k)]
+    if isinstance(t, TupleType):  # an element of a list of tuples
+        return tuple(random_value(rng, e, n) for e in t.elts)
     if isinstance(t, DictType):  # 0 to 5 entries; keys from a small set, so lookups hit and miss
         k = int(rng.integers(0, 6)) if rng.random() < 0.9 else 0
         out = {}
@@ -600,6 +608,8 @@ def _encode(v, t):
         return "S" + str(v).encode("utf-8").hex()
     if isinstance(t, ListType):
         return " ".join([str(len(v))] + [_encode(x, t.elem) for x in v])
+    if isinstance(t, TupleType):  # its elements, in order
+        return " ".join(_encode(x, e) for x, e in zip(v, t.elts))
     if isinstance(t, DictType):  # its length, then key and value, in order
         return " ".join([str(len(v))] + [f"{_encode(k, t.key)} {_encode(x, t.val)}" for k, x in v.items()])
     if isinstance(t, OptionalType):
@@ -667,6 +677,12 @@ def _has_complex(v):
 
 
 def _py_value(v, t):
+    if isinstance(t, TupleType) and not isinstance(v, tuple):
+        raise TypeError(f"expected a tuple, got {type(v).__name__}")
+    if isinstance(t, TupleType):
+        if len(v) != len(t.elts):
+            raise TypeError(f"expected a tuple of {len(t.elts)}, got {len(v)}")
+        return tuple(_py_value(x, e) for x, e in zip(v, t.elts))
     if isinstance(t, DictType):
         if not isinstance(v, dict):
             raise TypeError(f"expected a dict, got {type(v).__name__}")
@@ -1141,6 +1157,15 @@ static double num(double x) { return x; }
 static double num(long long x) { return static_cast<double>(x); }
 static double num(bool x) { return x ? 1.0 : 0.0; }
 @@ARRAY_IO@@
+// declared first: a list's elements may be tuples or optionals, written by the overloads below
+template <class... T>
+static void out(const std::tuple<T...>& t);
+template <class T>
+static void out(const std::optional<T>& x);
+template <class... T>
+static double num(const std::tuple<T...>& t);
+template <class T>
+static double num(const std::optional<T>& x);
 template <class T>
 static void out(const std::vector<T>& v) {
     std::printf(" %lld", static_cast<long long>(v.size()));
@@ -1356,6 +1381,8 @@ def _reader(t, ns, r="r") -> str:
         return (f"qtrans_optional<{inner.cpp()}>({r}, [](Reader& rr) {{ return {_reader(inner, ns, 'rr')}; }})")
     if isinstance(t, ListType):
         return f"qtrans_list<{t.elem.cpp()}>({r}, [](Reader& rr) {{ return {_reader(t.elem, ns, 'rr')}; }})"
+    if isinstance(t, TupleType):  # a braced list: its elements are read in order (a call's arguments aren't)
+        return f"{t.cpp()}{{{', '.join(_reader(e, ns, r) for e in t.elts)}}}"
     if isinstance(t, DictType):
         return (f"qtrans_dict<{t.key.cpp()}, {t.val.cpp()}>({r}, [](Reader& rr) {{ return {_reader(t.key, ns, 'rr')}; }}, "
                 f"[](Reader& rr) {{ return {_reader(t.val, ns, 'rr')}; }})")
@@ -1438,6 +1465,8 @@ def _parse_cpp_line(line, out_t):
 
 
 def _parse_value(t, toks):
+    if isinstance(t, TupleType):
+        return tuple(_parse_value(e, toks) for e in t.elts)
     if isinstance(t, DictType):
         n = int(next(toks))
         out = {}
@@ -1959,11 +1988,18 @@ def load_project(project):
 def setup_inputs(project, pymods):
     """Point the input generators at this project: its string literals, its classes."""
     global _STRINGS, _CLASSES, _INIT_PARAMS
-    lits = set()
+    lits, text = set(), False
     for p in project.paths.values():
-        lits |= {n.value for n in ast.walk(ast.parse(Path(p).read_text(encoding="utf-8")))
-                 if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 80}
-    _STRINGS = sorted(lits) + ["", "no such option"]
+        for n in ast.walk(ast.parse(Path(p).read_text(encoding="utf-8"))):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 80:
+                lits.add(n.value)
+            elif isinstance(n, ast.Call) and (
+                    (isinstance(n.func, ast.Attribute) and n.func.attr in _TEXT_METHODS)
+                    or (isinstance(n.func, ast.Name) and n.func.id in ("float", "int") and n.args
+                        and not isinstance(n.args[0], ast.Constant))):
+                text = True
+    # code that takes text apart also gets text made to test it: spaces, case, digits, Unicode
+    _STRINGS = sorted(lits) + ["", "no such option"] + (_TEXT_PROBES if text else [])
     _CLASSES = {n: (info, getattr(pymods[m], n)) for n, (info, m) in project.classes().items()}
     _INIT_PARAMS = {n: project.modules[m].signatures[f"{n}.__init__"].params
                     for n, (info, m) in project.classes().items() if info.plain}
@@ -2184,6 +2220,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         shutil.copy(RUNTIME_HEADER, build / "qtrans_runtime.hpp")
     shutil.copy(PRINT_HEADER, build / "qtrans_print.hpp")
     shutil.copy(LIST_HEADER, build / "qtrans_list.hpp")
+    shutil.copy(UNICODE_HEADER, build / "qtrans_unicode.hpp")
     for m, r in project.modules.items():  # the driver includes each module's header, programs' too
         if not (build / f"{m}.hpp").exists():
             (build / f"{m}.hpp").write_text(r.header, encoding="utf-8")
@@ -2300,7 +2337,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         if result.program is not None:  # a program: run it both ways and compare what it prints
             src = build / f"{module}.cpp"
             src.write_text(result.program, encoding="utf-8")
-            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER):
+            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
                 shutil.copy(h, build / h.name)
             prog_system = list(system)
             if "qtrans_arrays.hpp" in result.program or "qtrans_random.hpp" in result.program:

@@ -38,12 +38,17 @@ def weighted(prices: dict[str, float], weights: dict[str, float]) -> float:
     return sum((prices[k] * w for k, w in weights.items()), 0.0)
 
 
+def ticker(line: str) -> str:
+    return line.split(",")[0].strip().upper()
+
+
 prices = {"AAPL": 190.5, "MSFT": 410.25, "GOOG": 140.0}
 weights = {"AAPL": 0.5, "MSFT": 0.3, "GOOG": 0.2}
 for i, (name, p) in enumerate(prices.items(), start=1):
     print(f"{i}. {name:<5} {p:>8.2f}")
 print("annuity(10) =", round(annuity(10), 6))
 print("weighted:", weighted(prices, weights))
+print(ticker(" aapl , 190.5"), ticker("straße,1"), float(" 1_000.5 "))
 '''
 
 TERMINAL_CSS = """
@@ -119,7 +124,7 @@ def main(out_dir):
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "1_live_editor.png"))
         shots.append("1_live_editor.png")
-        page.evaluate("goToLine(24)")  # a line of the program: enumerate over a dict
+        page.evaluate("goToLine(23)")  # text: split, strip, upper (Python's Unicode rules)
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "2_live_program_line.png"))
         shots.append("2_live_program_line.png")

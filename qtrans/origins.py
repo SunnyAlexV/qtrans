@@ -26,7 +26,9 @@ PY, NP, RNG_ = "py", "np", "rng"
 _BOTTOM = "bottom"  # no assignment seen yet (the start of the fixpoint)
 
 _PY_BUILTINS = {"float", "int", "bool", "round", "len", "str", "repr", "format", "isinstance", "divmod"}
-_PY_METHODS = {"item", "tolist", "upper", "lower", "strip", "format", "join", "replace", "startswith", "endswith"}
+_PY_METHODS = {"item", "tolist", "upper", "lower", "capitalize", "title", "swapcase", "casefold", "istitle", "strip", "lstrip", "rstrip", "format", "join",
+               "replace", "startswith", "endswith", "find", "zfill", "ljust", "rjust", "center", "isdigit",
+               "isdecimal", "isnumeric", "isalpha", "isalnum", "isspace", "isupper", "islower", "isprintable"}
 _SCALAR_DRAWS = {"random": 0, "standard_normal": 0, "normal": 2, "uniform": 2}  # positional args before size
 
 
@@ -71,9 +73,9 @@ def of_type(t):
     if isinstance(t, TupleType):
         return ("tuple", tuple(of_type(e) for e in t.elts))
     if isinstance(t, ListType):
-        return ("list", PY)
+        return ("list", of_type(t.elem) if t.elem is not None else PY)  # tuples: ("tuple", ...)
     if isinstance(t, DictType):
-        return ("dict", PY)
+        return ("dict", of_type(t.val) if t.val is not None else PY)
     return None
 
 
@@ -354,6 +356,27 @@ class _FunctionOrigins:
                 return None
             if f.id == "range":
                 return ("list", PY)  # its ints are Python's (list(range(n)), for i in range(n))
+            if f.id == "zip" and node.args:  # list(zip(xs, ys)): pairs of their elements
+                parts = [self.of(a) for a in node.args]
+                if any(p == _BOTTOM for p in parts):
+                    return _BOTTOM
+                return ("list", ("tuple", tuple(p[1] if isinstance(p, tuple) and p[0] == "list" else None
+                                                for p in parts)))
+            if f.id == "enumerate" and node.args:
+                o = self.of(node.args[0])
+                if o == _BOTTOM:
+                    return _BOTTOM
+                return ("list", ("tuple", (PY, o[1] if isinstance(o, tuple) and o[0] == "list" else None)))
+            if f.id == "dict" and len(node.args) == 1:  # dict(pairs): their second elements are the values
+                o = self.of(node.args[0])
+                if o == _BOTTOM:
+                    return _BOTTOM
+                if isinstance(o, tuple) and o[0] == "dict":
+                    return o
+                if isinstance(o, tuple) and o[0] == "list" and isinstance(o[1], tuple) and o[1][0] == "tuple" \
+                        and len(o[1][1]) == 2:
+                    return ("dict", o[1][1][1])
+                return None
             if f.id in ("sum", "min", "max", "sorted", "list") and len(node.args) == 1:
                 o = self.of(node.args[0])
                 if isinstance(o, tuple) and o[0] == "dict":  # over its keys
@@ -405,6 +428,8 @@ class _FunctionOrigins:
                     return ("list", base[1])
                 if f.attr == "keys":
                     return ("list", PY)
+                if f.attr == "items":
+                    return ("list", ("tuple", (PY, base[1])))
                 return None
             if isinstance(base, tuple) and base[0] == "list":
                 if f.attr == "pop":
@@ -415,6 +440,8 @@ class _FunctionOrigins:
                     return PY
             if f.attr in _PY_METHODS:
                 return PY
+            if f.attr == "split":
+                return ("list", PY)
             if base == NP:
                 return NP
         return None
