@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstdlib>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -163,7 +164,7 @@ inline double round(double x, long long ndigits) {
     }
     std::string text = (r.neg ? "-" : "") + r.d + "e" + std::to_string(r.decpt - static_cast<int>(r.d.size()));
     const double v = std::strtod(text.c_str(), nullptr);
-    if (std::isinf(v)) throw std::overflow_error("rounded value too large to represent");
+    if (std::isinf(v)) throw OverflowError("rounded value too large to represent");
     return v;
 }
 
@@ -415,7 +416,7 @@ inline Spec parse_spec(const std::string& s) {
         while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) sp.precision = sp.precision * 10 + (s[i++] - '0');
     }
     if (i < s.size()) sp.type = s[i++];
-    if (i != s.size()) throw std::invalid_argument("Invalid format specifier '" + s + "'");
+    if (i != s.size()) throw ValueError("Invalid format specifier '" + s + "'");
     return sp;
 }
 
@@ -489,7 +490,7 @@ inline std::string format(double x, const std::string& spec) {
     char type = sp.type;
     if (type == 'n') type = 'g';
     if (!(type == 0 || type == 'e' || type == 'E' || type == 'f' || type == 'F' || type == 'g' || type == 'G' || type == '%'))
-        throw std::invalid_argument(std::string("Unknown format code '") + type + "' for object of type 'float'");
+        throw ValueError(std::string("Unknown format code '") + type + "' for object of type 'float'");
     bool add_dot_0 = false;
     char code = type;
     int precision = sp.precision;
@@ -514,12 +515,12 @@ inline std::string format(long long v, const std::string& spec) {
     const char t = sp.type;
     if (t == 'e' || t == 'E' || t == 'f' || t == 'F' || t == 'g' || t == 'G' || t == '%')
         return format(static_cast<double>(v), spec);
-    if (sp.precision >= 0) throw std::invalid_argument("Precision not allowed in integer format specifier");
-    if (sp.z) throw std::invalid_argument("Negative zero coercion (z) not allowed in integer format specifier");
+    if (sp.precision >= 0) throw ValueError("Precision not allowed in integer format specifier");
+    if (sp.z) throw ValueError("Negative zero coercion (z) not allowed in integer format specifier");
     if (t == 'c') {
-        if (sp.sign_given) throw std::invalid_argument("Sign not allowed with integer format specifier 'c'");
-        if (sp.alt) throw std::invalid_argument("Alternate form (#) not allowed with integer format specifier 'c'");
-        if (v < 0 || v > 0x10FFFF) throw std::overflow_error("%c arg not in range(0x110000)");
+        if (sp.sign_given) throw ValueError("Sign not allowed with integer format specifier 'c'");
+        if (sp.alt) throw ValueError("Alternate form (#) not allowed with integer format specifier 'c'");
+        if (v < 0 || v > 0x10FFFF) throw OverflowError("%c arg not in range(0x110000)");
         std::string ch;
         const unsigned long u = static_cast<unsigned long>(v);
         if (u < 0x80) ch = std::string(1, static_cast<char>(u));
@@ -535,7 +536,7 @@ inline std::string format(long long v, const std::string& spec) {
     else if (t == 'x') { base = 16; prefix = "0x"; }
     else if (t == 'X') { base = 16; prefix = "0X"; }
     else if (!(t == 0 || t == 'd' || t == 'n'))
-        throw std::invalid_argument(std::string("Unknown format code '") + t + "' for object of type 'int'");
+        throw ValueError(std::string("Unknown format code '") + t + "' for object of type 'int'");
     unsigned long long u = v < 0 ? 0ULL - static_cast<unsigned long long>(v) : static_cast<unsigned long long>(v);
     std::string digits;
     do {
@@ -557,13 +558,13 @@ inline std::string format(bool b, const std::string& spec) {
 inline std::string format(const std::string& s, const std::string& spec) {
     Spec sp = parse_spec(spec);
     if (sp.type && sp.type != 's')
-        throw std::invalid_argument(std::string("Unknown format code '") + sp.type + "' for object of type 'str'");
-    if (sp.sign_given) throw std::invalid_argument("Sign not allowed in string format specifier");
-    if (sp.z) throw std::invalid_argument("Negative zero coercion (z) not allowed in string format specifier");
-    if (sp.alt) throw std::invalid_argument("Alternate form (#) not allowed in string format specifier");
-    if (sp.grouping) throw std::invalid_argument(std::string("Cannot specify '") + sp.grouping + "' with 's'.");
+        throw ValueError(std::string("Unknown format code '") + sp.type + "' for object of type 'str'");
+    if (sp.sign_given) throw ValueError("Sign not allowed in string format specifier");
+    if (sp.z) throw ValueError("Negative zero coercion (z) not allowed in string format specifier");
+    if (sp.alt) throw ValueError("Alternate form (#) not allowed in string format specifier");
+    if (sp.grouping) throw ValueError(std::string("Cannot specify '") + sp.grouping + "' with 's'.");
     if (sp.align == '=') {
-        if (!sp.zero_pad) throw std::invalid_argument("'=' alignment not allowed in string format specifier");
+        if (!sp.zero_pad) throw ValueError("'=' alignment not allowed in string format specifier");
         sp.align = '<';  // "05" pads a string with zeros on the right
     }
     std::string body = s;
@@ -584,7 +585,7 @@ template <class T>
 std::string format(const std::optional<T>& x, const std::string& spec) {
     if (x) return format(*x, spec);
     if (spec.empty()) return "None";
-    throw type_error("unsupported format string passed to NoneType.__format__");
+    throw TypeError("unsupported format string passed to NoneType.__format__");
 }
 
 inline std::string format(double x, const std::string& spec, bool as_int) {  // see str(x, as_int)
@@ -816,6 +817,131 @@ template <class A, class>
 std::string str(const A& a) { return array_str_or_repr(a, false); }
 template <class A, class, class>
 std::string repr(const A& a) { return array_str_or_repr(a, true); }
+
+// the pieces of a line of text, worked out in order (a braced list's elements are, left to right)
+inline std::string concat_text(std::initializer_list<std::string> parts) {
+    std::string out;
+    for (const std::string& p : parts) out += p;
+    return out;
+}
+
+// --- Python's float errors, where Python raises them ----------------------------------------------
+// A C++ double carries on where a Python float raises: 1.0 / 0.0 is inf, math.sqrt(-1) NaN,
+// math.exp(1000) inf. Inside code whose errors a Python `except` may catch (ZeroDivisionError,
+// ArithmeticError, OverflowError, ValueError, Exception), the translation uses these instead:
+// they raise what CPython raises, with this Python's message (qtrans_python.hpp), and otherwise
+// return the very same double. (NumPy's numbers don't raise, so they are never used for those.)
+namespace pyerr {
+inline std::string domain_text(const msg::DomainText* t, double x, bool from_int) {
+    const int cls = x == 0 ? 1 : x == -qt::inf ? 2 : x == qt::inf ? 3 : 0;
+    const msg::DomainText& d = t[cls];
+    std::string out = d.prefix;
+    if (d.has_value) out += d.as_int && from_int ? std::to_string(static_cast<long long>(x)) : repr(x);
+    return out + d.suffix;
+}
+// CPython's math_1: NaN from a non-NaN argument is a domain error; an infinity from a finite one
+// is an overflow where the function can overflow, else a domain error (log(0.0), atanh(1.0))
+template <class F>
+double math1(F f, double x, const msg::DomainText* text, bool can_overflow, bool from_int) {
+    const double r = f(x);
+    if (std::isnan(r) && !std::isnan(x)) throw ValueError(domain_text(text, x, from_int));
+    if (std::isinf(r) && std::isfinite(x)) {
+        if (can_overflow) throw OverflowError(msg::math_range);
+        throw ValueError(domain_text(text, x, from_int));
+    }
+    return r;
+}
+// gamma and lgamma are CPython's own: a domain error at 0, -1, -2, ... (and -inf for gamma)
+template <class F>
+double gamma_like(F f, double x, const msg::DomainText* text, bool is_gamma, bool from_int) {
+    if ((x <= 0 && std::isfinite(x) && x == std::floor(x)) || (is_gamma && x == -qt::inf))
+        throw ValueError(domain_text(text, x, from_int));
+    const double r = f(x);
+    if (std::isinf(r) && std::isfinite(x)) throw OverflowError(msg::math_range);
+    return r;
+}
+}  // namespace pyerr
+
+#define QT_PY_MATH(name, call, ovf)                                                                  \
+    inline double math_##name(double x) {                                                           \
+        return pyerr::math1([](double v) { return call(v); }, x, msg::name##_float, ovf, false);     \
+    }                                                                                               \
+    inline double math_##name(long long x) {                                                        \
+        return pyerr::math1([](double v) { return call(v); }, static_cast<double>(x), msg::name##_int, ovf, true); \
+    }
+QT_PY_MATH(sqrt, std::sqrt, false)
+QT_PY_MATH(exp, std::exp, true)
+QT_PY_MATH(log, std::log, false)
+QT_PY_MATH(log10, std::log10, false)
+QT_PY_MATH(log2, std::log2, false)
+QT_PY_MATH(log1p, std::log1p, false)
+QT_PY_MATH(expm1, std::expm1, true)
+QT_PY_MATH(sin, std::sin, false)
+QT_PY_MATH(cos, std::cos, false)
+QT_PY_MATH(tan, std::tan, false)
+QT_PY_MATH(asin, std::asin, false)
+QT_PY_MATH(acos, std::acos, false)
+QT_PY_MATH(atan, std::atan, false)
+QT_PY_MATH(sinh, std::sinh, true)
+QT_PY_MATH(cosh, std::cosh, true)
+QT_PY_MATH(tanh, std::tanh, false)
+QT_PY_MATH(asinh, std::asinh, false)
+QT_PY_MATH(acosh, std::acosh, false)
+QT_PY_MATH(atanh, std::atanh, false)
+QT_PY_MATH(erf, std::erf, false)
+QT_PY_MATH(erfc, std::erfc, false)
+QT_PY_MATH(cbrt, std::cbrt, false)
+QT_PY_MATH(exp2, std::exp2, true)
+QT_PY_MATH(fabs, std::fabs, false)
+#undef QT_PY_MATH
+inline double math_gamma(double x) { return pyerr::gamma_like([](double v) { return std::tgamma(v); }, x, msg::gamma_float, true, false); }
+inline double math_gamma(long long x) {
+    return pyerr::gamma_like([](double v) { return std::tgamma(v); }, static_cast<double>(x), msg::gamma_int, true, true);
+}
+inline double math_lgamma(double x) { return pyerr::gamma_like([](double v) { return std::lgamma(v); }, x, msg::lgamma_float, false, false); }
+inline double math_lgamma(long long x) {
+    return pyerr::gamma_like([](double v) { return std::lgamma(v); }, static_cast<double>(x), msg::lgamma_int, false, true);
+}
+
+// math.pow(x, y): CPython's rules (errors only for finite x and y)
+inline double math_pow(double x, double y) {
+    if (msg::math_pow_zero_to_minus_inf_raises && x == 0.0 && y == -qt::inf) throw ValueError(msg::math_domain_pow);
+    const double r = std::pow(x, y);
+    if (std::isfinite(x) && std::isfinite(y)) {
+        if (std::isnan(r)) throw ValueError(msg::math_domain_pow);
+        if (std::isinf(r)) {
+            if (x == 0.0) throw ValueError(msg::math_domain_pow);
+            throw OverflowError(msg::math_range);
+        }
+    }
+    return r;
+}
+// math.fmod(x, y)
+inline double math_fmod(double x, double y) {
+    if (std::isinf(y) && std::isfinite(x)) return x;
+    const double r = std::fmod(x, y);
+    if (std::isnan(r) && !std::isnan(x) && !std::isnan(y)) throw ValueError(msg::math_domain_fmod);
+    return r;
+}
+// a / b of two Python numbers: ZeroDivisionError for b == 0 (ints and floats have their own words)
+inline double truediv(double a, double b) {
+    if (b == 0.0) throw ZeroDivisionError(msg::float_truediv_zero);
+    return a / b;
+}
+inline double truediv(long long a, long long b) {
+    if (b == 0) throw ZeroDivisionError(msg::int_truediv_zero);
+    return static_cast<double>(a) / static_cast<double>(b);
+}
+// x ** y of Python floats (CPython's float_pow): 0.0 ** negative raises ZeroDivisionError, an
+// overflow OverflowError; a negative x to a fractional power is complex in Python (NaN here)
+inline double power(double x, double y, bool ints = false) {
+    if (y == 0.0) return 1.0;
+    if (std::isfinite(y) && x == 0.0 && y < 0.0)
+        throw ZeroDivisionError(ints ? msg::int_zero_negative_power : msg::zero_negative_power);
+    const double r = std::pow(x, y);
+    if (std::isinf(r) && std::isfinite(x) && std::isfinite(y)) throw OverflowError(msg::float_pow_overflow);
+    return r;
+}
 
 // --- text on a Windows console -----------------------------------------------------------------
 // Python writes to a Windows console window as characters (WriteConsoleW), so print() of Greek

@@ -204,6 +204,24 @@ class OptionalType:
 BOOL = Scalar("bool")
 INT = Scalar("int")
 FLOAT = Scalar("float")
+class ExcType:
+    """The exception an `except ... as e:` caught: str(e) is its message."""
+    def __init__(self, py_name: str):
+        self.py_name = py_name
+
+    def __eq__(self, other):
+        return isinstance(other, ExcType)
+
+    def __hash__(self):
+        return hash("ExcType")
+
+    def __str__(self):
+        return self.py_name
+
+    def cpp(self):
+        return "const qt::Exception&"
+
+
 VOID = VoidType()
 VEC = ArrayType(1)
 MAT = ArrayType(2)

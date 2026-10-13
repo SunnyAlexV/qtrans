@@ -11,7 +11,81 @@
 #include <optional>
 #include <stdexcept>
 
+#include <exception>
+#include <string>
+#include <utility>
+
+#include "qtrans_python.hpp"  // this Python's error messages (written from it by qtrans.pyfacts)
+
 namespace qt {
+
+// ---------------------------------------------------------------------------------
+// Python's exceptions, as a C++ family with Python's shape, so that a C++ catch takes exactly
+// what Python's except takes: catch (const qt::LookupError&) gets IndexError and KeyError,
+// catch (const qt::ValueError&) gets LinAlgError and your own class PricingError(ValueError),
+// and catch (const qt::Exception&) gets them all. (The standard library's own types are
+// shaped otherwise: there ValueError, IndexError, ZeroDivisionError and AssertionError would
+// all be logic_errors.) What the C++ raises where Python wouldn't (a long long overflowing,
+// something qtrans can't reproduce) is not a qt::Exception, so no Python handler takes it.
+// str(e) is what(); type_name() is the Python class's name.
+// ---------------------------------------------------------------------------------
+class Exception : public std::exception {
+  public:
+    explicit Exception(std::string message = "") : message_(std::move(message)) {}
+    const char* what() const noexcept override { return message_.c_str(); }
+    virtual const char* type_name() const noexcept { return "Exception"; }
+    virtual const char* builtin_name() const noexcept { return "Exception"; }  // the nearest built-in class
+
+  private:
+    std::string message_;
+};
+
+#define QT_PY_EXCEPTION(Name, Base)                                                      \
+    struct Name : Base {                                                                 \
+        using Base::Base;                                                                \
+        const char* type_name() const noexcept override { return #Name; }                \
+        const char* builtin_name() const noexcept override { return #Name; }             \
+    };
+QT_PY_EXCEPTION(ArithmeticError, Exception)
+QT_PY_EXCEPTION(ZeroDivisionError, ArithmeticError)
+QT_PY_EXCEPTION(OverflowError, ArithmeticError)
+QT_PY_EXCEPTION(FloatingPointError, ArithmeticError)
+QT_PY_EXCEPTION(AssertionError, Exception)
+QT_PY_EXCEPTION(LookupError, Exception)
+QT_PY_EXCEPTION(IndexError, LookupError)
+QT_PY_EXCEPTION(KeyError, LookupError)  // str(e) is repr(key), as Python's
+QT_PY_EXCEPTION(RuntimeError, Exception)
+QT_PY_EXCEPTION(NotImplementedError, RuntimeError)
+QT_PY_EXCEPTION(TypeError, Exception)
+QT_PY_EXCEPTION(ValueError, Exception)
+#undef QT_PY_EXCEPTION
+
+// your own exception class (class PricingError(ValueError): pass) is one line of the same kind
+#define QT_USER_EXCEPTION(Name, Base)                                                    \
+    struct Name : Base {                                                                 \
+        using Base::Base;                                                                \
+        const char* type_name() const noexcept override { return #Name; }                \
+    };
+
+using type_error = TypeError;  // earlier names, kept
+
+// try ... finally: the finally block as a function, run on every way out of the try (the end,
+// a return, a break, an exception), and only once; if it raises, its exception is the one that
+// goes on, as in Python.
+template <class F>
+class finally_block {
+  public:
+    explicit finally_block(F f) : f_(std::move(f)) {}
+    void run() {
+        if (done_) return;
+        done_ = true;
+        f_();
+    }
+
+  private:
+    F f_;
+    bool done_ = false;
+};
 
 inline constexpr double pi = 3.141592653589793;
 inline constexpr double e = 2.718281828459045;
@@ -24,10 +98,6 @@ inline constexpr double nan = std::numeric_limits<double>::quiet_NaN();
 // (arithmetic, a comparison, int(x), passing it on as a float), None raises TypeError;
 // qt::value checks the same way. Truthiness: None is false, otherwise the value's own.
 // ---------------------------------------------------------------------------------
-struct type_error : std::runtime_error {  // Python: TypeError
-    using std::runtime_error::runtime_error;
-};
-
 template <class T>
 const T& value(const std::optional<T>& x) {
     if (!x) throw type_error("'NoneType' used where a value is needed");
@@ -43,7 +113,7 @@ bool truthy(const std::optional<T>& x) {
 // Integer // and %.  Python rounds the quotient toward -infinity and gives the
 // remainder the sign of the divisor:  -7 // 2 == -4,  -7 % 2 == 1.
 // C++ truncates toward zero:          -7 / 2  == -3,  -7 % 2 == -1.
-// Division by zero raises ZeroDivisionError in Python; std::domain_error here.
+// Division by zero raises ZeroDivisionError, with this Python's message.
 // ---------------------------------------------------------------------------------
 // ---------------------------------------------------------------------------------
 // int arithmetic that could leave 64 bits. Python ints are unbounded; a long long is not,
@@ -109,7 +179,7 @@ inline long long iabs(long long a) {
 }
 
 inline long long floordiv(long long a, long long b) {
-    if (b == 0) throw std::domain_error("integer division or modulo by zero");
+    if (b == 0) throw ZeroDivisionError(msg::int_floordiv_zero);
     if (a == LLONG_MIN && b == -1) throw int_overflow();  // -(-2**63) is 2**63
     long long q = a / b;
     long long r = a % b;
@@ -118,7 +188,7 @@ inline long long floordiv(long long a, long long b) {
 }
 
 inline long long mod(long long a, long long b) {
-    if (b == 0) throw std::domain_error("integer division or modulo by zero");
+    if (b == 0) throw ZeroDivisionError(msg::int_mod_zero);
     if (b == -1) return 0;  // LLONG_MIN % -1 is undefined in C++; Python gives 0
     long long r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) r += b;
@@ -132,7 +202,7 @@ inline long long mod(long long a, long long b) {
 // is 10.0 because the division rounds up to exactly 10.
 // ---------------------------------------------------------------------------------
 inline double mod(double vx, double wx) {
-    if (wx == 0.0) throw std::domain_error("float modulo");
+    if (wx == 0.0) throw ZeroDivisionError(msg::float_mod_zero);
     double m = std::fmod(vx, wx);
     if (m != 0.0) {
         if ((wx < 0) != (m < 0)) m += wx;
@@ -143,7 +213,7 @@ inline double mod(double vx, double wx) {
 }
 
 inline double floordiv(double vx, double wx) {
-    if (wx == 0.0) throw std::domain_error("float floor division by zero");
+    if (wx == 0.0) throw ZeroDivisionError(msg::float_floordiv_zero);
     double m = std::fmod(vx, wx);
     double div = (vx - m) / wx;
     if (m != 0.0) {
@@ -167,8 +237,8 @@ inline double floordiv(double vx, double wx) {
 // returning garbage. The argument is already integral (floored, rounded or truncated).
 // ---------------------------------------------------------------------------------
 inline long long to_int(double x) {
-    if (std::isnan(x)) throw std::invalid_argument("cannot convert float NaN to integer");
-    if (std::isinf(x)) throw std::overflow_error("cannot convert float infinity to integer");  // as Python
+    if (std::isnan(x)) throw ValueError(msg::int_of_nan);
+    if (std::isinf(x)) throw OverflowError(msg::int_of_inf);
     if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0))
         throw int_overflow();  // Python returns a big int
     return static_cast<long long>(x);

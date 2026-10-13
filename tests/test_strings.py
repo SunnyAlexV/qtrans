@@ -11,7 +11,7 @@ import unicodedata
 import pytest
 
 from qtrans import unicode_tables
-from qtrans.translator import LIST_HEADER, PRINT_HEADER, RUNTIME_HEADER, UNICODE_HEADER, translate_source
+from qtrans.translator import LIST_HEADER, PRINT_HEADER, PYTHON_HEADER, RUNTIME_HEADER, UNICODE_HEADER, translate_source
 from qtrans.verify import verify_file
 from tests.test_semantics import HAVE_CXX
 
@@ -115,7 +115,7 @@ print()
 
 @pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
 def test_every_code_point_agrees_with_python(tmp_path):
-    for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+    for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
         shutil.copy(h, tmp_path / h.name)
     (tmp_path / "all.cpp").write_text(encoding="utf-8", data=textwrap.dedent("""
         #include "qtrans_list.hpp"
@@ -125,10 +125,10 @@ def test_every_code_point_agrees_with_python(tmp_path):
         #include <io.h>
         #endif
         static std::string F(const std::string& s) {
-            try { return qt::py::repr(qt::py::parse_float(s)); } catch (const std::invalid_argument& e) { return e.what(); }
+            try { return qt::py::repr(qt::py::parse_float(s)); } catch (const qt::ValueError& e) { return e.what(); }
         }
         static std::string I(const std::string& s) {
-            try { return std::to_string(qt::py::parse_int(s)); } catch (const std::invalid_argument& e) { return e.what(); }
+            try { return std::to_string(qt::py::parse_int(s)); } catch (const qt::ValueError& e) { return e.what(); }
         }
         int main() {
         #ifdef _WIN32
@@ -251,7 +251,7 @@ def test_string_refusals(src, words):
 def test_utf8_to_utf16_for_every_code_point(tmp_path):
     """What qt::py::windows_console hands the Windows console (UTF-16), for every character,
     against Python's own encoder; a character cut off at the end of the bytes waits."""
-    for h in (RUNTIME_HEADER, PRINT_HEADER, UNICODE_HEADER):
+    for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, UNICODE_HEADER):
         shutil.copy(h, tmp_path / h.name)
     (tmp_path / "u16.cpp").write_text(encoding="utf-8", data=textwrap.dedent("""
         #include "qtrans_print.hpp"

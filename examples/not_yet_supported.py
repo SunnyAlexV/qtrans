@@ -17,11 +17,11 @@ def portfolio_value(weights: np.ndarray, prices: np.ndarray) -> float:  # arrays
     return float(weights @ prices)
 
 
-def safe_log(x: float) -> float:
-    try:
-        return math.log(x)
-    except ValueError:
-        return -math.inf
+def running_totals(xs: list[float]):
+    total = 0.0
+    for x in xs:
+        total += x
+        yield total  # generators
 
 
 def lookup(x: float) -> float:

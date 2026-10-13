@@ -181,6 +181,6 @@ def test_self_referencing_updates_read_old_values(report):
 def test_linalg_errors_match(report):
     singular = next(c for c in fn(report, "solve").cases if c.source == "given" and c.args[0].shape == (3, 3)
                     and np.all(c.args[0] == 1.0))
-    assert singular.py[1] == "ValueError" and singular.cpp[1] == "ValueError"  # LinAlgError
+    assert singular.py[1] == "LinAlgError" and singular.cpp[1] == "LinAlgError"  # its own class now, a ValueError
     not_pd = [c for c in fn(report, "factor").cases if c.source == "given"][1]
-    assert not_pd.py[1] == "ValueError" and not_pd.cpp[1] == "ValueError"
+    assert not_pd.py[1] == "LinAlgError" and not_pd.cpp[1] == "LinAlgError"

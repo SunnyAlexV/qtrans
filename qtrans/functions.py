@@ -136,7 +136,8 @@ def _contains_break(stmts) -> bool:
             return True
         if isinstance(s, ast.If) and (_contains_break(s.body) or _contains_break(s.orelse)):
             return True
-        if isinstance(s, ast.Try) and (_contains_break(s.body) or any(_contains_break(h.body) for h in s.handlers)):
+        if isinstance(s, ast.Try) and (_contains_break(s.body) or any(_contains_break(h.body) for h in s.handlers)
+                                       or _contains_break(s.orelse) or _contains_break(s.finalbody)):
             return True
     return False
 
@@ -163,7 +164,8 @@ def always_returns(stmts) -> bool:
             return True
         if isinstance(s, ast.If) and always_returns(s.body) and always_returns(s.orelse):
             return True
-        if isinstance(s, ast.Try) and always_returns(s.body) and all(always_returns(h.body) for h in s.handlers):
+        if isinstance(s, ast.Try) and ((always_returns(s.body + s.orelse) and all(always_returns(h.body) for h in s.handlers))
+                                       or always_returns(s.finalbody)):
             return True
         if isinstance(s, ast.While) and isinstance(s.test, ast.Constant) and s.test.value is True \
                 and not _contains_break(s.body):
@@ -172,16 +174,24 @@ def always_returns(stmts) -> bool:
 
 
 def _try_state(s, A, block):
-    """Variables certainly assigned after `try: body except ...: handler`. The handler may start
-    after any statement of the body, so it can rely only on what was assigned before the try."""
+    """Variables certainly assigned after `try: body except ...: handler else: ... finally: ...`.
+    A handler may start after any statement of the body, so it can rely only on what was
+    assigned before the try; the else follows the whole body; the finally runs on every way out,
+    an exception included, so it too can rely only on what came before the try."""
     a = block(s.body, set(A))
+    if a is not None and s.orelse:
+        a = block(s.orelse, a)
     outs = [a] + [block(h.body, set(A)) for h in s.handlers]
+    if s.finalbody:
+        block(s.finalbody, set(A))  # its reads, on the exception's path
     done = [o for o in outs if o is not None]
     if not done:
         return None
     out = set(done[0])
     for o in done[1:]:
         out &= o
+    if s.finalbody:
+        out = block(s.finalbody, out)
     return out
 
 
@@ -298,6 +308,13 @@ class FunctionTranslator(ExprTranslator):
         self.inline_at: dict = {}
         self._locals_cache: set = set()
         self.all_names = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)} | set(self.params)
+        key = next((k for k, f in mod.fdefs.items() if f is fdef), fdef.name)
+        # inside a try whose handler may catch a float error: Python's float errors raised as Python
+        self.strict = key in getattr(mod, "strict", ())
+        self.exc_vars: list = []        # (name in Python, C++ name) of the handlers we're inside
+        self.finally_stack: list = []   # (C++ name, loop depth) of the try ... finally blocks we're inside
+        self._active_finally_bodies: list = []  # their Python statements
+        self.loop_depth = 0
         self.owner = mod.classes.get(sig.owner) if sig.owner else None
         self.py_names = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)} | {a.arg for a in fdef.args.args}
         self.has_self = sig.kind in ("instance", "property", "post_init", "init")
@@ -753,6 +770,8 @@ class FunctionTranslator(ExprTranslator):
                 self.scan(s.body)
                 for h in s.handlers:
                     self.scan(h.body)
+                self.scan(s.orelse)
+                self.scan(s.finalbody)
             elif isinstance(s, ast.Assign):
                 for t in s.targets:
                     self._scan_target(t, s.value, s)
@@ -781,27 +800,24 @@ class FunctionTranslator(ExprTranslator):
                 self._add_event(s.target.id, "expr", b, s)
 
     # --- try / except -------------------------------------------------------------------------
-    def _handler_class(self, h):
-        """The C++ exception class an `except` clause catches, or Unsupported."""
+    def _handler_classes(self, h):
+        """[(C++ class, Python name)] an `except` clause catches (several for a tuple), or Unsupported."""
         if h.type is None:
-            raise Unsupported(h, "a bare `except:` catches everything, including errors Python raises "
-                                 "where C++ carries on with inf/NaN", "catch the specific error, e.g. "
-                                 "except np.linalg.LinAlgError:")
-        if h.name is not None and any(isinstance(n, ast.Name) and n.id == h.name for b in h.body for n in ast.walk(b)):
-            raise Unsupported(h, f"using the caught exception ('{h.name}') is not supported")
-        q = self.qualify(h.type) or (h.type.id if isinstance(h.type, ast.Name) else None)
-        if q in ("numpy.linalg.LinAlgError", "numpy.linalg.linalg.LinAlgError", "numpy.linalg.exceptions.LinAlgError"):
-            return "qt::linalg_error"
-        if q == "ValueError":
-            return "std::invalid_argument"
-        why = {"ZeroDivisionError": "x / 0.0 raises it in Python but gives inf in C++",
-               "ArithmeticError": "x / 0.0 and float overflow raise it in Python but give inf in C++",
-               "OverflowError": "float overflow raises it in Python but gives inf in C++",
-               "FloatingPointError": "NumPy raises it only under np.seterr; C++ never does",
-               "Exception": "it includes errors Python raises where C++ carries on with inf/NaN"}
-        src = ast.unparse(h.type)
-        raise Unsupported(h, f"catching {src} is not supported" + (f": {why[src]}" if src in why else ""),
-                          "supported: except np.linalg.LinAlgError, except ValueError")
+            raise Unsupported(h, "a bare `except:` also catches KeyboardInterrupt and SystemExit",
+                              "catch what you mean: except Exception: (or a narrower class)")
+        out = []
+        for t in (h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]):
+            named = self.mod._exception_named(t)
+            if named is None:
+                src = ast.unparse(t)
+                if src == "BaseException":
+                    raise Unsupported(h, "except BaseException also catches KeyboardInterrupt and SystemExit",
+                                      "except Exception:")
+                raise Unsupported(h, f"catching {src} is not supported",
+                                  "catch a built-in class (ValueError, KeyError, ZeroDivisionError, ...), "
+                                  "np.linalg.LinAlgError, or one of your own exception classes")
+            out.append(named)
+        return out
 
     def _uses_math_domain(self, stmts, seen=None) -> bool:
         """Does running `stmts` (or a function it calls) use a math-module function that raises
@@ -821,19 +837,25 @@ class FunctionTranslator(ExprTranslator):
         return False
 
     def check_try(self, s):
-        if s.finalbody:
-            raise Unsupported(s, "try ... finally is not supported")
-        if s.orelse:
-            raise Unsupported(s, "try ... else is not supported", "move the else-block after the try statement")
         for h in s.handlers:
-            if isinstance(h.type, ast.Tuple):
-                raise Unsupported(h, "catching several exception types in one clause is not supported",
-                                  "write one except clause per type")
-            cls = self._handler_class(h)
-            if cls == "std::invalid_argument" and self._uses_math_domain(s.body):
-                raise Unsupported(h, "except ValueError around math.sqrt / math.log / ...: Python raises "
-                                     "ValueError outside their domain, C++ returns NaN, so the handler would "
-                                     "run in Python but not in C++", "test the argument before the call instead")
+            classes = self._handler_classes(h)
+            if any(py in lib.FLOAT_ERRORS for _, py in classes):
+                why = getattr(self.mod, "strict_blockers", {}).get(id(s))
+                if why:
+                    raise Unsupported(h, f"except {ast.unparse(h.type)}: {why}")
+            if h.name is not None:
+                for n in (m for b in h.body for m in ast.walk(b)):
+                    if isinstance(n, ast.Name) and n.id == h.name and isinstance(n.ctx, ast.Store):
+                        raise Unsupported(n, f"assigning to '{h.name}', the caught exception, is not supported")
+        if s.finalbody:
+            for n in (m for b in s.finalbody for m in ast.walk(b)):
+                if isinstance(n, (ast.Return, ast.Yield)):
+                    raise Unsupported(n, "a return inside `finally:` is not supported: Python then drops the "
+                                         "exception that was on its way", "return after the try statement")
+            if _contains_break_of(s.finalbody) or any(isinstance(n, ast.Continue) for b in s.finalbody
+                                                       for n in ast.walk(b)):
+                raise Unsupported(s, "break / continue inside `finally:` is not supported: Python then drops the "
+                                     "exception that was on its way")
 
     def _scan_target(self, t, value, stmt):
         if isinstance(t, ast.Name) and t.id == "self" and self.has_self:
@@ -1369,9 +1391,24 @@ class FunctionTranslator(ExprTranslator):
                                              "`g2 = g` would share one stream in Python but copy it in C++",
                                           "pass the generator itself to the functions that need it")
                 for block in (getattr(s, "body", []), getattr(s, "orelse", []),
-                              *[h.body for h in getattr(s, "handlers", [])]):
+                              *[h.body for h in getattr(s, "handlers", [])], getattr(s, "finalbody", [])):
                     visit(block)
         visit(self.body)
+
+    @staticmethod
+    def _print_pieces(s):
+        """The values of a print(...) statement, an f-string's fields each on its own: the line is
+        worked out piece by piece, left to right, as Python does (printing.join_code)."""
+        if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Name)
+                and s.value.func.id == "print"):
+            return []
+        out = []
+        for a in s.value.args:
+            if isinstance(a, ast.JoinedStr):
+                out += [v.value for v in a.values if isinstance(v, ast.FormattedValue)]
+            else:
+                out.append(a)
+        return out
 
     def _check_order(self, s, types):
         if isinstance(s, (ast.Assign, ast.AnnAssign)):
@@ -1391,7 +1428,13 @@ class FunctionTranslator(ExprTranslator):
                         effects.append((n, roots, draw))
         def nested(a, b):  # one call inside the other's arguments: the inner one runs first, in both
             return any(x is b for x in ast.walk(a)) or any(x is a for x in ast.walk(b))
-        if len(effects) > 1 and not all(nested(effects[i][0], effects[j][0])
+        pieces = self._print_pieces(s)
+
+        def apart(a, b):  # in two different values of a print() line: worked out left to right (printing.py)
+            pa = next((k for k, p in enumerate(pieces) if any(x is a for x in ast.walk(p))), None)
+            pb = next((k for k, p in enumerate(pieces) if any(x is b for x in ast.walk(p))), None)
+            return pa is not None and pb is not None and pa != pb
+        if len(effects) > 1 and not all(nested(effects[i][0], effects[j][0]) or apart(effects[i][0], effects[j][0])
                                         for i in range(len(effects)) for j in range(i + 1, len(effects))):
             if all(d for _, _, d in effects):
                 raise Unsupported(s, "two random draws in one statement: C++ doesn't fix which is "
@@ -1514,6 +1557,10 @@ class FunctionTranslator(ExprTranslator):
             visit(s.body, stack)
             for h in s.handlers:
                 visit(h.body, stack)
+            if s.orelse:
+                visit(s.orelse, stack)
+            if s.finalbody:
+                visit(s.finalbody, stack)
 
     def _assigned_before_every_read(self, stmts, var) -> bool:
         """True if, running `stmts` from the top, `var` is always assigned before it is read.
@@ -1788,9 +1835,11 @@ class FunctionTranslator(ExprTranslator):
         flags = getattr(self, "loop_flags", [])
         if flags and flags[-1]:
             self.emit(f"{flags[-1]} = true;")
+        self._run_finally(through_loops=False)
         self.emit("break;")
 
     def s_Continue(self, s):
+        self._run_finally(through_loops=False)
         self.emit("continue;")
 
     def s_Expr(self, s):
@@ -2228,20 +2277,103 @@ class FunctionTranslator(ExprTranslator):
             self._block(orelse)
         self.emit("}")
 
+    def _fresh(self, base):
+        name = base
+        while name in self.all_names:
+            name += "_"
+        self.all_names.add(name)
+        return name
+
     def s_Try(self, s):
-        """try / except LinAlgError (or ValueError): a C++ try / catch. Variables assigned in the
-        try block are declared before it, so a handler and the code after see them as Python does;
-        statements that ran before the error keep their effect in both."""
-        self.emit("try {")
-        self._block(s.body)
-        for h in s.handlers:
-            self.current = h
-            self.flush_comments(h.lineno)
-            self.comment_floor = h.lineno
-            self.cur_src = (h.lineno, h.lineno)
-            self.emit(f"}} catch (const {self._handler_class(h)}&) {{  // except {ast.unparse(h.type)}")
-            self._block(h.body)
-        self.emit("}")
+        """try / except / else / finally as C++'s try / catch, with Python's meaning:
+        - a handler takes the class it names and the classes deriving from it (the C++ classes
+          have Python's family, qtrans_runtime.hpp); several classes, one catch each;
+        - `as e`: the caught exception, for str(e) / print(e) / f"{e}" and a bare `raise`;
+        - else: runs when the try block ended without an exception (a flag says so);
+        - finally: a qt::finally_block, run on every way out (the end, return, break, continue,
+          an exception, which then goes on).
+        Variables assigned in the try block are declared before it, so a handler and the code
+        after see them as Python does."""
+        fin = None
+        if s.finalbody:
+            fin = self._fresh("finally_")
+            ln = self._keyword_line(s.handlers[-1].body[-1].end_lineno if s.handlers else
+                                    (s.orelse or s.body)[-1].end_lineno, s.finalbody[0].lineno, "finally")
+            self.cur_src = (ln, ln) if ln else self.cur_src
+            self.emit(f"qt::finally_block {fin}([&] {{  // finally: runs once, however the try is left")
+            saved_stack = self.finally_stack
+            self.finally_stack = []  # (a return inside it is refused; its own body runs plainly)
+            try:
+                self._block(s.finalbody)
+            finally:
+                self.finally_stack = saved_stack
+            self.emit("});")
+            self.cur_src = (s.lineno, s.lineno)
+            self.emit("try {")
+            self.depth += 1
+            self.finally_stack.append((fin, self.loop_depth))
+            self._active_finally_bodies.append(s.finalbody)
+        try:
+            if s.handlers:
+                # an else needs a flag only if a handler can fall through to the code after the try
+                ok = self._fresh("completed") if s.orelse and not all(always_returns(h.body) for h in s.handlers) \
+                    else None
+                if ok:
+                    self.emit(f"bool {ok} = false;  // the try block ran to its end: its else runs")
+                self.emit("try {")
+                self._block(s.body)
+                if ok:
+                    self.depth += 1
+                    self.emit(f"{ok} = true;")
+                    self.depth -= 1
+                for h in s.handlers:
+                    self.current = h
+                    self.flush_comments(h.lineno)
+                    self.comment_floor = h.lineno
+                    self.cur_src = (h.lineno, h.lineno)
+                    for cpp, py in self._handler_classes(h):
+                        var = ""
+                        if h.name is not None:  # each catch has its own scope: the Python name, unless a local has it
+                            clash = h.name in self.params or any(ev.name == h.name for ev in self.events)
+                            var = " " + (self._fresh(cpp_ident(h.name)) if clash else cpp_ident(h.name))
+                        self.emit(f"}} catch (const {cpp}&{var}) {{  // except {py}" + (f" as {h.name}" if h.name else ""))
+                        self.exc_vars.append((h.name, var.strip()) if h.name else (None, None))
+                        try:
+                            self._block(h.body)
+                        finally:
+                            self.exc_vars.pop()
+                self.emit("}")
+                if s.orelse:
+                    ln = self._keyword_line(s.handlers[-1].body[-1].end_lineno, s.orelse[0].lineno, "else")
+                    self.cur_src = (ln, ln) if ln else self.cur_src
+                    if ok:
+                        self.emit(f"if ({ok}) {{  // else: no exception in the try block")
+                        self._block(s.orelse)
+                        self.emit("}")
+                    else:  # every handler returns or raises: reaching here means no exception
+                        self.emit("// else: no exception in the try block (every handler above leaves)")
+                        self.emit_block(s.orelse)
+            else:
+                self.emit_block(s.body)
+        finally:
+            if fin:
+                self.finally_stack.pop()
+                self._active_finally_bodies.pop()
+                self.depth -= 1
+        if fin:
+            self.emit("} catch (...) {")
+            self.depth += 1
+            self.emit(f"{fin}.run();  // then the exception goes on")
+            self.emit("throw;")
+            self.depth -= 1
+            self.emit("}")
+            self.emit(f"{fin}.run();")
+
+    def _run_finally(self, through_loops: bool):
+        """Before a return (through_loops) or a break / continue: the finally blocks being left."""
+        for name, depth in reversed(self.finally_stack):
+            if through_loops or depth == self.loop_depth:
+                self.emit(f"{name}.run();")
 
     def _unroll(self, s):
         n = self.mod.hints.get(s.lineno, {}).get("unroll")
@@ -2278,7 +2410,11 @@ class FunctionTranslator(ExprTranslator):
                     self.emit_stmt(b)
 
     def s_While(self, s):
-        self._with_else(s, self._s_while)
+        self.loop_depth += 1
+        try:
+            self._with_else(s, self._s_while)
+        finally:
+            self.loop_depth -= 1
 
     def _s_while(self, s):
         self._unroll(s)
@@ -2288,7 +2424,11 @@ class FunctionTranslator(ExprTranslator):
         self.emit("}")
 
     def s_For(self, s):
-        self._with_else(s, self._s_for)
+        self.loop_depth += 1
+        try:
+            self._with_else(s, self._s_for)
+        finally:
+            self.loop_depth -= 1
 
     def _s_for(self, s):
         self._unroll(s)
@@ -2408,6 +2548,44 @@ class FunctionTranslator(ExprTranslator):
                                   f"loop over a copy of the keys: for k in list({name})")
 
     def s_Return(self, s):
+        if not self.finally_stack:
+            return self._s_return(s)
+        # inside try ... finally: the value first, then the finally blocks, then the return (Python's order)
+        start = len(self.lines)
+        self._s_return(s)
+        ret_line = _MARK_RE.sub("", self.lines.pop())
+        expr = ret_line.strip()[len("return"):].rstrip(";").strip()
+        pre = self.lines[start:]
+        del self.lines[start:]
+        self.lines += pre
+        if expr and self._unchanged_by_finally(expr):  # a constant, or a local the finally can't touch
+            self._run_finally(through_loops=True)
+            self.emit(f"return {expr};")
+        elif expr:
+            if not hasattr(self, "_result_name"):  # each return is in its own scope: one name will do
+                self._result_name = self._fresh("result")
+            name = self._result_name
+            cpp = self.sig.ret.cpp()
+            self.emit(f"{cpp} {name}" + (expr if expr.startswith("{") else f" = {expr}") + ";  // the value before the finally")
+            self._run_finally(through_loops=True)
+            self.emit(f"return {name};")
+        else:
+            self._run_finally(through_loops=True)
+            self.emit("return;")
+
+    def _unchanged_by_finally(self, expr: str) -> bool:
+        if re.fullmatch(r"-?[\d.]+(e[-+]?\d+)?(LL)?|true|false|qt::(nan|inf)|-qt::inf|std::nullopt|\"([^\"\\\\]|\\\\.)*\"", expr):
+            return True
+        if not re.fullmatch(r"[A-Za-z_]\w*", expr):
+            return False
+        fins = [n for n in self._active_finally_bodies]
+        for body in fins:  # a local the finally blocks neither name nor could reach through a call
+            for n in (m for b in body for m in ast.walk(b)):
+                if isinstance(n, ast.Call) or (isinstance(n, ast.Name) and cpp_ident(n.id) == expr):
+                    return False
+        return True
+
+    def _s_return(self, s):
         ret = self.sig.ret
         none = s.value is None or (isinstance(s.value, ast.Constant) and s.value.value is None)
         if none and ret == VOID:
@@ -2443,35 +2621,58 @@ class FunctionTranslator(ExprTranslator):
         code = self.as_double(e).code if ret == FLOAT else e.code
         self.emit(f"return {code};")
 
+    def _message_of(self, node, py_class):
+        """str(e) of an exception made with this one argument, as C++: str(arg), and repr(arg)
+        for a KeyError (Python's KeyError shows its key's repr)."""
+        if py_class == "KeyError" or (py_class in getattr(self.mod, "exc_classes", {}) and
+                                      self._derives_from(py_class, "KeyError")):
+            return self.text_value(ast.copy_location(ast.Call(func=ast.Name(id="repr", ctx=ast.Load()),
+                                                              args=[node], keywords=[]), node)).code
+        return self.text_value(node).code
+
+    def _derives_from(self, name, base):
+        exc = getattr(self.mod, "exc_classes", {})
+        while name in exc and exc[name]["base"] is not None:
+            name = exc[name]["base"][1]
+            if name == base:
+                return True
+        return name == base
+
     def s_Raise(self, s):
         exc = s.exc
-        if exc is None:
-            raise Unsupported(s, "bare `raise` (re-raise) is not supported")
+        if exc is None:  # re-raise: inside a handler, the exception it caught
+            if not self.exc_vars:
+                raise Unsupported(s, "a bare `raise` outside an except block raises RuntimeError in Python",
+                                  "raise an exception: raise ValueError(...)")
+            self.emit("throw;")
+            return
+        if isinstance(exc, ast.Name) and self.exc_vars and exc.id == self.exc_vars[-1][0]:
+            self.emit("throw;")  # raise e, the exception being handled
+            return
         if isinstance(exc, ast.Call):
             cls_node, args = exc.func, exc.args
             if exc.keywords:
                 raise Unsupported(s, "keyword arguments to exceptions are not supported")
         else:
             cls_node, args = exc, []
-        cls = ast.unparse(cls_node)
-        cpp_cls = lib.EXCEPTIONS.get(cls)
-        if cpp_cls is None:
-            raise Unsupported(s, f"raising {cls} is not supported",
-                              "use ValueError, ZeroDivisionError, ArithmeticError, OverflowError or RuntimeError")
+        named = self.mod._exception_named(cls_node)
+        if named is None:
+            raise Unsupported(s, f"raising {ast.unparse(cls_node)} is not supported",
+                              "raise a built-in class (ValueError, ZeroDivisionError, KeyError, RuntimeError, ...) "
+                              "or one of your own exception classes")
+        cpp_cls, py = named
         if not args:
-            msg = cpp_string(cls)
+            msg = '""'  # str(ValueError()) is ""
         elif len(args) == 1:
-            e = self.text_value(args[0])  # a message: a str, an f-string, str(x), ...
-            msg = e.code
+            msg = self._message_of(args[0], py)
         else:
-            raise Unsupported(s, "an exception with several arguments is not supported", "pass one message")
+            raise Unsupported(s, "an exception with several arguments is not supported (Python's str(e) shows "
+                                 "them as a tuple)", "pass one message: raise ValueError(f\"...\")")
         self.emit(f"throw {cpp_cls}({msg});")
 
     def s_Assert(self, s):
         cond = self.truth(self.expr(s.test), s)
-        if s.msg is not None and isinstance(s.msg, ast.Constant) and isinstance(s.msg.value, str):
-            msg = s.msg.value
-        else:
-            msg = "assertion failed: " + ast.unparse(s.test)
+        # str(e) of the AssertionError is the message's str(), or "" without one, as in Python
+        msg = '""' if s.msg is None else self._message_of(s.msg, "AssertionError")
         self.note("assert", "assert statements always run in C++; `python -O` strips them")
-        self.emit(f"if (!{wrap(cond, P_ATOM)}) throw std::logic_error({cpp_string(msg)});")
+        self.emit(f"if (!{wrap(cond, P_ATOM)}) throw qt::AssertionError({msg});")

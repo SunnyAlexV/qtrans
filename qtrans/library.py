@@ -67,18 +67,14 @@ DROPPABLE_DECORATORS = {
 }
 
 # --- exceptions: Python class -> C++ class -------------------------------------------
-EXCEPTIONS = {
-    "ValueError": "std::invalid_argument",
-    "ZeroDivisionError": "std::domain_error",
-    "ArithmeticError": "std::domain_error",
-    "FloatingPointError": "std::domain_error",
-    "OverflowError": "std::overflow_error",
-    "AssertionError": "std::logic_error",
-    "RuntimeError": "std::runtime_error",
-    "NotImplementedError": "std::runtime_error",
-    "Exception": "std::runtime_error",
-    "TypeError": "qt::type_error",
+EXCEPTIONS = {  # the classes of qtrans_runtime.hpp, shaped as Python's
+    n: f"qt::{n}" for n in ("Exception", "ArithmeticError", "ZeroDivisionError", "OverflowError", "FloatingPointError",
+                            "AssertionError", "LookupError", "IndexError", "KeyError", "RuntimeError",
+                            "NotImplementedError", "TypeError", "ValueError")
 }
+# the ones a float can raise in Python where a C++ double carries on (1.0 / 0.0, math.sqrt(-1),
+# math.exp(1000)): code a handler for one of these may catch raises them as Python does
+FLOAT_ERRORS = {"Exception", "ArithmeticError", "ZeroDivisionError", "OverflowError", "ValueError"}
 
 
 def supported_names() -> list[str]:

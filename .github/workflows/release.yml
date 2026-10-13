@@ -57,6 +57,8 @@ jobs:
           /tmp/env/bin/qtrans verify dicts_demo.py | tee v.txt && grep -q "output identical" v.txt
           printf 'line = " AAPL, 190.5 ,straße "\nparts = [p.strip() for p in line.split(",")]\nprint(parts, float(parts[1]), parts[2].upper(), "ΟΔΟΣ".lower(), repr("a\\u00a0b"))\n' > text_demo.py
           /tmp/env/bin/qtrans verify text_demo.py | tee v.txt && grep -q "output identical" v.txt
+          printf 'import math\n\nclass PricingError(ValueError):\n    pass\n\ndef f(x: float) -> float:\n    try:\n        if x < 0:\n            raise PricingError("negative")\n        return math.log(x) / x\n    except (PricingError, ZeroDivisionError) as e:\n        print(type(e).__name__, e)\n        return 0.0\n    finally:\n        print("done")\n\nfor x in [2.0, -1.0, 0.0]:\n    print(f(x))\n' > exc_demo.py
+          /tmp/env/bin/qtrans verify exc_demo.py | tee v.txt && grep -q "output identical" v.txt
           /tmp/env/bin/qtrans override black_scholes.py d1
           /tmp/env/bin/qtrans verify black_scholes.py --cases 30 | tee v.txt && grep -q "your C++ against qtrans's" v.txt
           /tmp/env/bin/qtrans export black_scholes.py -o bs_cpp --cases 20 | tee e.txt && grep -q "ctest tests passed" e.txt

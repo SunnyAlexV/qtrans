@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from qtrans.translator import LIST_HEADER, PRINT_HEADER, RUNTIME_HEADER, UNICODE_HEADER, translate_source  # noqa: E402
+from qtrans.translator import LIST_HEADER, PRINT_HEADER, PYTHON_HEADER, RUNTIME_HEADER, UNICODE_HEADER, translate_source  # noqa: E402
 
 DEMO = 'line = " AAPL, 190.5 ,straße "\nparts = [p.strip() for p in line.split(",")]\n' \
        'print(parts, float(parts[1]), parts[2].upper(), "ΟΔΟΣ".lower(), "١٢٣", repr("a\\u00a0b"))\n'
@@ -41,7 +41,7 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="qtrans_console_"))
     program = translate_source(DEMO, "demo", "demo.py").program
     assert "qt::py::windows_console" in program
-    for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+    for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
         shutil.copy(h, work / h.name)
     (work / "with.cpp").write_text(program, encoding="utf-8")
     (work / "without.cpp").write_text(re.sub(r".*qt::py::windows_console .*\n", "", program), encoding="utf-8")

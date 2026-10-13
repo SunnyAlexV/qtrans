@@ -42,6 +42,14 @@ def ticker(line: str) -> str:
     return line.split(",")[0].strip().upper()
 
 
+def safe_ratio(a: float, b: float) -> float:
+    try:
+        return a / b
+    except ZeroDivisionError as e:
+        print("no ratio:", e)
+        return 0.0
+
+
 prices = {"AAPL": 190.5, "MSFT": 410.25, "GOOG": 140.0}
 weights = {"AAPL": 0.5, "MSFT": 0.3, "GOOG": 0.2}
 for i, (name, p) in enumerate(prices.items(), start=1):
@@ -49,7 +57,13 @@ for i, (name, p) in enumerate(prices.items(), start=1):
 print("annuity(10) =", round(annuity(10), 6))
 print("weighted:", weighted(prices, weights))
 print(ticker(" aapl , 190.5"), ticker("straße,1"), float(" 1_000.5 "))
+print(safe_ratio(1.0, 4.0), safe_ratio(1.0, 0.0))
 '''
+
+def _line(text):
+    """The demo's line number holding `text`."""
+    return next(i for i, line in enumerate(DEMO.splitlines(), 1) if text in line)
+
 
 TERMINAL_CSS = """
 body { margin: 0; background: #0d1117; }
@@ -120,15 +134,15 @@ def main(out_dir):
         page.goto(box["url"])
         page.wait_for_selector("#cpp .cl")
         page.wait_for_function("document.getElementById('status').textContent.includes('translated')")
-        page.evaluate("goToLine(13)")  # the loop with its unroll hint
+        page.evaluate(f"goToLine({_line('for t in range')})")  # the loop with its unroll hint
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "1_live_editor.png"))
         shots.append("1_live_editor.png")
-        page.evaluate("goToLine(23)")  # text: split, strip, upper (Python's Unicode rules)
+        page.evaluate(f"goToLine({_line('return a / b')})")  # a try: the division raises as Python's
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "2_live_program_line.png"))
         shots.append("2_live_program_line.png")
-        page.evaluate("goToLine(32)")  # text beyond ASCII in the program: main() writes to a Windows console as Python
+        page.evaluate(f"goToLine({_line('print(ticker')})")  # text beyond ASCII: main() writes to a Windows console as Python
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "2b_live_program_main.png"))
         shots.append("2b_live_program_main.png")

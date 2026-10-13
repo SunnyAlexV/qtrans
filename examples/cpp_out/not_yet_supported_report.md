@@ -20,8 +20,7 @@ These only matter on inputs where Python would raise an exception or overflow.
   - Hint: write a comprehension instead: [f(x) for x in xs], or sum(f(x) for x in xs)
 - `portfolio_value` (line 16). line 16: type annotation 'np.ndarray' doesn't say whether the array is 1-D or 2-D
   - Hint: annotate with Vec (1-D) or Mat (2-D): `from qtrans.typing import Vec, Mat`
-- `safe_log` (line 20). line 23: except ValueError around math.sqrt / math.log / ...: Python raises ValueError outside their domain, C++ returns NaN, so the handler would run in Python but not in C++
-  - Hint: test the argument before the call instead
+- `running_totals` (line 20). line 20: generators (yield) are not supported
 - `lookup` (line 27). line 28: sets are not supported in stage 1
 - `no_annotations` (line 32). line 32: parameter 'x' has no type annotation, and no call in this file shows its type
   - Hint: write `x: float` (or int / bool) for a number, or `x: Vec` / `x: Mat` for a 1-D / 2-D float array (from qtrans.typing import Vec, Mat)

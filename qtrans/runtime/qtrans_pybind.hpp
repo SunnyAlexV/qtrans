@@ -21,6 +21,7 @@
 #include <cstring>
 #include <optional>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -97,6 +98,20 @@ inline PyObject*& shape_error_type() {
     return t;
 }
 
+// your own exception classes (class PricingError(ValueError)), as Python classes: name -> class
+inline std::map<std::string, PyObject*>& exception_classes() {
+    static std::map<std::string, PyObject*> classes;
+    return classes;
+}
+
+inline py::object exception_class(py::module_& m, const char* name, py::object base, const char* doc) {
+    py::object type = py::module_::import("builtins").attr("type");
+    py::object cls = type(name, py::make_tuple(base), py::dict(py::arg("__module__") = m.attr("__name__"),
+                                                              py::arg("__doc__") = doc));
+    exception_classes()[name] = cls.inc_ref().ptr();  // kept for the life of the process
+    return cls;
+}
+
 inline void register_exceptions(py::module_& m) {
     py::object type = py::module_::import("builtins").attr("type");
     py::object shape = type("ShapeError", py::make_tuple(py::handle(PyExc_ValueError), py::handle(PyExc_IndexError)),
@@ -118,15 +133,7 @@ inline void register_exceptions(py::module_& m) {
             PyErr_SetString(cached("numpy.linalg", "LinAlgError").ptr(), e.what());
         } catch (const qt::shape_error& e) {
             PyErr_SetString(shape_error_type(), e.what());
-        } catch (const qt::index_error& e) {
-            PyErr_SetString(PyExc_IndexError, e.what());
-        } catch (const qt::type_error& e) {
-            PyErr_SetString(PyExc_TypeError, e.what());
-        } catch (const std::domain_error& e) {  // raise ZeroDivisionError / ArithmeticError, x // 0
-            PyErr_SetString(PyExc_ZeroDivisionError, e.what());
-        } catch (const std::invalid_argument& e) {
-            PyErr_SetString(PyExc_ValueError, e.what());
-        } catch (const qt::py::KeyError& e) {
+        } catch (const qt::KeyError& e) {
             // Python's KeyError holds the key itself; the message is its repr ('AAPL', 3)
             try {
                 py::object key = py::module_::import("ast").attr("literal_eval")(e.what());
@@ -134,6 +141,19 @@ inline void register_exceptions(py::module_& m) {
             } catch (...) {
                 PyErr_SetString(PyExc_KeyError, e.what());
             }
+        } catch (const qt::Exception& e) {
+            // Python's own class: one of yours (made on the module when it was bound), else the built-in
+            auto it = exception_classes().find(e.type_name());
+            if (it != exception_classes().end()) {
+                PyErr_SetString(it->second, e.what());
+            } else {
+                PyErr_SetString(py::module_::import("builtins").attr(e.builtin_name()).ptr(), e.what());
+            }
+        // a standard exception (from your own C++ for a function): the Python class it stands for
+        } catch (const std::domain_error& e) {
+            PyErr_SetString(PyExc_ZeroDivisionError, e.what());
+        } catch (const std::invalid_argument& e) {
+            PyErr_SetString(PyExc_ValueError, e.what());
         } catch (const std::out_of_range& e) {
             PyErr_SetString(PyExc_IndexError, e.what());
         } catch (const std::logic_error& e) {  // a Python assert

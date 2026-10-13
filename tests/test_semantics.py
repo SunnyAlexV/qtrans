@@ -216,7 +216,7 @@ def test_integer_arithmetic_is_bit_exact(report):
 def test_division_by_zero_raises_like_python(report):
     f = next(f for f in report.functions if f.name == "int_floordiv")
     zero = [c for c in f.cases if c.args[1] == 0]
-    assert zero and all(c.cpp == ("exc", "ArithmeticError") for c in zero)
+    assert zero and all(c.cpp == ("exc", "ZeroDivisionError") and c.outcome == "match" for c in zero)
 
 
 def test_norm_ppf_matches_scipy_closely(report):

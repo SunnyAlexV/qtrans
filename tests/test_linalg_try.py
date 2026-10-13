@@ -201,7 +201,7 @@ def test_retry_loop_breaks_out_of_try(report):
 def test_eigh_reads_the_lower_triangle_and_propagates_nan(report):
     lower, rect, upper_nan = given(report, "eigenvalues")
     assert lower.outcome == "match" and np.allclose(lower.cpp[1], np.linalg.eigvalsh([[2.0, 0.0], [1.0, 3.0]]))
-    assert rect.py[1] == "ValueError" and rect.cpp == ("exc", "ValueError")      # LinAlgError is a ValueError
+    assert rect.py[1] == "LinAlgError" and rect.cpp == ("exc", "LinAlgError")    # (a ValueError)
     assert upper_nan.outcome == "match"                                          # NaN above the diagonal: ignored
 
 
@@ -228,39 +228,52 @@ def try_src(handler, body="return np.linalg.det(A)"):
     return f"def f(A: Mat) -> float:\n    try:\n        {body}\n    except {handler}:\n        return 0.0\n"
 
 
-@pytest.mark.parametrize("handler,why", [
-    ("ZeroDivisionError", "gives inf in C++"), ("ArithmeticError", "give inf in C++"),
-    ("OverflowError", "gives inf in C++"), ("Exception", "carries on with inf/NaN"),
-    ("(ValueError, IndexError)", "several exception types in one clause")])
-def test_handlers_that_cannot_match_python_are_refused(handler, why):
-    assert why in rejection(try_src(handler))
+@pytest.mark.parametrize("handler,cpp", [
+    ("ZeroDivisionError", "qt::ZeroDivisionError"), ("ArithmeticError", "qt::ArithmeticError"),
+    ("OverflowError", "qt::OverflowError"), ("Exception", "qt::Exception")])
+def test_handlers_for_float_errors_translate(handler, cpp):
+    """Handlers for errors a Python float raises where a C++ double carries on: the code they
+    guard raises them as Python does (qt::py::truediv, qt::py::math_*), so the handler runs when
+    Python's would."""
+    r = translate_source(HEAD + try_src(handler), "m")
+    assert not r.report.rejected and f"catch (const {cpp}&)" in r.header
+
+
+def test_several_classes_in_one_clause():
+    r = translate_source(HEAD + try_src("(ValueError, IndexError)"), "m")
+    assert not r.report.rejected
+    assert "catch (const qt::ValueError&)" in r.header and "catch (const qt::IndexError&)" in r.header
 
 
 def test_bare_except_is_refused():
     assert "bare `except:`" in rejection(try_src("").replace("except :", "except:"))
 
 
-def test_value_error_around_math_domain_functions_is_refused():
-    """math.sqrt(-1) raises ValueError in Python but returns NaN in C++: the handler would run
-    in one and not the other. Also through a called function."""
-    assert "math.sqrt" in rejection(try_src("ValueError", "return math.sqrt(A[0, 0])"))
-    src = ("def g(x: float) -> float:\n    return math.log(x)\n\n" + try_src("ValueError", "return g(A[0, 0])"))
-    assert "math.sqrt" in rejection(src)
+def test_value_error_around_math_domain_functions_raises_as_python():
+    """math.sqrt(-1) raises ValueError in Python: inside a try that catches it, the C++ raises it
+    too, also in a function the try block calls."""
+    r = translate_source(HEAD + try_src("ValueError", "return math.sqrt(A[0, 0])"), "m")
+    assert not r.report.rejected and "qt::py::math_sqrt(" in r.header
+    src = "def g(x: float) -> float:\n    return math.log(x)\n\n" + try_src("ValueError", "return g(A[0, 0])")
+    r = translate_source(HEAD + src, "m")
+    assert not r.report.rejected and "qt::py::math_log(x)" in r.header
 
 
 def test_value_error_from_numpy_is_fine():
     r = translate_source(HEAD + try_src("ValueError", "return np.quantile(A[0], 2.0)"), "m")
-    assert not r.report.rejected and "catch (const std::invalid_argument&)" in r.header
+    assert not r.report.rejected and "catch (const qt::ValueError&)" in r.header
 
 
-def test_finally_and_else_are_refused():
-    assert "finally" in rejection("def f(A: Mat) -> float:\n    try:\n        x = 1.0\n    finally:\n"
-                                  "        x = 2.0\n    return x\n")
+def test_finally_and_else_translate():
+    r = translate_source(HEAD + "def f(A: Mat) -> float:\n    try:\n        x = 1.0\n    finally:\n"
+                                "        x = 2.0\n    return x\n", "m")
+    assert not r.report.rejected and "qt::finally_block finally_([&] {" in r.header
 
 
-def test_using_the_exception_object_is_refused():
-    assert "caught exception" in rejection("def f(A: Mat) -> float:\n    try:\n        return np.linalg.det(A)\n"
-                                           "    except np.linalg.LinAlgError as e:\n        raise e\n")
+def test_re_raising_the_caught_exception():
+    r = translate_source(HEAD + "def f(A: Mat) -> float:\n    try:\n        return np.linalg.det(A)\n"
+                                "    except np.linalg.LinAlgError as e:\n        raise e\n", "m")
+    assert not r.report.rejected and "throw;" in r.header
 
 
 # Badly scaled matrices (entries near 1e8 beside entries near 1e-2) found by the random cases.

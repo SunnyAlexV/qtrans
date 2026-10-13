@@ -61,14 +61,14 @@ template <class T>
 T& item(std::vector<T>& xs, long long i) {
     const long long n = static_cast<long long>(xs.size());
     if (i < 0) i += n;
-    if (i < 0 || i >= n) throw std::out_of_range("list index out of range");
+    if (i < 0 || i >= n) throw IndexError(msg::list_index);
     return xs[static_cast<size_t>(i)];
 }
 template <class T>
 const T& item(const std::vector<T>& xs, long long i) {
     const long long n = static_cast<long long>(xs.size());
     if (i < 0) i += n;
-    if (i < 0 || i >= n) throw std::out_of_range("list index out of range");
+    if (i < 0 || i >= n) throw IndexError(msg::list_index);
     return xs[static_cast<size_t>(i)];
 }
 
@@ -79,7 +79,7 @@ std::vector<T> slice(const std::vector<T>& xs, std::optional<long long> start, s
                      std::optional<long long> step = std::nullopt) {
     const long long n = static_cast<long long>(xs.size());
     const long long s = step.value_or(1);
-    if (s == 0) throw std::invalid_argument("slice step cannot be zero");
+    if (s == 0) throw ValueError("slice step cannot be zero");
     auto adjust = [&](std::optional<long long> v, long long dflt) {
         if (!v) return dflt;
         long long x = *v;
@@ -152,7 +152,7 @@ inline long long sum(const std::vector<long long>& xs) {
 // later one is strictly smaller / greater, so NaN behaves as it does in Python)
 template <class T>
 T min(const std::vector<T>& xs) {
-    if (xs.empty()) throw std::invalid_argument("min() iterable argument is empty");
+    if (xs.empty()) throw ValueError(msg::min_empty);
     if constexpr (is_tuple<T>::value) check_sortable(xs);
     T m = xs[0];
     for (size_t k = 1; k < xs.size(); ++k)
@@ -161,7 +161,7 @@ T min(const std::vector<T>& xs) {
 }
 template <class T>
 T max(const std::vector<T>& xs) {
-    if (xs.empty()) throw std::invalid_argument("max() iterable argument is empty");
+    if (xs.empty()) throw ValueError(msg::max_empty);
     if constexpr (is_tuple<T>::value) check_sortable(xs);
     T m = xs[0];
     for (size_t k = 1; k < xs.size(); ++k)
@@ -224,7 +224,7 @@ std::vector<T> sorted_by(const std::vector<T>& xs, const std::vector<K>& keys, b
 // comparisons, so NaN keys behave as in Python; tuple keys holding NaN are refused, see above)
 template <class T, class K>
 T min_by(const std::vector<T>& xs, const std::vector<K>& keys) {
-    if (xs.empty()) throw std::invalid_argument("min() iterable argument is empty");
+    if (xs.empty()) throw ValueError(msg::min_empty);
     if constexpr (is_tuple<K>::value) check_sortable(keys);
     std::size_t best = 0;
     for (std::size_t k = 1; k < xs.size(); ++k)
@@ -233,7 +233,7 @@ T min_by(const std::vector<T>& xs, const std::vector<K>& keys) {
 }
 template <class T, class K>
 T max_by(const std::vector<T>& xs, const std::vector<K>& keys) {
-    if (xs.empty()) throw std::invalid_argument("max() iterable argument is empty");
+    if (xs.empty()) throw ValueError(msg::max_empty);
     if constexpr (is_tuple<K>::value) check_sortable(keys);
     std::size_t best = 0;
     for (std::size_t k = 1; k < xs.size(); ++k)
@@ -244,10 +244,10 @@ T max_by(const std::vector<T>& xs, const std::vector<K>& keys) {
 // xs.pop() / xs.pop(i)
 template <class T>
 T pop(std::vector<T>& xs, long long i = -1) {
-    if (xs.empty()) throw std::out_of_range("pop from empty list");
+    if (xs.empty()) throw IndexError(msg::pop_empty);
     const long long n = static_cast<long long>(xs.size());
     if (i < 0) i += n;
-    if (i < 0 || i >= n) throw std::out_of_range("pop index out of range");
+    if (i < 0 || i >= n) throw IndexError(msg::pop_index);
     T v = xs[static_cast<size_t>(i)];
     xs.erase(xs.begin() + i);
     return v;
@@ -270,7 +270,8 @@ template <class T>
 long long index(const std::vector<T>& xs, const T& x) {
     for (size_t k = 0; k < xs.size(); ++k)
         if (xs[k] == x) return static_cast<long long>(k);
-    throw std::invalid_argument("list.index(x): x not in list");
+    throw ValueError(msg::list_index_has_value ? msg::list_index_prefix + repr(x) + msg::list_index_suffix
+                                               : std::string(msg::list_index_prefix));
 }
 template <class T>
 long long count(const std::vector<T>& xs, const T& x) {
@@ -453,7 +454,7 @@ inline std::vector<std::string> split(const std::string& s, const std::optional<
                                       long long maxsplit = -1) {
     std::vector<std::string> out;
     if (sep) {
-        if (sep->empty()) throw std::invalid_argument("empty separator");
+        if (sep->empty()) throw ValueError("empty separator");
         std::size_t start = 0, at;
         while ((maxsplit < 0 || static_cast<long long>(out.size()) < maxsplit) && (at = s.find(*sep, start)) != std::string::npos) {
             out.push_back(s.substr(start, at - start));
@@ -521,7 +522,7 @@ inline long long find(const std::string& s, const std::string& sub, std::optiona
 inline long long index(const std::string& s, const std::string& sub, std::optional<long long> a = std::nullopt,
                        std::optional<long long> b = std::nullopt) {
     const long long k = find(s, sub, a, b);
-    if (k < 0) throw std::invalid_argument("substring not found");
+    if (k < 0) throw ValueError("substring not found");
     return k;
 }
 inline long long count(const std::string& s, const std::string& sub, std::optional<long long> a = std::nullopt,
@@ -607,7 +608,7 @@ inline std::string zfill(const std::string& s, long long width) {
     return pad + s;
 }
 inline std::string fill_of(const std::string& f) {
-    if (len(f) != 1) throw qt::type_error("The fill character must be exactly one character long");
+    if (len(f) != 1) throw TypeError("The fill character must be exactly one character long");
     return f;
 }
 inline std::string times(const std::string& f, long long n) {
@@ -636,7 +637,7 @@ inline std::string char_at(const std::string& s, long long i) {
     const auto off = strdetail::offsets(s);
     const long long n = static_cast<long long>(off.size()) - 1;
     if (i < 0) i += n;
-    if (i < 0 || i >= n) throw std::out_of_range("string index out of range");
+    if (i < 0 || i >= n) throw IndexError(msg::str_index);
     const auto k = static_cast<std::size_t>(i);
     return s.substr(off[k], off[k + 1] - off[k]);
 }
@@ -675,7 +676,7 @@ inline bool digit(char c) { return c >= '0' && c <= '9'; }
 
 inline double parse_float(const std::string& text) {
     const std::string t = strdetail::to_ascii_number(text);
-    auto bad = [&]() { return std::invalid_argument("could not convert string to float: " + repr(text)); };
+    auto bad = [&]() { return ValueError("could not convert string to float: " + repr(text)); };
     std::size_t k = 0;
     std::string clean;
     if (k < t.size() && (t[k] == '+' || t[k] == '-')) clean += t[k++];
@@ -708,7 +709,7 @@ inline double parse_float(const std::string& text) {
 }
 inline long long parse_int(const std::string& text) {
     const std::string t = strdetail::to_ascii_number(text);
-    auto bad = [&]() { return std::invalid_argument("invalid literal for int() with base 10: " + repr(text)); };
+    auto bad = [&]() { return ValueError("invalid literal for int() with base 10: " + repr(text)); };
     std::size_t k = 0;
     bool neg = false;
     if (k < t.size() && (t[k] == '+' || t[k] == '-')) neg = t[k++] == '-';
@@ -730,7 +731,7 @@ inline long long parse_int(const std::string& text) {
 
 // list(range(...)): the ints of a range
 inline std::vector<long long> range_list(long long start, long long stop, long long step = 1) {
-    if (step == 0) throw std::invalid_argument("range() arg 3 must not be zero");
+    if (step == 0) throw ValueError("range() arg 3 must not be zero");
     std::vector<long long> out;
     if (step > 0) for (long long i = start; i < stop; i += step) out.push_back(i);
     else for (long long i = start; i > stop; i += step) out.push_back(i);
@@ -758,10 +759,7 @@ std::string str(const std::vector<T>& xs) { return repr(xs); }
 // --- dict ------------------------------------------------------------------------------------
 // Python's dict: a key's position is the order it was first added (changing its value keeps the
 // position; deleting and adding again puts it last), lookups by hash. Keys are str or int.
-class KeyError : public std::out_of_range {
-  public:
-    using std::out_of_range::out_of_range;
-};
+using KeyError = ::qt::KeyError;  // (qtrans_runtime.hpp)
 
 template <class K>
 std::string key_text(const K& k) { return repr(k); }  // KeyError's message: the key's repr

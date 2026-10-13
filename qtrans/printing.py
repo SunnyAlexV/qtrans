@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from .core import P_ADD, P_ATOM, Expr, cpp_string, wrap
 from .errors import Unsupported
 from .origins import NP, PY
-from .types import (ArrayType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
+from .types import (ArrayType, DictType, ExcType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, is_array)
 
 _SAMPLE = {"float": 1.5, "int": 7, "bool": True}  # a value of each type, to try a format spec on
@@ -432,6 +432,8 @@ class TextOps:
             return Piece(code=e.code, stream=wrap(e, P_ADD))
         if t == NONE:
             return _lit("None")
+        if isinstance(t, ExcType):  # str(e) of a caught exception: its message
+            return Piece(code=f"std::string({e.code}.what())", stream=f"{e.code}.what()")
         if t == VOID:  # print(f()) of a function returning None: f runs, then None is shown
             return Piece(code=f"({e.code}, \"None\")", stream=f"({e.code}, \"None\")", std=False)
         if isinstance(e.value, bool) or t == BOOL and e.value is not None:
@@ -789,6 +791,12 @@ class TextOps:
                 codes.append(p.code)
         if len(pieces) == 1 and pieces[0].lit is not None:
             return f"std::string({cpp_string(pieces[0].lit)})"
+        throwing = [p for p in pieces if p.lit is None and (p.raises if p.raises is not None else _may_throw(p.code))]
+        if len(throwing) > 1:
+            # Python works the pieces out left to right, so the first that raises is the error; the
+            # operands of + have no order in C++, the elements of a braced list do
+            return "qt::py::concat_text({" + ", ".join(
+                cpp_string(p.lit) if p.lit is not None else p.code for p in pieces) + "})"
         return " + ".join(codes)
 
     def text_value(self, node) -> Expr:

@@ -48,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
+from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
                          library_tree, translate_file)
 from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, DictType, ListType, OptionalType, StructType, TupleType
 
@@ -700,17 +700,17 @@ def output_type(sig):
 
 # --- python side ------------------------------------------------------------------------
 def _py_category(exc):
-    for cls, name in ((ZeroDivisionError, "ZeroDivisionError"), (OverflowError, "OverflowError"),
-                      (FloatingPointError, "FloatingPointError"), (ArithmeticError, "ArithmeticError"),
-                      (ValueError, "ValueError"), (IndexError, "IndexError"),
-                      (AssertionError, "AssertionError"),
-                      (NotImplementedError, "NotImplementedError"), (RuntimeError, "RuntimeError"),
-                      # NumPy's UFuncTypeError (a complex result cast back into a float array)
-                      # is a TypeError: its name is NumPy's detail
-                      (TypeError, "TypeError")):
-        if isinstance(exc, cls):
-            return name
-    return type(exc).__name__
+    """The Python class the C++ reports for the same error: the exception's own class (the C++
+    classes have Python's names and family, your own classes included), except that NumPy's
+    internal subclasses (UFuncTypeError, AxisError, ...) count as the built-in class they derive
+    from; LinAlgError is NumPy's public one and keeps its name."""
+    cls = type(exc)
+    if cls.__name__ == "LinAlgError" or not (cls.__module__ or "").startswith("numpy"):
+        return cls.__name__
+    for base in cls.__mro__:
+        if base.__module__ == "builtins":
+            return base.__name__
+    return cls.__name__
 
 
 def _has_complex(v):
@@ -925,7 +925,7 @@ def _singular_verdict(case) -> bool:
     shape errors as ShapeError, so its ValueError is a LinAlgError)."""
     if case.py[0] == "exc":
         return "ingular" in case.py[2] or "positive definite" in case.py[2]
-    return case.cpp[0] == "exc" and case.cpp[1] == "ValueError"
+    return case.cpp[0] == "exc" and case.cpp[1] in ("LinAlgError", "ValueError")
 
 
 def python_near_singular(fn, case, sig) -> bool:
@@ -1289,13 +1289,11 @@ int main() {
 @@BRANCHES@@
             { std::printf("EXC UnknownFunction\n"); }
         }
-        catch (const qt::type_error&) { std::printf("EXC TypeError\n"); }
         catch (const qt::int_overflow&) { std::printf("EXC IntOverflow\n"); }@@ARRAY_CATCH@@
+        catch (const qt::Exception& e) { std::printf("EXC %s\n", e.type_name()); }  // Python's class, by name
+        // a standard exception (from your own C++ for a function): the Python class it stands for
         catch (const std::invalid_argument&) { std::printf("EXC ValueError\n"); }
         catch (const std::domain_error&) { std::printf("EXC ArithmeticError\n"); }
-#ifdef QTRANS_LIST_HPP
-        catch (const qt::py::KeyError&) { std::printf("EXC KeyError\n"); }
-#endif
         catch (const std::out_of_range&) { std::printf("EXC IndexError\n"); }
         catch (const std::logic_error&) { std::printf("EXC AssertionError\n"); }
         catch (const std::overflow_error&) { std::printf("EXC OverflowError\n"); }
@@ -1807,7 +1805,7 @@ def classify(case: Case, ret, rtol, atol):
         case.rel_err, case.ulps = rel, ulps
         case.outcome = "match" if eq else "mismatch"
         case.tiny = eq and not _compare_values(py[1], cpp[1], ret, rtol, 0.0)[0]
-    elif py[0] == "exc" and cpp[0] == "exc" and py[1] in CPP_EXC_MATCHES.get(cpp[1], set()):
+    elif py[0] == "exc" and cpp[0] == "exc" and (py[1] == cpp[1] or py[1] in CPP_EXC_MATCHES.get(cpp[1], set())):
         case.outcome = "match"
     elif cpp[0] == "exc" and cpp[1] == "IntOverflow":
         # Python's int grew past 64 bits (or a float became one), where C++ raises
@@ -2261,6 +2259,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
     driver.write_text(src, encoding="utf-8")
     if not (build / "qtrans_runtime.hpp").exists():
         shutil.copy(RUNTIME_HEADER, build / "qtrans_runtime.hpp")
+    shutil.copy(PYTHON_HEADER, build / "qtrans_python.hpp")
     shutil.copy(PRINT_HEADER, build / "qtrans_print.hpp")
     shutil.copy(LIST_HEADER, build / "qtrans_list.hpp")
     shutil.copy(UNICODE_HEADER, build / "qtrans_unicode.hpp")
@@ -2330,7 +2329,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
             if c.rel_err <= 100 * c.sensitivity:
                 c.outcome = "illcond"
         elif c.outcome == "mismatch" and (fc.py_name or fc.name) in linalg and (c.py[0] == "ok") != (c.cpp[0] == "ok") \
-                and "ValueError" in (c.py[1] if c.py[0] == "exc" else c.cpp[1]):
+                and (c.py[1] if c.py[0] == "exc" else c.cpp[1]) in ("LinAlgError", "ValueError"):
             # one side found the matrix singular (LinAlgError is a ValueError): ill-conditioned
             # when Python's own verdict changes under a rounding-sized nudge
             fn = getattr(pymods[fc.module], fc.py_name or fc.name)
@@ -2380,7 +2379,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         if result.program is not None:  # a program: run it both ways and compare what it prints
             src = build / f"{module}.cpp"
             src.write_text(result.program, encoding="utf-8")
-            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+            for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
                 shutil.copy(h, build / h.name)
             prog_system = list(system)
             if "qtrans_arrays.hpp" in result.program or "qtrans_random.hpp" in result.program:

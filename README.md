@@ -506,8 +506,7 @@ The other way to make a simulation reproducible, passing the draws in as an arra
 |---|---|
 | `lag: int \| None = None`, `x: Optional[float]`, `-> float \| None` | `std::optional`. `x is None` is `!x.has_value()`; wherever Python uses the value itself (`x + 1`, `int(x)`, `x < 0`), `qt::value(x)` raises `TypeError` on None, as Python does. None is falsy. The verifier sends None as an input in a quarter of the random cases. |
 | `try: solve(...) except np.linalg.LinAlgError: pinv(...)` | C++ `try`/`catch (const qt::linalg_error&)`. Variables assigned in the `try` are declared before it, and statements that ran before the error keep their effect, as in Python. |
-| `except ValueError` | allowed unless the `try` body (or a function it calls) uses `math.sqrt`, `math.log`, ...: those raise `ValueError` in Python and return NaN in C++, so the handler would run in one and not the other. |
-| `except ZeroDivisionError` / `OverflowError` / `Exception` / bare `except:` | refused, with the reason: Python raises them on float operations where C++ gives inf/NaN. |
+| `except ValueError` / `ZeroDivisionError` / `OverflowError` / `Exception` | since 0.12 the code they guard raises Python's float errors as Python does: see [Exceptions](#exceptions). A bare `except:` is refused (it also catches KeyboardInterrupt). |
 | `np.linalg.eigh`, `eigvalsh` | Eigen's self-adjoint solver, reading the lower triangle as LAPACK does. Eigenvectors are unique only up to sign, so results like `V @ diag(f(w)) @ V.T` agree; code that reads individual entries may not (said in the report). |
 | `np.linalg.pinv(A, rcond)` | NumPy's rank rule (`s > rcond * max(s)`) on Eigen's SVD; for full rank, a column-pivoted QR, which stays accurate on badly scaled matrices where rebuilding from the SVD loses 5-6 digits (see below). |
 | `np.einsum("ij,ij->i", A, B)` | one or two operands of rank ≤ 2, implicit and explicit mode, size-1 broadcasting; common patterns run as direct loops or products. Agrees to rounding (NumPy's kernels add in a different order). |
@@ -635,6 +634,98 @@ as Python does (WriteConsoleW) and leaves files, pipes and other systems as UTF-
 The verifier's random strings come from the module's own string literals, so branches like
 `if stance == "Long only":` run; code that takes text apart also gets text made to break it
 (padding, mixed case, `1_000.25`, `-nan`, `ΟΔΟΣ ΣΑΣ`, Arabic-Indic digits, no-break spaces).
+
+### Exceptions
+
+Your own exception classes, `try` / `except` / `else` / `finally`, `raise` and re-raise, with
+Python's meaning:
+
+```python
+class PricingError(ValueError):
+    """A price that can't be computed."""
+
+def safe_price(s: float, k: float) -> float:
+    try:
+        return price(s, k)
+    except PricingError as e:
+        print("pricing:", e)
+        return -1.0
+    except (ZeroDivisionError, OverflowError):
+        return math.nan
+    finally:
+        log_attempt()
+```
+```cpp
+struct PricingError : qt::ValueError {  // class PricingError(ValueError)
+    using qt::ValueError::ValueError;
+    const char* type_name() const noexcept override { return "PricingError"; }
+};
+
+inline double safe_price(double s, double k) {
+    qt::finally_block finally_([&] {  // finally: runs once, however the try is left
+        log_attempt();
+    });
+    try {
+        try {
+            double result = price(s, k);  // the value before the finally
+            finally_.run();
+            return result;
+        } catch (const PricingError& e) {  // except PricingError as e
+            std::cout << "pricing: " << e.what() << '\n';
+            finally_.run();
+            return -1.0;
+        } catch (const qt::ZeroDivisionError&) {  // except ZeroDivisionError
+            finally_.run();
+            return qt::nan;
+        } catch (const qt::OverflowError&) {  // except OverflowError
+            finally_.run();
+            return qt::nan;
+        }
+    } catch (...) {
+        finally_.run();  // then the exception goes on
+        throw;
+    }
+    finally_.run();
+}
+```
+
+- **The C++ classes have Python's family** (`qtrans_runtime.hpp`): `catch (const qt::LookupError&)`
+  takes `IndexError` and `KeyError`, `catch (const qt::ValueError&)` takes `LinAlgError` and
+  `class PricingError(ValueError)`, `catch (const qt::Exception&)` takes them all. What the C++
+  raises where Python wouldn't (a long long leaving 64 bits, something qtrans can't reproduce)
+  is outside that family, so no Python handler takes it.
+- **Several classes in one clause**, `as e` with `str(e)`, `print(e)`, `f"{e}"` and
+  `type(e).__name__`; a bare `raise` (or `raise e`) inside a handler re-raises; `raise X from Y`;
+  `ValueError()` with no message (its `str()` is `""`); `KeyError(k)`, whose `str()` is the
+  key's repr; `assert` messages.
+- **`else`** runs when the `try` block ended without an exception; **`finally`** runs on every way
+  out (the end, `return`, `break`, `continue`, an exception), once, and an error it raises
+  replaces the one on its way, as in Python. A `return` value is computed before the `finally`
+  runs.
+- **Python's float errors, where a handler may catch them.** A C++ double carries on where a
+  Python float raises: `1.0 / 0.0` is inf, `math.sqrt(-1)` NaN, `math.exp(1000)` inf, `10.0 ** 400`
+  inf. In a function holding a `try` whose handler takes one of those errors (`ZeroDivisionError`,
+  `ArithmeticError`, `OverflowError`, `ValueError`, `Exception`), and in every function its `try`
+  block calls, the translation raises them as CPython does: `qt::py::truediv`, `qt::py::power`,
+  `qt::py::math_sqrt`, ... (CPython's own rules, `math_1` and `float_pow`). NumPy's numbers
+  don't raise, so their arithmetic stays plain; everywhere else the C++ stays plain too.
+- **Python's own words.** Error messages change between versions: `1.0 / 0.0` says "float division
+  by zero" up to 3.13 and "division by zero" in 3.14, `math.sqrt(-1)` "math domain error" up to
+  3.13 and "expected a nonnegative input, got -1.0" in 3.14, `math.pow(0.0, -inf)` raises up to
+  3.10 only. `qtrans_python.hpp` is written from the running Python by making each error happen
+  (shipped for one version, written once into the cache for another), so the C++ prints what that
+  Python prints. `tests/test_exceptions.py` compares 22,957 values and errors with the Python running it
+  (21,261 on 3.10, which has no `math.cbrt` or `exp2`), and CI runs it on 3.10 to 3.14.
+- **From Python, through the bindings**, your classes are classes of the compiled module, with the
+  same family.
+
+Refused, with the reason: a bare `except:` and `except BaseException` (they also catch
+KeyboardInterrupt), exception classes with fields or methods (put the details in the message), a
+`return` or `break` inside `finally` (Python then drops the exception on its way), an exception
+with several arguments, and a handler for float errors around a function of another module.
+When one expression holds two things that may raise, Python raises the left one first: a
+`print()` line is worked out in that order, but the operands of other C++ expressions have no
+fixed order, so there the other error may be the one raised (verify reports such cases).
 
 ## Tested on real code
 
@@ -794,8 +885,9 @@ imports, so a function knows exactly how every imported function treats its argu
 `rates.normalise` divides its array in place, so `core.weights`, which passes its own array on,
 takes it by reference, and so does a function two modules up that calls `core.weights`. The same
 holds for methods of an imported class, a generator passed on to an imported function that
-draws from it, an argument an imported function may hand back, and `try: ... except
-ValueError` around an imported function that may raise a math domain error. Calling an imported
+draws from it, an argument an imported function may hand back, and a `try` whose handler takes a
+float error (`except ValueError`, `ZeroDivisionError`, ...) around an imported function: refused,
+since that function was translated without raising them. Calling an imported
 function that could not be translated is refused with its own reason ("calls bad(): bad (in
 rates) could not be translated: module variable 'TABLE' was not translated: sets are not
 supported").
@@ -861,7 +953,9 @@ Two arguments that share memory (the same array, a view of it, the same generato
 where one of them is modified, raise `ValueError`: in Python the change would show through
 both, the compiled code works on separate copies. Exceptions come back as Python's:
 `numpy.linalg.LinAlgError`, `ValueError`, `ZeroDivisionError`, `TypeError` (for `None` where a
-number is needed), `IndexError`, `AssertionError`, `OverflowError`. Shape and bounds errors
+number is needed), `IndexError`, `KeyError`, `AssertionError`, `OverflowError`, `RuntimeError`,
+`NotImplementedError`, and your own exception classes, as classes of the compiled module with the
+same family (`m.PricingError` is a `ValueError`). Shape and bounds errors
 raise the module's `ShapeError`, which is both a `ValueError` and an `IndexError`, because
 NumPy raises one or the other and Eigen's checks can't tell which.
 
@@ -895,8 +989,7 @@ about 100 ns of overhead with number arguments and about 0.5 µs with two small 
 same array; reading an array field of a compiled object gives a read-only copy (writing to it
 would change nothing, so it can't be written); assigning an array to a field stores a copy;
 reading a generator field gives a copy; a generator given to a compiled constructor is copied,
-so the object and you no longer share it; `raise NotImplementedError` comes back as its parent
-`RuntimeError`; `copy.copy` of a compiled object is a deep copy; and when a function re-points
+so the object and you no longer share it; `copy.copy` of a compiled object is a deep copy; and when a function re-points
 an array field to an array *equal* to the old one, the compiled side keeps the old array (only
 `is` can tell).
 

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.12.0
+
+- **Exceptions, as Python has them.** Your own exception classes (`class PricingError(ValueError):
+  pass`, any depth), `try` / `except` (several classes in one clause, `as e` with `str(e)`,
+  `print(e)`, `f"{e}"`, `type(e).__name__`) / `else` / `finally`, `raise` with or without a
+  message, `raise ... from ...`, a bare `raise` to re-raise. `finally` runs once on every way out:
+  the end, `return` (its value computed first), `break`, `continue`, an exception; an error it
+  raises replaces the one on its way.
+- **A C++ exception family with Python's shape** (`qt::Exception`, `qt::ValueError`,
+  `qt::LookupError`, `qt::KeyError`, ...), replacing the standard library's types, under which
+  ValueError, IndexError, ZeroDivisionError and AssertionError were all `logic_error`s.
+  `qtrans verify` now compares the exact class (`LinAlgError`, `PricingError`), where it compared
+  a category; the bindings raise your classes as classes of the compiled module.
+- **Python's float errors, where a handler may catch them.** In code an `except ZeroDivisionError`
+  / `ArithmeticError` / `OverflowError` / `ValueError` / `Exception` guards (the function holding
+  the `try` and everything its `try` block calls), `1.0 / 0.0`, `0.0 ** -1`, `10.0 ** 400`,
+  `math.sqrt(-1)`, `math.exp(1000)`, `math.log(0.0)`, ... raise as CPython does (its `math_1` and
+  `float_pow` rules). NumPy's numbers keep NumPy's behaviour (no error). These were refused.
+- **Python's own words**: `qtrans_python.hpp` holds the error messages of the running Python,
+  written from it by making each error happen (3.14 says "division by zero" where 3.13 says
+  "float division by zero", and "expected a nonnegative input, got -1.0" for `math.sqrt(-1)`;
+  `math.pow(0.0, -inf)` raises up to 3.10 only). Checked against Python 3.10 to 3.14
+  (`tests/test_exceptions.py`): 22,957 values and errors, 21,261 on 3.10, all identical.
+- `assert` messages are Python's (`str(e)` is the message, or `""`), and `list.index`,
+  `min([])`, `max([])` raise with the running Python's wording.
+- A `print()` line is worked out left to right, as Python does (a braced list, where the `+` of
+  C++ strings has no order): with two values that may raise, the first error is the one raised,
+  and `print(f(a), f(b))` of functions that print themselves is no longer refused.
+
 ## 0.11.3
 
 From setting qtrans up on a fresh Windows PC (a new user's steps, with the console check of

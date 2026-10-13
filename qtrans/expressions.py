@@ -23,7 +23,7 @@ from .printing import TextOps
 from .dicts import DictOps, dict_of
 from .strings import StrOps
 from .lists import ListOps, list_of
-from .types import (ListType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
+from .types import (ExcType, ListType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
 from .core import cpp_string
@@ -274,6 +274,11 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
         raise Unsupported(node, f"{type(v).__name__} literals are not supported")
 
     def e_Name(self, node):
+        for py, cpp in reversed(getattr(self, "exc_vars", [])):
+            if py == node.id:
+                if cpp is None:
+                    break
+                return Expr(cpp, P_ATOM, ExcType(py), simple=True)
         if self.is_variable(node.id):
             return self.variable(node)
         return self.mod.global_name(node, self)
@@ -310,6 +315,11 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
         return self.array_subscript(node)
 
     def e_Attribute(self, node):
+        if node.attr == "__name__" and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) \
+                and node.value.func.id == "type" and len(node.value.args) == 1 and not node.value.keywords:
+            e = self.expr(node.value.args[0])
+            if isinstance(e.type, ExcType):  # type(e).__name__ of a caught exception: its Python class
+                return Expr(f"std::string({e.code}.type_name())", P_ATOM, STR)
         q = self.qualify(node)
         src = ast.unparse(node)
         if isinstance(node.value, ast.Name) and node.value.id in self.mod.classes \
@@ -372,6 +382,9 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
 
         if isinstance(op, ast.Div):
             # Python semantics: `/` is always true division. In C++ `7 / 2` is 3.
+            if self._python_raises(node, R):  # ZeroDivisionError for 1.0 / 0.0, where a handler may catch it
+                a, b = (self.as_type(L, INT), self.as_type(R, INT)) if both_int else (self.as_double(L), self.as_double(R))
+                return Expr(f"qt::py::truediv({a.code}, {b.code})", P_ATOM, FLOAT)
             L = self.as_double(L) if both_int else self.promote(L, FLOAT)
             R = self.promote(R, FLOAT)
             if R.value is None or R.value == 0:
@@ -398,6 +411,26 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             return self.power(node, L, R)
 
         raise Unsupported(node, f"the {type(op).__name__} operator is not supported in stage 1")
+
+    def _python_raises(self, node, R=None) -> bool:
+        """In code whose float errors a Python handler may catch (FunctionTranslator.strict): does
+        this operation raise as Python's floats do? Not when an operand is a NumPy number (NumPy
+        returns inf / NaN with a warning), nor for a nonzero constant divisor. An operand that is a
+        NumPy number on some runs and a Python one on others can't be decided: refused."""
+        if not getattr(self, "strict", False) or not isinstance(node, ast.BinOp):
+            return False
+        if R is not None and isinstance(R.value, (int, float)) and R.value != 0:
+            return False
+        from .origins import NP, PY
+        kinds = [self.origin(node.left), self.origin(node.right)]
+        if NP in kinds:
+            return False
+        if None in kinds:
+            raise Unsupported(node, f"`{ast.unparse(node)}` inside code an `except` may stop: an operand may be a "
+                                    "NumPy number (no error, inf or NaN) or a Python float (ZeroDivisionError, "
+                                    "OverflowError), depending on the run",
+                              "make it one or the other: float(x) for a Python float")
+        return True
 
     def int_arith(self, sym, p, L: Expr, R: Expr) -> Expr:
         """a + b, a - b, a * b on ints. Plain C++ when the result provably fits in 64 bits, from
@@ -441,6 +474,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             if isinstance(R.value, (bool, int)):
                 n = int(R.value)
                 if n < 0:
+                    if self._python_raises(node):  # 0 ** -1 raises ZeroDivisionError
+                        return Expr(f"qt::py::power({self.as_double(L).code}, {n}.0, true)", P_ATOM, FLOAT)
                     return Expr(f"std::pow({self.as_double(L).code}, {n}.0)", P_ATOM, FLOAT)
                 a = self.as_type(L, INT)
                 lo, hi = iv_of(L)
@@ -457,6 +492,9 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             raise Unsupported(node, "int ** int with a non-constant exponent: Python returns an "
                                     "int or a float depending on the exponent's sign at run time",
                               "convert one side with float(...)")
+        if self._python_raises(node):  # 0.0 ** -1 and overflow raise, as Python's float_pow
+            L, R = self.promote(L, FLOAT), self.promote(R, FLOAT)
+            return Expr(f"qt::py::power({self.as_double(L).code}, {self.as_double(R).code})", P_ATOM, FLOAT)
         if R.value is not None and float(R.value) == 2.0 and L.simple and L.prec == P_ATOM:
             # x ** 2 == x * x exactly (one correctly rounded multiplication)
             return Expr(f"{L.code} * {L.code}", P_MUL, FLOAT)
@@ -900,6 +938,29 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             return Expr(f"std::abs({self.as_type(e, INT).code})", P_ATOM, INT, iv=r)
         return Expr(f"qt::iabs({self.as_type(e, INT).code})", P_ATOM, INT, iv=iv_clip(r))  # abs(-2**63)
 
+    def _math_raising(self, node, qual, args):
+        """math.<f>(...) raising ValueError / OverflowError where CPython does (qt::py::math_*)."""
+        from .pyfacts import UNARY
+        name = qual.split(".", 1)[1]
+
+        def arg(a):  # an int keeps its type: Python's message may show it as one
+            return self.as_type(a, INT).code if a.type in (INT, BOOL) else self.as_double(a).code
+        if name in UNARY:
+            self._arity(node, args, 1)
+            return Expr(f"qt::py::math_{name}({arg(args[0])})", P_ATOM, FLOAT)
+        if name == "log":
+            self._arity(node, args, 1, 2)
+            if len(args) == 1:
+                return Expr(f"qt::py::math_log({arg(args[0])})", P_ATOM, FLOAT)
+            # CPython: log(x), then log(base), then the float division (ZeroDivisionError for base 1)
+            return Expr(f"[&] {{ const double num = qt::py::math_log({arg(args[0])}); "
+                        f"return qt::py::truediv(num, qt::py::math_log({arg(args[1])})); }}()", P_ATOM, FLOAT)
+        if name in ("pow", "fmod"):
+            self._arity(node, args, 2)
+            return Expr(f"qt::py::math_{name}({self.as_double(args[0]).code}, {self.as_double(args[1]).code})",
+                        P_ATOM, FLOAT)
+        return None
+
     def call_builtin(self, node, name):
         if node.keywords:
             raise Unsupported(node, f"keyword arguments to {name}() are not supported")
@@ -1052,6 +1113,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             self.note("range:" + qual, f"{qual} raises OverflowError on overflow in Python; "
                                        "C++ returns inf")
 
+        if getattr(self, "strict", False) and qual.startswith("math."):
+            e = self._math_raising(node, qual, args)  # raises ValueError / OverflowError as Python
+            if e is not None:
+                return e
         if qual in lib.UNARY_FLOAT:
             self._arity(node, args, 1)
             return Expr(f"{lib.UNARY_FLOAT[qual]}({args[0].code})", P_ATOM, FLOAT)

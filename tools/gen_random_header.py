@@ -127,7 +127,7 @@ public:
     Rng() = default;
 
     explicit Rng(long long seed) {
-        if (seed < 0) throw std::invalid_argument("expected non-negative integer");
+        if (seed < 0) throw ValueError("expected non-negative integer");
         std::uint64_t v[4];
         detail::seed_sequence_state(static_cast<std::uint64_t>(seed), v);
         const detail::U128 initstate{v[0], v[1]}, initseq{v[2], v[3]};
@@ -236,13 +236,13 @@ private:
     }
 
     static void check_scale(double scale) {
-        if (!std::isnan(scale) && std::signbit(scale)) throw std::invalid_argument("scale < 0");
+        if (!std::isnan(scale) && std::signbit(scale)) throw ValueError("scale < 0");
     }
 
     static double check_range(double low, double high) {
         const double range = high - low;
-        if (!std::isfinite(range)) throw std::overflow_error("high - low range exceeds valid bounds");
-        if (std::signbit(range)) throw std::invalid_argument("high - low < 0");
+        if (!std::isfinite(range)) throw OverflowError("high - low range exceeds valid bounds");
+        if (std::signbit(range)) throw ValueError("high - low < 0");
         return range;
     }
 

@@ -34,12 +34,9 @@ namespace qt {
 struct shape_error : std::invalid_argument {   // NumPy: ValueError (shapes), IndexError (bounds)
     using std::invalid_argument::invalid_argument;
 };
-struct index_error : std::out_of_range {       // NumPy: IndexError
-    using std::out_of_range::out_of_range;
-};
-struct linalg_error : std::invalid_argument {  // numpy.linalg.LinAlgError (a ValueError)
-    using std::invalid_argument::invalid_argument;
-};
+using index_error = IndexError;  // NumPy's IndexError
+QT_USER_EXCEPTION(LinAlgError, ValueError)  // numpy.linalg.LinAlgError, a ValueError
+using linalg_error = LinAlgError;
 }  // namespace qt
 
 #ifndef eigen_assert
@@ -124,7 +121,7 @@ inline Vec linspace(double start, double stop, long long num = 50) {
 // np.arange(start, stop, step): length ceil((stop - start) / step); NumPy fills element i
 // as start + i * (second - first), where second = start + step.
 inline Vec arange(double start, double stop, double step = 1.0) {
-    if (step == 0.0) throw std::domain_error("division by zero");  // NumPy: ZeroDivisionError
+    if (step == 0.0) throw ZeroDivisionError("division by zero");  // NumPy's own message
     const double len = std::ceil((stop - start) / step);
     if (std::isnan(len)) throw shape_error("arange: cannot compute length");
     const Index n = len > 0 ? static_cast<Index>(len) : 0;
@@ -692,7 +689,7 @@ bool has_nan(const Eigen::ArrayBase<D>& a) {
 // which interpolates from whichever end is nearer.
 template <class D>
 double quantile(const Eigen::ArrayBase<D>& a, double q) {
-    if (!(q >= 0.0 && q <= 1.0)) throw std::invalid_argument("Quantiles must be in the range [0, 1]");
+    if (!(q >= 0.0 && q <= 1.0)) throw ValueError("Quantiles must be in the range [0, 1]");
     Vec v = a;
     const Index n = v.size();
     if (n == 0) throw index_error("index -1 is out of bounds for axis 0 with size 0");

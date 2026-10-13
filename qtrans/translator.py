@@ -22,6 +22,7 @@ from pathlib import Path
 from . import library as lib
 from .errors import Unsupported
 from .unicode_tables import header_path as unicode_header_path
+from .pyfacts import header_path as python_header_path
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
 from . import loops
@@ -33,7 +34,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, assignable, is_array)
 
-VERSION = "0.11.3"
+VERSION = "0.12.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -45,6 +46,7 @@ RANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_random.hpp"
 PRINT_HEADER = Path(__file__).parent / "runtime" / "qtrans_print.hpp"
 LIST_HEADER = Path(__file__).parent / "runtime" / "qtrans_list.hpp"
 UNICODE_HEADER = unicode_header_path()  # qtrans_list.hpp includes it: this Python's Unicode tables
+PYTHON_HEADER = python_header_path()  # qtrans_runtime.hpp includes it: this Python's error messages
 
 
 @functools.lru_cache(maxsize=None)
@@ -421,9 +423,8 @@ class ModuleTranslator:
     # --- classes (stage 5) -------------------------------------------------------------
     def _register_class(self, node):
         self.class_owner[node.name] = self.module_name
-        if any(isinstance(b, ast.Name) and (b.id.endswith("Error") or b.id.endswith("Exception")) for b in node.bases):
-            self.report.module_notes.append(f"line {node.lineno}: exception class `{node.name}` skipped "
-                                            "(raise ValueError / RuntimeError instead)")
+        if self._is_exception_class(node):
+            self._register_exception(node)
             return
         try:
             is_dc, frozen, eq, nt = cls_.dataclass_options(self, node)
@@ -435,6 +436,88 @@ class ModuleTranslator:
             self.classes[node.name] = cls_.ClassInfo(node.name, node, eq=False, plain=True)
             return
         self.classes[node.name] = cls_.ClassInfo(node.name, node, frozen=frozen, eq=eq, namedtuple=nt)
+
+    # --- your own exception classes: class PricingError(ValueError): pass ------------------------
+    def _exception_named(self, node):
+        """(C++ class, Python name) of the exception class `node` names, or None: one of yours, a
+        built-in (ValueError, ...), or numpy.linalg.LinAlgError."""
+        exc = self.__dict__.setdefault("exc_classes", {})
+        if isinstance(node, ast.Name):
+            if node.id in exc:
+                info = exc[node.id]
+                if info["rejected"] is not None:
+                    raise info["rejected"]
+                return cpp_ident(node.id), node.id
+            if node.id in lib.EXCEPTIONS and node.id not in self.classes and node.id not in self.fdefs \
+                    and node.id not in self.imports:
+                return lib.EXCEPTIONS[node.id], node.id
+        q = _ConstTranslator(self).qualify(node) if isinstance(node, (ast.Name, ast.Attribute)) else None
+        if q in ("numpy.linalg.LinAlgError", "numpy.linalg.linalg.LinAlgError", "numpy.linalg.exceptions.LinAlgError"):
+            return "qt::LinAlgError", "LinAlgError"
+        return None
+
+    def _is_exception_class(self, node) -> bool:
+        for b in node.bases:
+            if self._exception_named_quiet(b) is not None:
+                return True
+            if isinstance(b, ast.Name) and (b.id.endswith("Error") or b.id.endswith("Exception")):
+                return True
+        return False
+
+    def _exception_named_quiet(self, node):
+        try:
+            return self._exception_named(node)
+        except Unsupported:
+            return ("rejected", "rejected")
+
+    def _register_exception(self, node):
+        """class X(Base): pass / a docstring: a C++ struct deriving from Base's, named X to Python."""
+        exc = self.__dict__.setdefault("exc_classes", {})
+        reason, base = None, None
+        if len(node.bases) != 1 or node.keywords or node.decorator_list:
+            reason = Unsupported(node, f"exception class {node.name}: one base class, no decorators or keywords "
+                                       "is what is supported")
+        else:
+            try:
+                base = self._exception_named(node.bases[0])
+            except Unsupported as e:
+                reason = Unsupported(node, f"exception class {node.name} derives from a class that couldn't be "
+                                           f"translated: {e.message}")
+            if base is None and reason is None:
+                reason = Unsupported(node, f"exception class {node.name} derives from {ast.unparse(node.bases[0])}, "
+                                           "which is not supported",
+                                     "derive from Exception, ValueError, ArithmeticError, LookupError, RuntimeError, ...")
+            if base is not None and base[1] == "BaseException":
+                reason = Unsupported(node, "deriving from BaseException is not supported", "derive from Exception")
+        body = list(node.body)
+        doc = None
+        if body and is_docstring(body[0]):
+            doc, body = inspect.cleandoc(body[0].value.value), body[1:]
+        if reason is None and any(not isinstance(b, ast.Pass) and not (isinstance(b, ast.Expr) and
+                                                                      isinstance(b.value, ast.Constant)) for b in body):
+            reason = Unsupported(node, f"exception class {node.name} has fields or methods: only `pass` or a docstring "
+                                       "is supported", "put the details in the message: raise "
+                                                       f"{node.name}(f\"... {{value}}\")")
+        exc[node.name] = {"node": node, "base": base, "doc": doc, "rejected": reason}
+        if reason is not None:
+            self.report.module_notes.append(f"line {node.lineno}: exception class `{node.name}` not translated: "
+                                            f"{reason.message}")
+
+    def render_exceptions(self) -> list:
+        out = []
+        for name, info in self.__dict__.get("exc_classes", {}).items():
+            if info["rejected"] is not None:
+                continue
+            node, (base_cpp, base_py) = info["node"], info["base"]
+            mark = source_mark(node.lineno, node.end_lineno)
+            if info["doc"]:
+                out += [("/// " + line).rstrip() + mark for line in info["doc"].splitlines()]
+            cpp = cpp_ident(name)
+            out += [f"struct {cpp} : {base_cpp} {{  // class {name}({ast.unparse(node.bases[0])})" + mark,
+                    f"    using {base_cpp}::{base_cpp.split('::')[-1]};" + mark,
+                    f"    const char* type_name() const noexcept override {{ return {cpp_string_literal(name)}; }}" + mark,
+                    "};" + mark, ""]
+        return out
 
     def _collect_classes(self):
         """Fields, defaults and method signatures of every class, once all names are known."""
@@ -756,6 +839,7 @@ class ModuleTranslator:
             return None
         names = {c.cpp for c in self.constants.values() if not c.external}
         names |= {cpp_ident(n) for n, i in self.classes.items() if not i.external}
+        names |= {cpp_ident(n) for n, i in self.__dict__.get("exc_classes", {}).items() if i["rejected"] is None}
         names |= {self.sigs[n].cpp for n in self.fdefs if n in self.sigs and "." not in n}
         if not names:
             return code
@@ -939,6 +1023,71 @@ class ModuleTranslator:
         if pending:
             self._infer_from_calls(pending)
         self.analyze_array_params()
+        self._find_strict()
+
+    # --- code whose float errors a Python `except` may catch ------------------------------------
+    def _catches_float_errors(self, t: ast.Try) -> bool:
+        for h in t.handlers:
+            types = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
+            for x in types:
+                if x is None:
+                    continue
+                named = self._exception_named_quiet(x)
+                if named is not None and named[1] in lib.FLOAT_ERRORS:
+                    return True
+        return False
+
+    def _find_strict(self):
+        """The functions (and the program) whose code can run inside a `try` with a handler for an
+        error a Python float raises where a C++ double carries on (ZeroDivisionError for 1.0 / 0.0,
+        ValueError for math.sqrt(-1), OverflowError for math.exp(1000), ArithmeticError,
+        Exception): those are translated to raise them as Python does. That's the function holding
+        the try, and everything its try block calls, all the way down."""
+        self.strict, self.strict_blockers = set(), {}
+        bodies = dict(self.fdefs)
+        if self.is_program and self.main_body:
+            bodies[PROGRAM] = ast.Module(body=list(self.main_body), type_ignores=[])
+        methods = {}
+        for key in self.fdefs:
+            if "." in key:
+                methods.setdefault(key.split(".", 1)[1], []).append(key)
+        variants = getattr(self, "variants", {})
+
+        def callees(nodes):
+            out, ext = set(), []
+            for n in (m for x in nodes for m in ast.walk(x)):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                    name = n.func.id
+                    if name in self.fdefs:
+                        out.add(name)
+                    out |= set(variants.get(name, ()))
+                    if name in self.classes:
+                        out |= {k for k in self.fdefs if k.startswith(name + ".")}
+                    if name in self.imported:
+                        ext.append(name)
+                elif isinstance(n, ast.Attribute):
+                    out |= set(methods.get(n.attr, ()))
+            return out, ext
+
+        work = []
+        for key, f in bodies.items():
+            for t in (n for n in ast.walk(f) if isinstance(n, ast.Try)):
+                if not self._catches_float_errors(t):
+                    continue
+                self.strict.add(key)
+                reach, ext = callees(t.body)
+                if ext:
+                    self.strict_blockers[id(t)] = (
+                        f"the try block calls {ext[0]}() from another module of the project, whose float errors "
+                        "(1.0 / 0.0, math.sqrt(-1)) can't be raised as Python raises them from here")
+                work += list(reach)
+        while work:
+            k = work.pop()
+            if k in self.strict:
+                continue
+            self.strict.add(k)
+            reach, ext = callees([self.fdefs[k]])
+            work += list(reach)
 
     # --- types of unannotated functions, from how the file calls them ----------------------------
     def _main_fdef(self):
@@ -1844,6 +1993,9 @@ class ModuleTranslator:
         result.heads = {n: "inline " + self.cpp_signature(self.sigs[n], defaults=False)
                         for n in self.fdefs if n in self.sigs and not self.sigs[n].owner}
         result.rejections = {n: e.message for n, e in self.rejected.items()}
+        # your exception classes: name -> (the Python base it derives from, docstring), in order
+        result.exceptions = {n: (i["base"][1], i["doc"]) for n, i in self.__dict__.get("exc_classes", {}).items()
+                             if i["rejected"] is None}
         result.fingerprint_of = self.fingerprint
         for fr in self.report.functions:
             if fr.name in result.overrides:
@@ -2118,6 +2270,7 @@ class ModuleTranslator:
                 out.append(f"inline const {c.type.cpp()} {c.cpp} = {c.code};{tail}" + (source_mark(c.lineno, c.lineno) if c.lineno else ""))
             out.append("")
 
+        out += self.render_exceptions()
         live = [self.classes[n] for n in getattr(self, "class_order", []) if self.classes[n].rejected is None]
         for info in live:
             out += self.render_struct(info, bodies)
@@ -2277,14 +2430,15 @@ def translate_file(path, out_dir=None) -> TranslationResult:
             (out / f"{path.stem}.cpp").write_text(result.program, encoding="utf-8")
         (out / f"{path.stem}_report.md").write_text(result.report.to_markdown(), encoding="utf-8")
         if result.uses_runtime:
-            (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
+            for h in (RUNTIME_HEADER, PYTHON_HEADER):
+                (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
         everything = result.header + (result.program or "")
         if result.uses_arrays or "qtrans_arrays.hpp" in everything or "qtrans_random.hpp" in everything:
-            (out / "qtrans_arrays.hpp").write_text(ARRAYS_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
-            (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
+            for h in (ARRAYS_HEADER, RUNTIME_HEADER, PYTHON_HEADER):
+                (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
         if result.uses_random or "qtrans_random.hpp" in everything:
             (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
         if re.search(r"qtrans_(print|list)\.hpp", result.header + (result.program or "")):
-            for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+            for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
                 (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
     return result
