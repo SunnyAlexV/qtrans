@@ -466,7 +466,7 @@ def explain_file(path, function: str | None = None) -> ModuleView:
     from .translator import translate_file
     path = Path(path)
     result = translate_file(path)
-    view = explain_result(result, path.read_text(encoding="utf-8"), str(path))
+    view = explain_result(result, path.read_text(encoding="utf-8-sig"), str(path))
     if function:
         view.functions = [f for f in view.functions if f.name == function or f.name.split(".")[-1] == function]
         if not view.functions:

@@ -96,7 +96,7 @@ class ProjectResult:
                or "qtrans_list.hpp" in r.header + (r.program or "")
                for r in self.modules.values()):
             for h in headers:
-                (out / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")
+                (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
         return out
 
 
@@ -123,7 +123,7 @@ def discover(paths) -> tuple[dict, dict]:
                 raise ProjectError(f"two modules named {name}: {found[name]} and {path}")
             continue
         found[name] = path
-        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), str(path))
         edges[name] = _imports_of(tree, path.parent)
         todo += [path.parent / f"{d}.py" for d in edges[name]]
     return found, edges
@@ -161,7 +161,7 @@ def translate_project(paths, out_dir=None) -> ProjectResult:
     done, results = {}, {}
     for name in _order(edges):
         path = found[name]
-        t = ModuleTranslator(path.read_text(encoding="utf-8"), name, str(path), deps=done)
+        t = ModuleTranslator(path.read_text(encoding="utf-8-sig"), name, str(path), deps=done)
         results[name] = t.translate()
         done[name] = t
     owners = {}

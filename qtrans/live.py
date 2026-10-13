@@ -118,7 +118,7 @@ def translate_text(text: str, path: Path) -> dict:
         while todo:  # the project modules it imports, as they are on disk
             f = todo.pop()
             try:
-                tree = ast.parse(f.read_text(encoding="utf-8"))
+                tree = ast.parse(f.read_text(encoding="utf-8-sig"))
             except SyntaxError:
                 continue
             for m in _sibling_imports(tree, path.parent) - seen:
@@ -208,12 +208,13 @@ class Document:
         if not path.exists():
             path.write_text("import numpy as np\nfrom qtrans.typing import Mat, Vec\n\n\n"
                             "def f(x: float) -> float:\n    return x * x\n", encoding="utf-8")
-        raw = path.read_bytes().decode("utf-8")
-        self.crlf = "\r\n" in raw
+        raw = path.read_bytes()
+        self.bom = raw.startswith(b"\xef\xbb\xbf")  # Notepad and Windows PowerShell 5 start UTF-8 files with one
+        self.crlf = b"\r\n" in raw
 
     def read(self):
         with self.lock:
-            raw = self.path.read_bytes().decode("utf-8")
+            raw = self.path.read_bytes().decode("utf-8-sig")
             return raw.replace("\r\n", "\n"), str(self.path.stat().st_mtime_ns)
 
     def write(self, text: str, base_mtime: int | None):
@@ -221,12 +222,12 @@ class Document:
         with self.lock:
             now = str(self.path.stat().st_mtime_ns)  # a string: nanoseconds don't fit a JS number
             if base_mtime is not None and now != str(base_mtime):
-                return False, now, self.path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+                return False, now, self.path.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
             data = text.replace("\r\n", "\n")
             if self.crlf:
                 data = data.replace("\n", "\r\n")
             tmp = self.path.with_name(self.path.name + ".qtrans-live.tmp")
-            tmp.write_bytes(data.encode("utf-8"))
+            tmp.write_bytes((b"\xef\xbb\xbf" if self.bom else b"") + data.encode("utf-8"))  # kept as it was
             tmp.replace(self.path)  # never a half-written file
             return True, str(self.path.stat().st_mtime_ns), None
 
@@ -322,7 +323,7 @@ class _Server(ThreadingHTTPServer):
 
 def serve(path, port: int = 0, open_browser: bool = True, ready=None):
     """Run the server until interrupted. `ready(url, server)` is called once it listens."""
-    PAGE = (Path(__file__).with_name("live_page.html")).read_text(encoding="utf-8")
+    PAGE = (Path(__file__).with_name("live_page.html")).read_text(encoding="utf-8-sig")
     path = Path(path).resolve()
     doc = Document(path)
     token = secrets.token_urlsafe(24)

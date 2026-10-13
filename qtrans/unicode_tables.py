@@ -196,7 +196,7 @@ def generate() -> str:
 
 def shipped_version() -> str | None:
     try:
-        for line in SHIPPED.read_text(encoding="utf-8").splitlines()[:20]:
+        for line in SHIPPED.read_text(encoding="utf-8-sig").splitlines()[:20]:
             if line.startswith("#define QTRANS_UNICODE_VERSION"):
                 return line.split('"')[1]
     except OSError:
@@ -207,7 +207,7 @@ def shipped_version() -> str | None:
 def header_for_this_python() -> str:
     """The header text matching the running Python (the shipped one when the versions agree)."""
     if shipped_version() == unicodedata.unidata_version:
-        return SHIPPED.read_text(encoding="utf-8")
+        return SHIPPED.read_text(encoding="utf-8-sig")
     return generate()
 
 

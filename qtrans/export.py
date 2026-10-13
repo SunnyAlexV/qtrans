@@ -38,7 +38,7 @@ from .types import BOOL, FLOAT, INT, RNG, STR, VOID, ArrayType, DictType, ListTy
 
 def _source_hash(p) -> str:
     """As in the headers: SHA-256 of the source with Windows line ends as Unix ones."""
-    return hashlib.sha256(Path(p).read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(Path(p).read_text(encoding="utf-8-sig").replace("\r\n", "\n").encode("utf-8")).hexdigest()[:16]
 
 
 def _cmake_name(name: str) -> str:

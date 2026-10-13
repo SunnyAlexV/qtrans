@@ -38,7 +38,7 @@ class FunctionInfo:
 def inspect_file(path) -> list:
     from .translator import translate_file
     path = Path(path)
-    source = path.read_text(encoding="utf-8")
+    source = path.read_text(encoding="utf-8-sig")
     result = translate_file(path)
     tree = ast.parse(source)
     names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}

@@ -47,6 +47,8 @@ def _inputs(files):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="qtrans", description="Translate typed quant Python into readable C++.")
+    from .translator import VERSION
+    ap.add_argument("--version", action="version", version=f"qtrans {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     t = sub.add_parser("translate", help="write <module>.hpp (one per module), <module>.cpp for a program, and a report")

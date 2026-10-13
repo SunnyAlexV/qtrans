@@ -833,7 +833,7 @@ def _probe_complex(fn, args, sig):
     (`v > x ** 0.5` compares by the real part)."""
     try:
         path = inspect.getsourcefile(fn)
-        src = Path(path).read_text(encoding="utf-8")
+        src = Path(path).read_text(encoding="utf-8-sig")
     except (TypeError, OSError):
         return ("ok", False)
     went = []
@@ -942,7 +942,7 @@ def load_module(path, name=None):
     try:
         # a program's top-level code (what becomes int main()) is left out: importing the file
         # to call its functions must not run the program (it is run on its own, see run_program)
-        tree = library_tree(ast.parse(path.read_text(encoding="utf-8"), str(path)))
+        tree = library_tree(ast.parse(path.read_text(encoding="utf-8-sig"), str(path)))
         exec(compile(tree, str(path), "exec"), mod.__dict__)
     except BaseException:
         sys.modules.pop(name, None)
@@ -1845,7 +1845,7 @@ def linalg_functions(paths) -> set:
     (of any module given): where 'edge' applies (see edge_inputs)."""
     direct, calls = set(), {}
     for p in paths:
-        tree = ast.parse(Path(p).read_text(encoding="utf-8"))
+        tree = ast.parse(Path(p).read_text(encoding="utf-8-sig"))
         defs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
         defs += [m for c in tree.body if isinstance(c, ast.ClassDef) for m in c.body if isinstance(m, ast.FunctionDef)]
         for f in defs:
@@ -1886,7 +1886,7 @@ def edge_inputs(args) -> bool:
 def lapack_functions(path) -> set:
     """Functions that call numpy.linalg's LAPACK-backed routines, directly or through other
     functions of the module. Only for these is normwise error the right yardstick."""
-    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    tree = ast.parse(Path(path).read_text(encoding="utf-8-sig"))
     defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     direct = {name for name, f in defs.items() if any(
         isinstance(n, ast.Attribute) and n.attr in _LAPACK for n in ast.walk(f))}
@@ -1990,7 +1990,7 @@ def setup_inputs(project, pymods):
     global _STRINGS, _CLASSES, _INIT_PARAMS
     lits, text = set(), False
     for p in project.paths.values():
-        for n in ast.walk(ast.parse(Path(p).read_text(encoding="utf-8"))):
+        for n in ast.walk(ast.parse(Path(p).read_text(encoding="utf-8-sig"))):
             if isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 80:
                 lits.add(n.value)
             elif isinstance(n, ast.Call) and (
@@ -2022,7 +2022,7 @@ def project_lapack_functions(project) -> set:
     """lapack_functions across modules (a function calling an imported one that uses LAPACK)."""
     direct, calls = set(), {}
     for p in project.paths.values():
-        tree = ast.parse(Path(p).read_text(encoding="utf-8"))
+        tree = ast.parse(Path(p).read_text(encoding="utf-8-sig"))
         for f in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
             if any(isinstance(n, ast.Attribute) and n.attr in _LAPACK for n in ast.walk(f)):
                 direct.add(f.name)

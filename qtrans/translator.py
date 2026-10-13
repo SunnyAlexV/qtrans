@@ -33,7 +33,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, assignable, is_array)
 
-VERSION = "0.11.1"
+VERSION = "0.11.2"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -50,10 +50,10 @@ UNICODE_HEADER = unicode_header_path()  # qtrans_list.hpp includes it: this Pyth
 @functools.lru_cache(maxsize=None)
 def _list_names() -> frozenset:
     """The qt::py names qtrans_list.hpp defines (code using one includes it)."""
-    text = LIST_HEADER.read_text(encoding="utf-8")
+    text = LIST_HEADER.read_text(encoding="utf-8-sig")
     names = set(re.findall(r"^(?:inline |template <[^>]*>\s*)?[\w:<>,&* ]+?\b(\w+)\(", text, re.M))
     names |= set(re.findall(r"^(?:struct|class) (\w+)", text, re.M)) | {"none", "dict"}
-    printing = set(re.findall(r"\b(\w+)\(", (LIST_HEADER.parent / "qtrans_print.hpp").read_text(encoding="utf-8")))
+    printing = set(re.findall(r"\b(\w+)\(", (LIST_HEADER.parent / "qtrans_print.hpp").read_text(encoding="utf-8-sig")))
     names = (names - printing) | {"item", "slice", "sum", "sum_left", "min", "max", "sorted", "sort", "pop", "insert",
                                   "index", "count", "contains", "concat", "range_list", "repeat", "len", "none",
                                   "join", "dict", "KeyError", "isdigit"}
@@ -2267,7 +2267,7 @@ def translate_file(path, out_dir=None) -> TranslationResult:
     from .project import discover, translate_project
     if len(discover([path])[0]) > 1:
         return translate_project([path], out_dir).modules[path.stem]
-    result = translate_source(path.read_text(encoding="utf-8"), path.stem, str(path))
+    result = translate_source(path.read_text(encoding="utf-8-sig"), path.stem, str(path))
     if out_dir is not None:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
@@ -2277,14 +2277,14 @@ def translate_file(path, out_dir=None) -> TranslationResult:
             (out / f"{path.stem}.cpp").write_text(result.program, encoding="utf-8")
         (out / f"{path.stem}_report.md").write_text(result.report.to_markdown(), encoding="utf-8")
         if result.uses_runtime:
-            (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
+            (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
         everything = result.header + (result.program or "")
         if result.uses_arrays or "qtrans_arrays.hpp" in everything or "qtrans_random.hpp" in everything:
-            (out / "qtrans_arrays.hpp").write_text(ARRAYS_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
-            (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
+            (out / "qtrans_arrays.hpp").write_text(ARRAYS_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
+            (out / "qtrans_runtime.hpp").write_text(RUNTIME_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
         if result.uses_random or "qtrans_random.hpp" in everything:
-            (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8"), encoding="utf-8")
+            (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
         if re.search(r"qtrans_(print|list)\.hpp", result.header + (result.program or "")):
             for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
-                (out / h.name).write_text(h.read_text(encoding="utf-8"), encoding="utf-8")
+                (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
     return result

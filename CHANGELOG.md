@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.2
+
+- A Python file saved with a UTF-8 byte-order mark (Windows Notepad, and Windows PowerShell 5's
+  `Out-File` / `Set-Content -Encoding utf8`, write one) is read as Python reads it; qtrans
+  stopped with `SyntaxError: invalid non-printable character U+FEFF`. `qtrans live` keeps the
+  mark when it saves, as it keeps the line endings.
+- `qtrans --version`.
+
 ## 0.11.1
 
 - A program that prints text beyond ASCII shows it in a Windows console window as Python does.

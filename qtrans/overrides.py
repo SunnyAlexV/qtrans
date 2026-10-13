@@ -77,7 +77,7 @@ def load(source_path) -> OverridesFile | None:
     p = path_for(source_path)
     if not p.is_file():
         return None
-    return parse(p.read_text(encoding="utf-8"), p)
+    return parse(p.read_text(encoding="utf-8-sig"), p)
 
 
 def parse(text: str, path=Path("<overrides>")) -> OverridesFile:
@@ -317,7 +317,7 @@ def today() -> str:
 
 def add_block(source_path, name, head, body_lines, fp, comments=()) -> Path:
     p = path_for(source_path)
-    text = p.read_text(encoding="utf-8") if p.is_file() else \
+    text = p.read_text(encoding="utf-8-sig") if p.is_file() else \
         HEADER.format(name=p.name, py=Path(source_path).name)
     if p.is_file() and name in parse(text, p).blocks:
         raise OverrideError(f"{p.name} already has a block for {name}()")
@@ -331,7 +331,7 @@ def add_block(source_path, name, head, body_lines, fp, comments=()) -> Path:
 def restamp(source_path, name, fp) -> Path:
     """Record that the block for `name` was checked against the Python whose fingerprint is fp."""
     p = path_for(source_path)
-    lines = p.read_text(encoding="utf-8").split("\n")
+    lines = p.read_text(encoding="utf-8-sig").split("\n")
     for k, line in enumerate(lines):
         m = OPEN.match(line)
         if m and m.group(1) == name:
@@ -343,7 +343,7 @@ def restamp(source_path, name, fp) -> Path:
 
 def remove_block(source_path, name) -> Path:
     p = path_for(source_path)
-    lines = p.read_text(encoding="utf-8").split("\n")
+    lines = p.read_text(encoding="utf-8-sig").split("\n")
     start = next((k for k, l in enumerate(lines) if OPEN.match(l) and OPEN.match(l).group(1) == name), None)
     if start is None:
         raise OverrideError(f"{p.name} has no block for {name}()")
@@ -413,9 +413,9 @@ def command(file, name=None, accept=False, remove=False, show=False, out=print) 
         body = strip_marks("\n".join(res.bodies[name]))[0].split("\n")
         comments = [f"// started from qtrans's translation of {name}(); edit freely: `qtrans verify` checks it"]
     else:
-        fdef = next(n for n in ast.parse(src.read_text(encoding="utf-8")).body
+        fdef = next(n for n in ast.parse(src.read_text(encoding="utf-8-sig")).body
                     if isinstance(n, ast.FunctionDef) and n.name == name)
-        py = ast.get_source_segment(src.read_text(encoding="utf-8"), fdef) or ""
+        py = ast.get_source_segment(src.read_text(encoding="utf-8-sig"), fdef) or ""
         body = [f"    // qtrans can't translate {name}() itself ({res.rejections.get(name, 'see the report')});",
                 "    // write it here. The Python, for reference:"] + \
                [f"    //   {line}" for line in py.splitlines()] + \
