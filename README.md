@@ -628,6 +628,10 @@ version. A test compares all 1,112,064 characters against Python. A method whose
 all literals is worked out when translating. Not supported, with the reason: `rsplit`,
 `partition`, `rfind`, `splitlines`, `expandtabs`, `translate`, `encode`.
 
+On a Windows console window, a program's text beyond ASCII shows as Python shows it: such a
+program starts with `qt::py::windows_console console;`, which writes characters to the console
+as Python does (WriteConsoleW) and leaves files, pipes and other systems as UTF-8.
+
 The verifier's random strings come from the module's own string literals, so branches like
 `if stance == "Long only":` run; code that takes text apart also gets text made to break it
 (padding, mixed case, `1_000.25`, `-nan`, `ΟΔΟΣ ΣΑΣ`, Arabic-Indic digits, no-break spaces).

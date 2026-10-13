@@ -128,6 +128,10 @@ def main(out_dir):
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "2_live_program_line.png"))
         shots.append("2_live_program_line.png")
+        page.evaluate("goToLine(32)")  # text beyond ASCII in the program: main() writes to a Windows console as Python
+        page.wait_for_timeout(400)
+        page.screenshot(path=str(out / "2b_live_program_main.png"))
+        shots.append("2b_live_program_main.png")
         page.click("#verify")
         page.wait_for_function("document.querySelector('#why #closeverify') !== null", timeout=300000)
         page.wait_for_timeout(300)

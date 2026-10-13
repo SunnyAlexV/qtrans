@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.1
+
+- A program that prints text beyond ASCII shows it in a Windows console window as Python does.
+  Python writes characters to the console (WriteConsoleW); the C++ wrote UTF-8 bytes, which the
+  console read in its code page (`straße` came out as `straÃe`). Such a program now starts
+  with `qt::py::windows_console console;`, which writes characters there too and changes
+  nothing anywhere else (files, pipes, Linux, macOS: UTF-8, as Python writes in UTF-8 mode, the
+  default from 3.15). `tools/windows_console_check.py` shows both side by side under Wine.
+- The runtime headers are plain ASCII, so MSVC reads them the same in every code page.
+
 ## 0.11.0
 
 - **Strings:** Python's str methods (`split`, `strip`, `replace`, `find`, `count`, `startswith`,

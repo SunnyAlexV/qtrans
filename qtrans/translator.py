@@ -33,7 +33,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, assignable, is_array)
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -2230,18 +2230,29 @@ class ModuleTranslator:
             any(re.search(rf"\b{re.escape(c)}\(", code) for c in calls)
         guard = getattr(self, "main_guard", None)
         head = "int main() {" + (source_mark(guard.lineno, guard.test.end_lineno) if guard is not None else "")
+        console = []
+        if re.search(r"std::(cout|cerr)\b", "\n".join(out + rest + body)) and _has_non_ascii_text(self.tree):
+            # text beyond ASCII to print: on a Windows console it shows as Python shows it
+            name, used = "console", {n.id for n in ast.walk(self.tree) if isinstance(n, ast.Name)}
+            while name in used:
+                name += "_"
+            console = [f"    qt::py::windows_console {name};  // print() to a Windows console as Python does"]
         if risky:
             # an exception Python wouldn't catch ends the program with its message and exit status 1
-            out_main = [head, "    try {"] + ["    " + l if l.strip() else l for l in body] + [
+            out_main = [head] + console + ["    try {"] + ["    " + l if l.strip() else l for l in body] + [
                 "    } catch (const std::exception& e) {",
                 "        std::cerr << e.what() << '\\n';",
                 "        return 1;",
                 "    }",
                 "}"]
         else:
-            out_main = [head] + body + ["}"]
+            out_main = [head] + console + body + ["}"]
         text = "\n".join(out + rest + out_main) + "\n"
         return text.replace("@@INCLUDES@@", "\n".join(self._include_block(text, bodies)))
+
+
+def _has_non_ascii_text(tree) -> bool:
+    return any(isinstance(n, ast.Constant) and isinstance(n.value, str) and not n.value.isascii() for n in ast.walk(tree))
 
 
 def translate_source(source: str, module_name: str = "module", filename: str = "<input>") -> TranslationResult:

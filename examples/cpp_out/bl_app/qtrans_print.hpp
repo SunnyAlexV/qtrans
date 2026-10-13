@@ -27,6 +27,20 @@
 #include "qtrans_runtime.hpp"
 #include "qtrans_unicode.hpp"  // the Unicode tables of Python's str methods and repr()
 
+#include <iostream>
+#include <streambuf>
+
+#if defined(_WIN32)
+// The three Windows calls console output needs, declared as <windows.h> declares them (so the
+// two agree if both are included); <windows.h> itself defines macros such as min, max, small
+// and near that would break ordinary code.
+extern "C" {
+__declspec(dllimport) void* __stdcall GetStdHandle(unsigned long);
+__declspec(dllimport) int __stdcall GetConsoleMode(void*, unsigned long*);
+__declspec(dllimport) int __stdcall WriteConsoleW(void*, const void*, unsigned long, unsigned long*, void*);
+}
+#endif
+
 namespace qt {
 namespace py {
 
@@ -37,7 +51,7 @@ struct Digits {
     bool neg = false;
 };
 
-// "d.ddddde±x" from snprintf -> Digits (trailing zeros dropped)
+// "d.ddddde+-x" from snprintf -> Digits (trailing zeros dropped)
 inline Digits parse_e(const char* s) {
     Digits r;
     if (*s == '-') { r.neg = true; ++s; }
@@ -802,6 +816,119 @@ template <class A, class>
 std::string str(const A& a) { return array_str_or_repr(a, false); }
 template <class A, class, class>
 std::string repr(const A& a) { return array_str_or_repr(a, true); }
+
+// --- text on a Windows console -----------------------------------------------------------------
+// Python writes to a Windows console window as characters (WriteConsoleW), so print() of Greek
+// or Arabic text shows it as it is, whatever the console's code page. std::cout writes bytes, which the console would
+// read in its code page (437, 1252, ...) and show as other characters. In main():
+//     qt::py::windows_console console;
+// makes std::cout and std::cerr do what Python does there: on a console, characters, written at
+// once (nothing is held back, so std::exit loses nothing); anywhere else (a file, a pipe) and on
+// every other system nothing changes, and the text goes out as UTF-8 bytes, as Python writes it
+// in UTF-8 mode (python -X utf8, and the default from Python 3.15).
+
+// UTF-8 to UTF-16: the complete characters at the start of [p, p + n), appended to out; the
+// bytes used (a character cut off at the end waits for the rest)
+inline std::size_t utf8_to_utf16(const char* p, std::size_t n, std::u16string& out) {
+    std::size_t k = 0;
+    while (k < n) {
+        const unsigned char c = static_cast<unsigned char>(p[k]);
+        const std::size_t len = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (k + len > n) break;
+        char32_t v = len == 1 ? c : (c & (0x7Fu >> len));
+        for (std::size_t i = 1; i < len; ++i) v = (v << 6) | (static_cast<unsigned char>(p[k + i]) & 0x3Fu);
+        if (v >= 0x10000) {
+            v -= 0x10000;
+            out += static_cast<char16_t>(0xD800 + (v >> 10));
+            out += static_cast<char16_t>(0xDC00 + (v & 0x3FF));
+        } else {
+            out += static_cast<char16_t>(v);
+        }
+        k += len;
+    }
+    return k;
+}
+
+#if defined(_WIN32)
+class console_buf : public std::streambuf {
+public:
+    explicit console_buf(void* handle) : handle_(handle) {}
+    ~console_buf() override { flush_all(); }
+
+protected:
+    int_type overflow(int_type ch) override {
+        if (traits_type::eq_int_type(ch, traits_type::eof())) return traits_type::not_eof(ch);
+        pending_ += traits_type::to_char_type(ch);
+        flush_all();
+        return ch;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        pending_.append(s, static_cast<std::size_t>(n));
+        flush_all();
+        return n;
+    }
+    int sync() override {
+        flush_all();
+        return 0;
+    }
+
+private:
+    void flush_all() {
+        std::u16string text;
+        const std::size_t used = utf8_to_utf16(pending_.data(), pending_.size(), text);
+        pending_.erase(0, used);
+        const char16_t* at = text.data();
+        std::size_t left = text.size();
+        while (left > 0) {
+            unsigned long done = 0;
+            const unsigned long part = left > 8192 ? 8192ul : static_cast<unsigned long>(left);
+            if (!WriteConsoleW(handle_, at, part, &done, nullptr) || done == 0) break;
+            at += done;
+            left -= done;
+        }
+    }
+    void* handle_;
+    std::string pending_;
+};
+#endif
+
+class windows_console {
+public:
+    windows_console() {
+#if defined(_WIN32)
+        attach(std::cout, static_cast<unsigned long>(-11), out_, old_out_);  // STD_OUTPUT_HANDLE
+        attach(std::cerr, static_cast<unsigned long>(-12), err_, old_err_);  // STD_ERROR_HANDLE
+#endif
+    }
+    ~windows_console() {
+#if defined(_WIN32)
+        std::cout.flush();
+        std::cerr.flush();
+        if (out_) std::cout.rdbuf(old_out_);
+        if (err_) std::cerr.rdbuf(old_err_);
+        delete out_;
+        delete err_;
+#endif
+    }
+    windows_console(const windows_console&) = delete;
+    windows_console& operator=(const windows_console&) = delete;
+
+private:
+#if defined(_WIN32)
+    static void attach(std::ostream& os, unsigned long which, console_buf*& buf, std::streambuf*& old) {
+        void* h = GetStdHandle(which);
+        unsigned long mode = 0;
+        if (h == nullptr || h == reinterpret_cast<void*>(-1) || !GetConsoleMode(h, &mode)) return;  // not a console
+        os.flush();
+        buf = new console_buf(h);
+        old = os.rdbuf(buf);
+    }
+    console_buf* out_ = nullptr;
+    console_buf* err_ = nullptr;
+    std::streambuf* old_out_ = nullptr;
+    std::streambuf* old_err_ = nullptr;
+#endif
+};
 
 }  // namespace py
 }  // namespace qt

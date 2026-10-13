@@ -245,3 +245,49 @@ def test_string_refusals(src, words):
         assert not bad and 'qt::py::split(s, "")' in r.header
         return
     assert bad and words in bad[0].reason, r.report.to_text()
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_utf8_to_utf16_for_every_code_point(tmp_path):
+    """What qt::py::windows_console hands the Windows console (UTF-16), for every character,
+    against Python's own encoder; a character cut off at the end of the bytes waits."""
+    for h in (RUNTIME_HEADER, PRINT_HEADER, UNICODE_HEADER):
+        shutil.copy(h, tmp_path / h.name)
+    (tmp_path / "u16.cpp").write_text(encoding="utf-8", data=textwrap.dedent("""
+        #include "qtrans_print.hpp"
+        #include <cstdio>
+        #ifdef _WIN32
+        #include <fcntl.h>
+        #include <io.h>
+        #endif
+        int main() {
+        #ifdef _WIN32
+            _setmode(_fileno(stdout), _O_BINARY);
+        #endif
+            std::string all;
+            for (char32_t c = 0; c < 0x110000; ++c)
+                if (c < 0xD800 || c > 0xDFFF) qt::uni::encode(all, c);
+            std::u16string out;
+            const std::size_t used = qt::py::utf8_to_utf16(all.data(), all.size() - 2, out);  // the last one cut
+            std::printf("%zu %zu\\n", used, all.size());
+            for (char16_t u : out) std::printf("%04x", static_cast<unsigned>(u));
+        }
+    """))
+    from qtrans.verify import find_compiler
+    exe = tmp_path / ("u16.exe" if sys.platform == "win32" else "u16")
+    subprocess.run(find_compiler().command(tmp_path / "u16.cpp", exe, tmp_path), check=True, capture_output=True,
+                   cwd=tmp_path)
+    head, units = subprocess.run([str(exe)], capture_output=True, check=True, text=True).stdout.split("\n", 1)
+    text = "".join(chr(c) for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF)
+    data = text.encode("utf-8")
+    used, size = map(int, head.split())
+    assert size == len(data) and used == len(data) - 4  # U+10FFFF (4 bytes) waits for its last bytes
+    assert units == text[:-1].encode("utf-16-be").hex()
+
+
+def test_programs_with_text_beyond_ascii_write_to_a_windows_console_as_python_does():
+    r = translate_source('print("straße", "ΟΔΟΣ".lower())\n', "m", "m.py")
+    assert "    qt::py::windows_console console;  // print() to a Windows console as Python does" in r.program
+    assert "windows_console" not in translate_source('print("plain", 1)\n', "m", "m.py").program
+    clash = translate_source('console = "é"\nprint(console)\n', "m", "m.py").program
+    assert "qt::py::windows_console console_;" in clash
