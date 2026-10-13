@@ -2,6 +2,7 @@
 x * x and 1 / x (glibc: about 1 value in 1,000), while a C++ compiler turns std::pow(x, 2.0) into
 x * x and std::pow(x, -1.0) into 1.0 / x. The translation calls qt::pow, which keeps the call, and
 np.power keeps NumPy's own fast paths (np.square, np.sqrt, np.reciprocal)."""
+import platform
 import random
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ from qtrans.verify import find_compiler
 from tests.test_semantics import HAVE_CXX
 
 compiled = pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+GLIBC = platform.libc_ver()[0] == "glibc"
 EXPONENTS = [2.0, -1.0, 3.0, 0.5, -2.0, 1.5]
 
 PROBE = r"""
@@ -50,7 +52,8 @@ def test_qt_pow_is_pythons_power(tmp_path):
     want = [v for x, y in zip(xs, ys) for v in (x ** 2.0, x ** -1.0, x ** y)]
     bad = [(i, w, c) for i, (w, c) in enumerate(zip(want, got)) if w.hex() != c.hex()]
     assert not bad, f"{len(bad)} of {len(want)} differ: {bad[:3]}"
-    assert any((x ** 2) != x * x for x in xs)  # the case this guards against is really there
+    if GLIBC:  # the case this guards against is really there (other C libraries round pow differently)
+        assert any((x ** 2) != x * x for x in xs)
 
 
 def test_power_and_np_power_keep_their_own_rules():
@@ -60,4 +63,6 @@ def test_power_and_np_power_keep_their_own_rules():
     assert "qt::pow(x, 2.0) + qt::pow(x, -1.0)" in h
     assert "x * x + std::sqrt(x) + 1.0 / x" in h
     x = np.float64(1.431322935583394)
-    assert np.power(x, 2) == x * x and x ** 2 != x * x  # (NumPy's square vs the C library's pow)
+    assert np.power(x, 2) == x * x  # NumPy's square
+    if GLIBC:  # glibc's pow(x, 2.0) is not x * x here; macOS's and Windows's pow happen to agree for this x
+        assert x ** 2 != x * x
