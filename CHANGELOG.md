@@ -23,6 +23,10 @@
   "float division by zero", and "expected a nonnegative input, got -1.0" for `math.sqrt(-1)`;
   `math.pow(0.0, -inf)` raises up to 3.10 only). Checked against Python 3.10 to 3.14
   (`tests/test_exceptions.py`): 22,957 values and errors, 21,261 on 3.10, all identical.
+- **`math.gamma` and `math.lgamma` are CPython's own code** (its Lanczos approximation, ported
+  operation for operation), not the C library's: the values are Python's to the last bit, and
+  `lgamma(5e-324)` is 744.44 on Windows too (the Windows C library gives inf, which the first CI
+  run of 0.12.0 caught).
 - `assert` messages are Python's (`str(e)` is the message, or `""`), and `list.index`,
   `min([])`, `max([])` raise with the running Python's wording.
 - A `print()` line is worked out left to right, as Python does (a braced list, where the `+` of

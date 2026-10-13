@@ -4,6 +4,7 @@ where a handler may catch them, with the running Python's own wording (qtrans_py
 written from it, so 3.10's "float division by zero" and 3.14's "division by zero" both come out
 right)."""
 import math
+import platform
 import random
 import shutil
 import subprocess
@@ -49,8 +50,11 @@ def test_float_errors_and_messages_agree_with_python_on_every_probe(tmp_path):
     out = subprocess.run([str(exe)], input="\n".join(lines) + "\n", capture_output=True, text=True,
                          check=True).stdout.splitlines()
     assert len(out) == len(want)
-    bad = [(w, g) for (n, w), g in zip(want, out) if w != g and not (n.startswith(("gamma", "lgamma"))
-                                                                    and "Error" not in w + g)]
+    # gamma and lgamma are CPython's own code, ported operation for operation: the same values,
+    # except where CPython itself was compiled to fuse a multiply and an add (clang does on ARM64)
+    fused = platform.machine().lower() in ("arm64", "aarch64")
+    bad = [(n, w, g) for (n, w), g in zip(want, out) if w != g and not (
+        fused and n.startswith(("gamma", "lgamma")) and "Error" not in w + g)]
     assert not bad, f"{len(bad)} of {len(want)} differ, first: {bad[:3]}"
 
 

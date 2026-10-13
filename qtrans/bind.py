@@ -663,7 +663,8 @@ class Binder:
                 base_obj = 'py::module_::import("numpy.linalg").attr("LinAlgError")'
             else:
                 base_obj = f'py::module_::import("builtins").attr({_cstr(base)})'
-            out += [f"    m.attr({_cstr(name)}) = qtb::exception_class(m, {_cstr(name)}, {base_obj}, {_doc(doc) or '""'});"]
+            doc_code = _doc(doc) or '""'
+            out += [f"    m.attr({_cstr(name)}) = qtb::exception_class(m, {_cstr(name)}, {base_obj}, {doc_code});"]
         out += body or (["    (void)m;"] if not exc else [])
         out += ["}", "", "}  // namespace qtrans_binding", f"}}  // namespace {self.ns}", ""]
         return out
