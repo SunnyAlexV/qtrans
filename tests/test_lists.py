@@ -159,3 +159,23 @@ def test_sharing_and_mixed_types_are_refused_at_their_line(src, line, words):
 def test_a_copy_breaks_the_sharing():
     r = translate_source("a = [1.0]\nb = list(a)\nb.append(2.0)\nc = a.copy()\nprint(a, b, c)\n", "m", "m.py")
     assert r.report.functions[0].translated
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_sum_from_a_start(tmp_path):
+    f = tmp_path / "sums2.py"
+    f.write_text(textwrap.dedent("""
+        def total(xs: list[float], base: float) -> float:
+            return sum(xs, base)
+
+
+        def count(ns: list[int]) -> int:
+            return sum(ns, 10)
+
+
+        empty: list[float] = []
+        print(sum(empty, 0.0), sum([0.1, 0.2, 0.3], 0.0), sum([1e16, 1.0, -1e16], 0.5))
+        print(sum((x * 2 for x in [0.1, 0.7]), 0.0), sum([0.1, 0.2], 0), total([0.1] * 10, 1.0), count([1, 2]))
+        """).lstrip())
+    rep = verify_file(f, n_random=60, build_dir=tmp_path / "build")
+    assert rep.ok and rep.program.identical and rep.warnings == [], rep.to_text()

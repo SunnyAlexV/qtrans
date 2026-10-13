@@ -222,6 +222,8 @@ class ListOps:
         if name == "len":
             self._arity(node, node.args, 1)
             return Expr(f"static_cast<long long>({wrap(a, P_ATOM)}.size())", P_ATOM, INT)
+        if name == "sum" and len(node.args) == 2:
+            return self._sum_from(node, a, t)
         if name == "sum":
             self._arity(node, node.args, 1)
             if t.elem == STR:
@@ -246,6 +248,28 @@ class ListOps:
             self._arity(node, node.args, 1)
             return Expr(f"{t.cpp()}({a.code})", P_ATOM, t)
         return None
+
+    def _sum_from(self, node, a, t):
+        """sum(xs, start): start + the elements, in order. A float start makes the result a float
+        whatever xs holds (empty too): the usual way to keep sum() a float."""
+        if node.keywords and not all(k.arg == "start" for k in node.keywords):
+            raise Unsupported(node, "sum() takes a list and a start")
+        st = self.expr(node.args[1])
+        if t.elem == FLOAT and st.type == FLOAT:
+            if self.maybe_int(node.args[1]):
+                raise Unsupported(node.args[1], "the start may be a Python int here", "write it as a float: 0.0")
+            fn = "qt::py::sum" if sys.version_info >= (3, 12) else "qt::py::sum_left"
+            self.note("listsum", "sum() of a list of floats is CPython's: compensated (Neumaier) from 3.12, "
+                                 "left to right before; this translation follows the Python running qtrans "
+                                 f"({sys.version_info.major}.{sys.version_info.minor})")
+            return Expr(f"{fn}({a.code}, {st.code})", P_ATOM, FLOAT)
+        if t.elem == INT and st.type in (INT, BOOL):  # ints add exactly: start + their sum
+            return Expr(f"qt::iadd({self.as_type(st, INT).code}, qt::py::sum({a.code}))", P_ATOM, INT)
+        if t.elem == FLOAT and st.type in (INT, BOOL) and st.value == 0:  # sum(xs, 0) is sum(xs)
+            return self.list_builtin(ast.copy_location(ast.Call(func=node.func, args=[node.args[0]], keywords=[]),
+                                                       node), "sum")
+        raise Unsupported(node, f"sum() of a list of {t.elem} from a {st.type} start is not supported",
+                          "a float start for floats (0.0), an int start for ints")
 
     # --- x in xs, xs + ys ---------------------------------------------------------------------
     def list_contains(self, node, x_node, xs_node, negate):

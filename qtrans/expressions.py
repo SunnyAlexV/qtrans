@@ -695,7 +695,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps):
                 e = self.dict_builtin(node, name)
                 if e is not None:
                     return e
-            if name in ("len", "sum", "min", "max", "sorted", "list") and len(node.args) == 1:
+            if name in ("len", "sum", "min", "max", "sorted", "list") and (
+                    len(node.args) == 1 or (name == "sum" and len(node.args) == 2)):
                 e = self.list_builtin(node, name)
                 if e is not None:
                     return e

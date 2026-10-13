@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.1
+
+Found by looking at what a user sees (`tools/screenshots.py`, new: screenshots of `qtrans live`,
+`qtrans explain` and the terminal, from the real commands):
+
+- A dict lookup that fails is `KeyError` on both sides: the checker reported the C++'s as
+  `IndexError` (so verify counted mismatches that weren't), and the Python bindings raised
+  `IndexError` too; they now raise Python's own `KeyError`, holding the key.
+- A function's parameters and locals are its own: a parameter named like a script's variable no
+  longer pulls that variable out of `main()` (which shadowed it, two compiler warnings).
+- `sum(xs, start)`: with a float start the result is a float even for an empty list (the usual
+  way to keep `sum()` a float), added from the start as CPython adds floats; also for
+  generators, `sum((p * w for ...), 0.0)`.
+- A program using a speed hint (`# qtrans: unroll 4`) compiles: its `.cpp` now defines the hint
+  macros too.
+
 ## 0.10.0
 
 **Programs.** A whole script translates: top-level code (or `if __name__ == "__main__":`)

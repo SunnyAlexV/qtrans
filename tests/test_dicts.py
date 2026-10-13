@@ -173,3 +173,42 @@ def test_dict_views_in_enumerate_and_zip_refuse_what_python_would_raise_on(src, 
     r = translate_source(src, "m", "m.py")
     bad = [f for f in r.report.functions if not f.translated]
     assert bad and words in bad[0].reason, r.report.to_text()
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_a_missing_key_is_a_keyerror_on_both_sides(tmp_path):
+    f = tmp_path / "lookup.py"
+    f.write_text("def price(d: dict[str, float], k: str) -> float:\n    return d[k] * 2.0\n")
+    rep = verify_file(f, n_random=80, build_dir=tmp_path / "build")
+    fc = rep.functions[0]
+    assert rep.ok and fc.count("match") == 80, rep.to_text()
+    assert any(c.py[0] == "exc" and c.py[1] == "KeyError" for c in fc.cases)  # missing keys were tried
+
+
+def test_bindings_raise_pythons_keyerror_with_the_key(tmp_path):
+    pytest.importorskip("pybind11")
+    if not HAVE_CXX:
+        pytest.skip("no C++ compiler")
+    from qtrans.bind import build_extension
+    import importlib
+    import sys
+    f = tmp_path / "lookup2.py"
+    f.write_text("def price(d: dict[str, float], k: str) -> float:\n    return d[k] * 2.0\n")
+    ext = build_extension([f], out_dir=tmp_path, build_dir=tmp_path / "b")
+    sys.path.insert(0, str(tmp_path))
+    try:
+        m = importlib.import_module(ext.name)
+        assert m.price({"AAPL": 1.5}, "AAPL") == 3.0
+        with pytest.raises(KeyError) as e:
+            m.price({"AAPL": 1.5}, "MSFT")
+        assert e.value.args == ("MSFT",)
+    finally:
+        sys.path.remove(str(tmp_path))
+
+
+def test_a_parameter_named_like_a_program_variable_is_the_functions_own(tmp_path):
+    src = ("def total(prices: dict[str, float]) -> float:\n    return sum(prices.values(), 0.0)\n\n"
+           "prices = {'a': 1.0}\nprint(total(prices))\n")
+    r = translate_source(src, "m", "m.py")
+    assert "inline const qt::py::dict" not in r.program  # the program's variable lives in main()
+    assert "qt::py::dict<std::string, double> prices = {{\"a\", 1.0}};" in r.program

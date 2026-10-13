@@ -31,7 +31,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, assignable, is_array)
 
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -168,6 +168,29 @@ def _runs(node, index) -> bool:
                              ast.Delete, ast.Match))
 
 
+def _global_reads(node) -> set:
+    """The module-level names a function (or each method of a class) reads: its loads, minus its
+    own parameters and the names it assigns (Python makes those local unless declared global)."""
+    if isinstance(node, ast.ClassDef):
+        out = set()
+        for n in node.body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out |= _global_reads(n)
+            else:
+                out |= {x.id for x in ast.walk(n) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+        return out
+    a = node.args
+    params = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs} | \
+        ({a.vararg.arg} if a.vararg else set()) | ({a.kwarg.arg} if a.kwarg else set())
+    declared = {g for x in ast.walk(node) if isinstance(x, ast.Global) for g in x.names}
+    stored = {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del))}
+    local = (params | stored) - declared
+    reads = {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+    # defaults and annotations are evaluated at module level
+    outer = [d for d in a.defaults + a.kw_defaults if d is not None]
+    return (reads - local) | {x.id for d in outer for x in ast.walk(d) if isinstance(x, ast.Name)}
+
+
 def _stays_module_level(node, fn_reads) -> bool:
     """In a program, an assignment stays a module constant only when a function reads it (or it
     is qtrans' own setting, or a type alias); the program's other variables are main()'s."""
@@ -187,7 +210,7 @@ def library_tree(tree):
     fn_reads = set()
     for node in body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            fn_reads |= {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+            fn_reads |= _global_reads(node)
     keep = [n for i, n in enumerate(body) if not (_is_main_guard(n) or _runs(n, i) or (
         isinstance(n, (ast.Assign, ast.AnnAssign)) and not _stays_module_level(n, fn_reads)))]
     return ast.Module(body=keep, type_ignores=[])
@@ -808,7 +831,7 @@ class ModuleTranslator:
         fn_reads = set()
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                fn_reads |= {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+                fn_reads |= _global_reads(node)
         self.main_body, self.main_error = [], None
         for i, node in enumerate(body):
             if i == 0 and is_docstring(node):
@@ -2108,11 +2131,15 @@ class ModuleTranslator:
         if self.main_lines is not None:
             empty = not own_constants and not live and not names
             self.program_text, self.program_map = strip_marks(self._program(out, empty, bodies))
+        text, self.line_map = strip_marks(text.replace("@@INCLUDES@@", "\n".join(self._include_block(text, bodies))))
+        return text
+
+    def _include_block(self, text, bodies) -> list:
+        """The #includes, and the speed-hint macros where a hint is used (header and program alike)."""
         incs = self._includes(text, bodies)
         if re.search(r"\bQT_(UNROLL|FORCE_INLINE|NOINLINE|HOT|COLD|LIKELY|UNLIKELY)\b", text):
             incs += [""] + hints_.MACROS.split("\n")
-        text, self.line_map = strip_marks(text.replace("@@INCLUDES@@", "\n".join(incs)))
-        return text
+        return incs
 
     def _includes(self, text, bodies) -> list:
         includes = ["<cmath>"]
@@ -2178,7 +2205,7 @@ class ModuleTranslator:
         else:
             out_main = [head] + body + ["}"]
         text = "\n".join(out + rest + out_main) + "\n"
-        return text.replace("@@INCLUDES@@", "\n".join(self._includes(text, bodies)))
+        return text.replace("@@INCLUDES@@", "\n".join(self._include_block(text, bodies)))
 
 
 def translate_source(source: str, module_name: str = "module", filename: str = "<input>") -> TranslationResult:

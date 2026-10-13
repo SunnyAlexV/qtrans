@@ -60,6 +60,7 @@ CPP_EXC_MATCHES = {
     "AssertionError": {"AssertionError"},
     "RuntimeError": {"RuntimeError", "NotImplementedError", "Exception"},
     "IndexError": {"IndexError"},
+    "KeyError": {"KeyError"},  # a dict without the key (qt::py::KeyError)
     "TypeError": {"TypeError"},
     # an int result beyond 64 bits (Python returns a big int there; see classify)
     "IntOverflow": {"OverflowError"},
@@ -1224,6 +1225,9 @@ int main() {
         catch (const qt::int_overflow&) { std::printf("EXC IntOverflow\n"); }@@ARRAY_CATCH@@
         catch (const std::invalid_argument&) { std::printf("EXC ValueError\n"); }
         catch (const std::domain_error&) { std::printf("EXC ArithmeticError\n"); }
+#ifdef QTRANS_LIST_HPP
+        catch (const qt::py::KeyError&) { std::printf("EXC KeyError\n"); }
+#endif
         catch (const std::out_of_range&) { std::printf("EXC IndexError\n"); }
         catch (const std::logic_error&) { std::printf("EXC AssertionError\n"); }
         catch (const std::overflow_error&) { std::printf("EXC OverflowError\n"); }

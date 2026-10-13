@@ -267,3 +267,13 @@ def test_hints_compile_cleanly_and_change_no_number(tmp_path):
     rep = verify_file(py, n_random=40, build_dir=tmp_path / "build")
     assert rep.ok and rep.warnings == [], rep.to_text()
     assert all(f.count("mismatch") == 0 and f.max_ulps == 0 for f in rep.functions)
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
+def test_hints_in_a_program_compile_too(tmp_path):
+    py = tmp_path / "prog.py"
+    py.write_text("def total(n: int) -> float:\n    t = 0.0\n    for i in range(n):  # qtrans: unroll 4\n"
+                  "        t += i * 0.5\n    return t\n\nprint(total(10))\n")
+    rep = verify_file(py, n_random=10, build_dir=tmp_path / "build")
+    assert rep.program is not None and rep.program.identical and rep.warnings == [], rep.to_text()
+    assert "#define QT_UNROLL" in translate_file(py).program

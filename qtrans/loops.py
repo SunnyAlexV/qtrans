@@ -542,7 +542,8 @@ class Rewriter(ast.NodeTransformer):
         # sum(x * w for x, w in zip(xs, ws)) reads the generator to the end: it is the list
         reads_all = (isinstance(node.func, ast.Name) and node.func.id in READS_TO_THE_END and self.generators_ok) \
             or (isinstance(node.func, ast.Attribute) and node.func.attr == "join")
-        if reads_all and len(node.args) == 1 and isinstance(node.args[0], ast.GeneratorExp):
+        if reads_all and (len(node.args) == 1 or (getattr(node.func, "id", None) == "sum" and len(node.args) == 2)) \
+                and isinstance(node.args[0], ast.GeneratorExp):
             gen = node.args[0]
             node.args[0] = ast.copy_location(ast.ListComp(elt=gen.elt, generators=gen.generators), gen)
             node.args[0].end_lineno, node.args[0].end_col_offset = gen.end_lineno, gen.end_col_offset

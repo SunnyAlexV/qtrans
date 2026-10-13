@@ -126,6 +126,14 @@ inline void register_exceptions(py::module_& m) {
             PyErr_SetString(PyExc_ZeroDivisionError, e.what());
         } catch (const std::invalid_argument& e) {
             PyErr_SetString(PyExc_ValueError, e.what());
+        } catch (const qt::py::KeyError& e) {
+            // Python's KeyError holds the key itself; the message is its repr ('AAPL', 3)
+            try {
+                py::object key = py::module_::import("ast").attr("literal_eval")(e.what());
+                PyErr_SetObject(PyExc_KeyError, key.ptr());
+            } catch (...) {
+                PyErr_SetString(PyExc_KeyError, e.what());
+            }
         } catch (const std::out_of_range& e) {
             PyErr_SetString(PyExc_IndexError, e.what());
         } catch (const std::logic_error& e) {  // a Python assert

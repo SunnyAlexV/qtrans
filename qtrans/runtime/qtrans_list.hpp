@@ -94,6 +94,25 @@ inline double sum_left(const std::vector<double>& xs) {
     for (size_t k = 0; k < xs.size(); ++k) f = k ? f + xs[k] : 0.0 + xs[k];
     return f;
 }
+// sum(xs, start) with a float start, as CPython 3.12+ adds floats: from start, compensated,
+// the correction added at the end if finite (an empty list gives start itself)
+inline double sum(const std::vector<double>& xs, double start) {
+    double f = start, c = 0.0;
+    for (double x : xs) {
+        const double t = f + x;
+        if (std::fabs(f) >= std::fabs(x)) c += (f - t) + x;
+        else c += (x - t) + f;
+        f = t;
+    }
+    if (c != 0.0 && std::isfinite(c)) f += c;
+    return f;
+}
+// ... and as Python 3.10 / 3.11 add them: left to right from start
+inline double sum_left(const std::vector<double>& xs, double start) {
+    double f = start;
+    for (double x : xs) f += x;
+    return f;
+}
 inline long long sum(const std::vector<long long>& xs) {
     long long s = 0;
     for (long long x : xs) s = qt::iadd(s, x);  // beyond 64 bits: OverflowError

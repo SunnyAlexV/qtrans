@@ -292,6 +292,8 @@ class TextOps:
             f = node.func.id
             if (f, None) in maybe:
                 return f"{f}() returns an int on some path"
+            if f == "sum" and len(node.args) == 2:  # from a start: an int only if the start is one
+                return self.maybe_int(node.args[1])
             if f == "sum" and node.args and not _nonempty(node.args[0]):
                 t = self._quiet_type(node.args[0])
                 if isinstance(t, ListType) and t.elem == FLOAT:
