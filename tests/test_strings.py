@@ -117,7 +117,7 @@ print()
 def test_every_code_point_agrees_with_python(tmp_path):
     for h in (RUNTIME_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
         shutil.copy(h, tmp_path / h.name)
-    (tmp_path / "all.cpp").write_text(textwrap.dedent("""
+    (tmp_path / "all.cpp").write_text(encoding="utf-8", data=textwrap.dedent("""
         #include "qtrans_list.hpp"
         #include <cstdio>
         #ifdef _WIN32
@@ -189,17 +189,19 @@ def test_every_code_point_agrees_with_python(tmp_path):
         pytest.fail(f"{len(bad)} code points differ, first: {pl[bad[0]]!r} vs {cl[bad[0]]!r}")
 
 
-def test_shipped_tables_are_this_pythons():
-    if unicode_tables.shipped_version() != unicodedata.unidata_version:
-        assert UNICODE_HEADER != unicode_tables.SHIPPED  # written into the cache for this Python instead
-        pytest.skip(f"this Python has Unicode {unicodedata.unidata_version}")
-    assert unicode_tables.SHIPPED.read_text(encoding="utf-8") == unicode_tables.generate()
+def test_the_tables_are_this_pythons():
+    """The header the C++ includes holds this Python's Unicode: the shipped one when the versions
+    agree, else the one written for this Python (3.10 has Unicode 13, 3.14 has 16)."""
+    text = UNICODE_HEADER.read_text(encoding="utf-8")
+    assert f'#define QTRANS_UNICODE_VERSION "{unicodedata.unidata_version}"' in text
+    assert (UNICODE_HEADER == unicode_tables.SHIPPED) == (unicode_tables.shipped_version() == unicodedata.unidata_version)
+    assert text == unicode_tables.generate()
 
 
 @pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
 def test_string_functions_agree_with_python(tmp_path):
     f = tmp_path / "strs.py"
-    f.write_text(FUNCTIONS)
+    f.write_text(FUNCTIONS, encoding="utf-8")
     rep = verify_file(f, n_random=150, build_dir=tmp_path / "build")
     assert rep.ok and rep.warnings == [], rep.to_text()
     assert len(rep.functions) == 13 and all(fc.count("mismatch") == 0 for fc in rep.functions)
@@ -208,7 +210,7 @@ def test_string_functions_agree_with_python(tmp_path):
 @pytest.mark.skipif(not HAVE_CXX, reason="no C++ compiler")
 def test_string_program_prints_what_python_prints(tmp_path):
     f = tmp_path / "text.py"
-    f.write_text(textwrap.dedent(PROGRAM).lstrip())
+    f.write_text(textwrap.dedent(PROGRAM).lstrip(), encoding="utf-8")
     rep = verify_file(f, n_random=0, build_dir=tmp_path / "build")
     assert rep.program is not None, rep.translation.report.to_text()
     assert rep.program.identical and rep.warnings == [], rep.to_text() + rep.program.py_out + rep.program.cpp_out
