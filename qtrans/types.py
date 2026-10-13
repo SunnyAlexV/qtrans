@@ -121,15 +121,32 @@ class StrType:
 @dataclass(frozen=True)
 class StructType:
     """An instance of a translated @dataclass or NamedTuple (stage 5): a C++ struct. Details
-    (fields, methods, frozen) live in the module's ClassInfo, looked up by name."""
+    (fields, methods, frozen) live in the module's ClassInfo, looked up by name.
+
+    A class with a base class or subclasses (0.13) is `ref`: its objects live behind a
+    std::shared_ptr, so a Payoff variable can hold a Call or a Put and calls go to the right
+    method, and so assigning or passing one shares the object, as Python does. `bases` lists
+    its ancestors, nearest first, as (name, C++ name) pairs."""
     name: str
     cpp_name: str
+    ref: bool = False
+    bases: tuple = ()
 
     def cpp(self) -> str:
-        return self.cpp_name
+        return f"std::shared_ptr<{self.cpp_name}>" if self.ref else self.cpp_name
 
     def zero(self) -> str:
         return "{}"
+
+    def lineage(self) -> list:
+        """This class, then its ancestors, as StructTypes."""
+        out = [self]
+        for k, (n, c) in enumerate(self.bases):
+            out.append(StructType(n, c, True, self.bases[k + 1:]))
+        return out
+
+    def derives_from(self, other) -> bool:
+        return isinstance(other, StructType) and any(t.name == other.name for t in self.lineage())
 
     def __str__(self) -> str:
         return self.name
@@ -259,6 +276,10 @@ def join(a, b):
     if isinstance(a, TupleType) and isinstance(b, TupleType) and len(a.elts) == len(b.elts):
         elts = tuple(join(x, y) for x, y in zip(a.elts, b.elts))
         return None if None in elts else TupleType(elts)
+    if isinstance(a, StructType) and isinstance(b, StructType) and a.ref and b.ref:
+        # a Call in one place and a Put in another: their nearest common base class
+        names = {t.name for t in b.lineage()}
+        return next((t for t in a.lineage() if t.name in names), None)
     if isinstance(a, ListType) and isinstance(b, ListType):
         # no widening: a list holding ints and floats keeps each as it is in Python (prints 1, 2.5)
         if a.elem is None or b.elem is None:
@@ -285,6 +306,8 @@ def assignable(target, value) -> bool:
         return _RANK[value.name] <= _RANK[target.name]
     if isinstance(target, (ArrayType, RngType)) or isinstance(value, (ArrayType, RngType)):
         return False
+    if isinstance(target, StructType) and isinstance(value, StructType):
+        return target.ref and value.derives_from(target)  # a Call where a Payoff is wanted
     if isinstance(target, ListType) and isinstance(value, ListType):
         return value.elem is None or value.elem == target.elem
     if isinstance(target, DictType) and isinstance(value, DictType):

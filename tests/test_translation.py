@@ -20,8 +20,9 @@ def rejection(src):
 # --- readable, exact output ----------------------------------------------------------
 def test_power_two_keeps_the_rounding_of_python():
     h = cpp("def f(a: float, s: float) -> float:\n    return a * s ** 2\n")
-    # a * s * s would round differently from Python's a * (s ** 2)
-    assert "return a * (s * s);" in h
+    # Python's s ** 2 is the C library's pow(s, 2.0), which for about 1 value in 1,000 is not
+    # s * s; and a C++ compiler turns std::pow(s, 2.0) into s * s, so qt::pow keeps the call
+    assert "return a * qt::pow(s, 2.0);" in h
 
 
 def test_true_division_of_ints_is_float():

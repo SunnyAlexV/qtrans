@@ -6,6 +6,7 @@
 #include <string>
 
 #define QTRANS_PYTHON_VERSION "3.13.16"
+#define QTRANS_PYTHON_FACTS 2
 
 namespace qt {
 namespace msg {
@@ -32,6 +33,8 @@ inline constexpr const char* pop_index = "pop index out of range";
 inline constexpr const char* math_range = "math range error";
 inline constexpr const char* math_domain_pow = "math domain error";
 inline constexpr const char* math_domain_fmod = "math domain error";
+inline constexpr const char* fsum_overflow = "intermediate overflow in fsum";
+inline constexpr const char* fsum_inf_minus_inf = "-inf + inf in fsum";
 inline constexpr bool math_pow_zero_to_minus_inf_raises = false;
 
 // list.index(x) without x: the message holds repr(x) or not
@@ -93,6 +96,22 @@ inline constexpr DomainText gamma_float[] = {{"math domain error", "", false, fa
 inline constexpr DomainText gamma_int[] = {{"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}};
 inline constexpr DomainText lgamma_float[] = {{"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}};
 inline constexpr DomainText lgamma_int[] = {{"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}};
+
+// the random module: the words of its errors (randrange's changed in 3.12, randint's in 3.14)
+inline constexpr const char* random_choice_empty = "Cannot choose from an empty sequence";  // IndexError
+inline constexpr const char* random_randrange_empty = "empty range for randrange()";
+inline constexpr const char* random_randrange_two = "empty range in randrange";
+inline constexpr int random_randrange_two_form = 1;  // 0: (start, stop, width), 1: (start, stop)
+inline constexpr const char* random_randrange_three = "empty range in randrange";
+inline constexpr int random_randrange_three_form = 1;  // 0: no values, 1: (start, stop, step)
+inline constexpr const char* random_randint = "empty range in randrange";
+inline constexpr int random_randint_form = 1;  // 0, 1: randrange(a, b + 1)'s; 2: (a, b)
+inline constexpr const char* random_zero_step = "zero step for randrange()";
+inline constexpr const char* random_sample_size = "Sample larger than population or is negative";
+inline constexpr const char* random_weights_total = "Total of weights must be greater than zero";
+inline constexpr const char* random_weights_finite = "Total of weights must be finite";
+inline constexpr const char* random_weights_count = "The number of weights does not match the population";
+inline constexpr bool random_choice_empty_is_index_error = true;
 
 }  // namespace msg
 }  // namespace qt

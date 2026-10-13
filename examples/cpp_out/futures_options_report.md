@@ -21,3 +21,4 @@
 These only matter on inputs where Python would raise an exception or overflow.
 
 - division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: black76, bachelier, margrabe)
+- float ** raises OverflowError in Python when the result overflows; C++ returns inf (applies to: margrabe)

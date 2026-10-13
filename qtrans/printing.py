@@ -22,6 +22,7 @@ import string
 from dataclasses import dataclass
 
 from .core import P_ADD, P_ATOM, Expr, cpp_string, wrap
+from .structs import THIS
 from .errors import Unsupported
 from .origins import NP, PY
 from .types import (ArrayType, DictType, ExcType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
@@ -101,20 +102,59 @@ class TextOps:
         info = self.mod.classes.get(e.type.name)
         if info is None:
             raise Unsupported(node, f"showing a {e.type} is not supported")
+        dot = "" if e.code == THIS else "->" if e.type.ref else "."
+        obj = "" if e.code == THIS else wrap(e, P_ATOM)
+        if info.ref:  # the object may be of any subclass: each must show the way Python shows it
+            return self._hierarchy_text(node, info, kind, obj + dot)
         for method in (["__str__", "__repr__"] if kind == "str" else ["__repr__"]):
             if method in info.methods:
                 key = info.methods[method].key
                 if key in self.mod.rejected:
                     raise Unsupported(node, f"{info.name}.{method} could not be translated: "
                                             f"{self.mod.rejected[key].message}")
-                c = f"{wrap(e, P_ATOM)}.{'str' if method == '__str__' else 'repr'}()"
+                c = f"{obj}{dot}{'str' if method == '__str__' else 'repr'}()"
                 return Piece(code=c, stream=c, raises=True)
         if not auto_repr(info):
             raise Unsupported(node, f"Python shows a {info.name} (a class with no __repr__) by its memory address, "
                                     "which differs on every run", f"give {info.name} a __repr__, or print its fields")
         self._need_repr(node, info)
-        c = f"{wrap(e, P_ATOM)}.repr()"
+        c = f"{obj}{dot}repr()"
         return Piece(code=c, stream=c)
+
+    def _hierarchy_text(self, node, info, kind, prefix) -> Piece:
+        """str(p) / repr(p) for p of a class hierarchy: a virtual repr() (and str()), so the object's
+        own class decides, as in Python. Every class p could be must show the same way."""
+        from .classes import auto_repr
+        classes = [info] + info.descendants()
+        classes = [c for c in classes if not (c.abc and c.abstract_left())] or [info]
+        uses_str = kind == "str" and any(c.find_method("__str__") is not None for c in classes)
+        if uses_str and not all(c.find_method("__str__") is not None for c in classes):
+            miss = next(c for c in classes if c.find_method("__str__") is None)
+            raise Unsupported(node, f"str() of a {info.name}: {miss.name} has no __str__ (Python then uses its "
+                                    "__repr__) while others do", f"give {info.name} a __str__")
+        method = "__str__" if uses_str else "__repr__"
+        raises = False
+        for c in classes:
+            m = c.find_method(method)
+            if m is not None:
+                if m.key in self.mod.rejected:
+                    raise Unsupported(node, f"{c.method_owner(method).name}.{method} could not be translated: "
+                                            f"{self.mod.rejected[m.key].message}")
+                own = c.method_owner(method)
+                if method == "__repr__" and own is not c and auto_repr(c):
+                    self._need_repr(node, c)  # a dataclass writes its own repr, over its base's __repr__
+                else:
+                    raises = True
+                continue
+            if not auto_repr(c):
+                raise Unsupported(node, f"Python shows a {c.name} (a class with no __repr__) by its memory address, "
+                                        "which differs on every run", f"give {c.name} a __repr__")
+            self._need_repr(node, c)
+        if info.find_method(method) is None and info.name not in getattr(self.mod, "repr_needed", set()):
+            # (an abstract class: Python never shows one, but the call needs a repr() to go through)
+            self.mod.__dict__.setdefault("text_pure", set()).add((info.name, method))
+        c = f"{prefix}{'str' if method == '__str__' else 'repr'}()"
+        return Piece(code=c, stream=c, raises=raises)
 
     def _need_repr(self, node, info, seen=None):
         """The dataclass repr of info (and of the dataclasses inside it) is generated, if it can be exact."""
@@ -129,6 +169,9 @@ class TextOps:
                 raise Unsupported(node, problem[1], "convert it with float(...) where it goes in")
             self.mod.__dict__.setdefault("repr_needed", set()).add(info.name)
         for f in info.fields:
+            if f.repr and isinstance(f.type, StructType) and f.type.ref:
+                self._hierarchy_text(node, self.mod.classes[f.type.name], "repr", "")  # any subclass may be there
+                continue
             if f.repr and isinstance(f.type, StructType):
                 inner = self.mod.classes[f.type.name]
                 if "__repr__" not in inner.methods and not auto_repr(inner):

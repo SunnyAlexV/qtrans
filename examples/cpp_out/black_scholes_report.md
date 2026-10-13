@@ -33,6 +33,7 @@
 These only matter on inputs where Python would raise an exception or overflow.
 
 - division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: d1, gamma, theta_per_day, delta_gamma, parity_gap)
+- float ** raises OverflowError in Python when the result overflows; C++ returns inf (applies to: d1)
 
 ## Module constants
 

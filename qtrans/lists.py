@@ -17,14 +17,20 @@ import sys
 
 from .core import P_ATOM, P_UNARY, Expr, wrap
 from .errors import Unsupported
-from .types import BOOL, FLOAT, INT, STR, VOID, ArrayType, DictType, ListType, Scalar, TupleType, is_array
+from .types import BOOL, FLOAT, INT, STR, VOID, ArrayType, DictType, ListType, Scalar, StructType, TupleType, join, is_array
 
 ELEMS = (FLOAT, INT, STR)
 
 
 def list_elem_ok(t) -> bool:
-    """What a list may hold: floats, ints or strings, or tuples of those (and bools)."""
-    return t in ELEMS or (isinstance(t, TupleType) and bool(t.elts) and all(e in ELEMS + (BOOL,) for e in t.elts))
+    """What a list may hold: floats, ints or strings, or tuples of those (and bools), or objects
+    of a class hierarchy (shared_ptrs, so the list holds the objects themselves, as in Python)."""
+    return t in ELEMS or (isinstance(t, TupleType) and bool(t.elts) and all(e in ELEMS + (BOOL,) for e in t.elts)) \
+        or is_object_list_elem(t)
+
+
+def is_object_list_elem(t) -> bool:
+    return isinstance(t, StructType) and t.ref
 MUTATORS = {"append", "extend", "insert", "pop", "sort", "reverse", "clear", "remove"}
 
 
@@ -34,11 +40,34 @@ def list_of(t) -> bool:
 
 class ListOps:
     # --- [a, b, c] ---------------------------------------------------------------------------
+    def expr_for(self, node, target):
+        """The value of `node`, going into a place of type `target`: a list display of subclass
+        objects there is a list of the target's class ([Call(1.0)] where a list[Payoff] goes)."""
+        if isinstance(node, ast.List) and isinstance(target, ListType) and is_object_list_elem(target.elem):
+            saved = self.__dict__.get("list_want")
+            self.list_want = target.elem
+            try:
+                return self.expr(node)
+            finally:
+                self.list_want = saved
+        return self.expr(node)
+
     def e_List(self, node):
+        want, self.list_want = self.__dict__.get("list_want"), None  # (for this display only, not one inside)
         if not node.elts:
+            if want is not None:
+                return Expr("{}", P_ATOM, ListType(want), value=[], simple=True)
             return Expr("{}", P_ATOM, ListType(None), value=[], simple=True)
         items = [self.expr(e) for e in node.elts]
         types = {e.type for e in items}
+        if want is not None and all(isinstance(t, StructType) and t.derives_from(want) for t in types):
+            types = {want}
+        if len(types) > 1 and all(is_object_list_elem(t) for t in types):  # [Call(...), Put(...)]: Payoffs
+            common = None
+            for t in types:
+                common = t if common is None else join(common, t)
+            if common is not None:
+                types = {common}
         if len(types) != 1:
             names = ", ".join(sorted(str(t) for t in types))
             raise Unsupported(node, f"a list holding several types ({names}): Python keeps each element's type "
@@ -138,8 +167,18 @@ class ListOps:
         if node.keywords and not (name == "sort" and all(k.arg in ("reverse", "key") for k in node.keywords)):
             raise Unsupported(node, f"keyword arguments to list.{name}() are not supported")
 
+        objects = is_object_list_elem(t.elem)
+        if objects and name in ("index", "count", "remove") and not self.mod.classes[t.elem.name].plain:
+            raise Unsupported(node, f"list.{name}() compares {t.elem} objects with ==, which for dataclass objects "
+                                    "of a class hierarchy is not supported", "compare the fields you mean in a loop")
+        if objects and name == "sort" and not any(k.arg == "key" for k in node.keywords):
+            raise Unsupported(node, f"sorting {t.elem} objects without a key: Python raises TypeError ('<' is not "
+                                    "supported between them)", "sort(key=lambda p: p.strike)")
+
         def elem_arg(a):
             e = self.expr(a)
+            if objects and isinstance(e.type, StructType) and e.type.derives_from(t.elem):
+                return e  # a Call into a list of Payoffs
             if t.elem is not None and e.type != t.elem:
                 raise Unsupported(a, f"adding a {e.type} to a list of {t.elem}: Python keeps its type (an int prints "
                                      "as 1, a float as 1.0), a std::vector has one",
@@ -235,6 +274,11 @@ class ListOps:
             return None
         self._need_list(a, node.args[0], f"{name}()")
         t = a.type
+        if is_object_list_elem(t.elem) and name in ("sum", "min", "max", "sorted") and \
+                not any(k.arg == "key" for k in node.keywords):
+            raise Unsupported(node, f"{name}() of {t.elem} objects: Python raises TypeError (it can't add or compare "
+                                    "them)", f"{name}(..., key=lambda p: p.strike)" if name != "sum" else
+                              "sum(p.value(s) for p in xs)")
         if name == "len":
             self._arity(node, node.args, 1)
             return Expr(f"static_cast<long long>({wrap(a, P_ATOM)}.size())", P_ATOM, INT)
@@ -545,7 +589,7 @@ class ListOps:
                                                                ("<" if step > 0 else ">", f"{ident} += {step}"))
             loop = f"for (long long {ident} = {start}; {ident} {cmp} {stop}; {inc})"
         else:
-            decl = "const std::string&" if vt == STR else vt.cpp()
+            decl = "const std::string&" if vt == STR else f"const {vt.cpp()}&" if isinstance(vt, StructType) else vt.cpp()
             loop = f"for ({decl} {ident} : {src.code})"
         if mode in ("any", "all"):
             hit = wrap(test, 13) if mode == "any" else "!" + wrap(test, P_UNARY)

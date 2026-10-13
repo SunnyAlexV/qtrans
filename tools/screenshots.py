@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 DEMO = '''"""A small pricing script: what qtrans is for."""
 import math
+import random
 
 RATE = 0.05
 
@@ -34,12 +35,29 @@ def annuity(n: int) -> float:
     return total
 
 
-def weighted(prices: dict[str, float], weights: dict[str, float]) -> float:
-    return sum((prices[k] * w for k, w in weights.items()), 0.0)
+class Payoff:
+    def __init__(self, strike: float):
+        self.strike = strike
+
+    def value(self, spot: float) -> float:
+        return 0.0
 
 
-def ticker(line: str) -> str:
-    return line.split(",")[0].strip().upper()
+class Call(Payoff):
+    def value(self, spot: float) -> float:
+        return max(spot - self.strike, 0.0)
+
+
+class Put(Payoff):
+    def value(self, spot: float) -> float:
+        return max(self.strike - spot, 0.0)
+
+
+def mc_value(p: Payoff, s0: float, vol: float, n: int) -> float:
+    total = 0.0
+    for _ in range(n):
+        total += p.value(s0 * math.exp(vol * random.gauss(0.0, 1.0)))
+    return total / n
 
 
 def safe_ratio(a: float, b: float) -> float:
@@ -50,13 +68,11 @@ def safe_ratio(a: float, b: float) -> float:
         return 0.0
 
 
-prices = {"AAPL": 190.5, "MSFT": 410.25, "GOOG": 140.0}
-weights = {"AAPL": 0.5, "MSFT": 0.3, "GOOG": 0.2}
-for i, (name, p) in enumerate(prices.items(), start=1):
-    print(f"{i}. {name:<5} {p:>8.2f}")
+random.seed(7)
+book: list[Payoff] = [Call(100.0), Put(95.0)]
+for p in book:
+    print(type(p).__name__, round(mc_value(p, 100.0, 0.2, 1000), 4))
 print("annuity(10) =", round(annuity(10), 6))
-print("weighted:", weighted(prices, weights))
-print(ticker(" aapl , 190.5"), ticker("straße,1"), float(" 1_000.5 "))
 print(safe_ratio(1.0, 4.0), safe_ratio(1.0, 0.0))
 '''
 
@@ -138,11 +154,11 @@ def main(out_dir):
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "1_live_editor.png"))
         shots.append("1_live_editor.png")
-        page.evaluate(f"goToLine({_line('return a / b')})")  # a try: the division raises as Python's
+        page.evaluate(f"goToLine({_line('return max(spot - self.strike')})")  # an override: virtual in C++
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "2_live_program_line.png"))
         shots.append("2_live_program_line.png")
-        page.evaluate(f"goToLine({_line('print(ticker')})")  # text beyond ASCII: main() writes to a Windows console as Python
+        page.evaluate(f"goToLine({_line('random.gauss')})")  # Python's random module, number for number
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "2b_live_program_main.png"))
         shots.append("2b_live_program_main.png")

@@ -34,7 +34,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, assignable, is_array)
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -43,6 +43,7 @@ GENERAL_NOTES = {"int64", "div0", "powoverflow"}
 RUNTIME_HEADER = Path(__file__).parent / "runtime" / "qtrans_runtime.hpp"
 ARRAYS_HEADER = Path(__file__).parent / "runtime" / "qtrans_arrays.hpp"
 RANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_random.hpp"
+PYRANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_pyrandom.hpp"  # Python's random module (0.14)
 PRINT_HEADER = Path(__file__).parent / "runtime" / "qtrans_print.hpp"
 LIST_HEADER = Path(__file__).parent / "runtime" / "qtrans_list.hpp"
 UNICODE_HEADER = unicode_header_path()  # qtrans_list.hpp includes it: this Python's Unicode tables
@@ -89,6 +90,9 @@ class Signature:
     kind: str = "function"          # or "instance", "property", "static", "class", "post_init"
     const: bool = False             # a method that doesn't modify self
     module: str | None = None       # imported from this module of the project (multi-module)
+    virtual: str = ""               # "virtual" (a subclass overrides it), "override", or "" (0.13)
+    py_random: bool = False         # uses the random module's generator, itself or through a call (0.14)
+    abstract: bool = False          # @abstractmethod: declared `= 0`, no body
 
 
 @dataclass
@@ -399,6 +403,12 @@ class ModuleTranslator:
                 if elem in (FLOAT, INT, STR) or (isinstance(elem, TupleType) and all(
                         e in (FLOAT, INT, STR, BOOL) for e in elem.elts)):
                     return ListType(elem)
+                if isinstance(elem, StructType) and elem.ref:
+                    return ListType(elem)  # objects of a class hierarchy: std::vector<std::shared_ptr<...>>
+                if isinstance(elem, StructType):
+                    raise Unsupported(node, f"'{ast.unparse(node)}': a list of {elem} objects is not supported "
+                                            f"(each element would be a copy in C++, the object itself in Python)",
+                                      "lists hold objects of a class hierarchy (class X(Base)), or float, int, str")
                 raise Unsupported(node, f"'{ast.unparse(node)}': lists of float, int or str are supported")
             if bname in ("dict", "Dict"):
                 kv = node.slice.elts if isinstance(node.slice, ast.Tuple) else []
@@ -427,15 +437,23 @@ class ModuleTranslator:
             self._register_exception(node)
             return
         try:
-            is_dc, frozen, eq, nt = cls_.dataclass_options(self, node)
+            is_dc, frozen, eq, nt, base, abc = cls_.dataclass_options(self, node)
         except Unsupported as e:
             info = cls_.ClassInfo(node.name, node, rejected=e)
             self.classes[node.name] = info
             return
         if not (is_dc or nt):
-            self.classes[node.name] = cls_.ClassInfo(node.name, node, eq=False, plain=True)
-            return
-        self.classes[node.name] = cls_.ClassInfo(node.name, node, frozen=frozen, eq=eq, namedtuple=nt)
+            info = cls_.ClassInfo(node.name, node, eq=False, plain=True)
+        else:
+            info = cls_.ClassInfo(node.name, node, frozen=frozen, eq=eq, namedtuple=nt)
+        info.base, info.abc = base, abc or (base is not None and base.abc)
+        if base is not None or abc:  # a hierarchy: every class in it holds its objects by shared_ptr
+            info.ref = True
+            for a in info.ancestors():
+                a.ref = True
+            if base is not None:
+                base.children.append(info)
+        self.classes[node.name] = info
 
     # --- your own exception classes: class PricingError(ValueError): pass ------------------------
     def _exception_named(self, node):
@@ -522,20 +540,28 @@ class ModuleTranslator:
     def _collect_classes(self):
         """Fields, defaults and method signatures of every class, once all names are known."""
         own = [i for i in self.classes.values() if not i.external]
+
+        def base_ok(info):  # (classes come in source order, so a base is always handled first)
+            b = info.base
+            if info.rejected is None and b is not None and b.rejected is not None:
+                info.rejected = Unsupported(info.node, f"its base class {b.name} could not be translated: "
+                                                       f"{b.rejected.message}", b.rejected.hint)
+            return info.rejected is None
+
         for info in own:
-            if info.rejected is None:
+            if base_ok(info):
                 try:
                     cls_.collect_class_body(self, info)
                 except Unsupported as e:
                     info.rejected = e
         for info in own:
-            if info.rejected is None:
+            if base_ok(info):
                 try:
                     cls_.check_field_types(self, info)
                 except Unsupported as e:
                     info.rejected = e
         for info in own:  # method signatures (a plain class's __init__ types its fields)
-            if info.rejected is not None:
+            if not base_ok(info):
                 continue
             try:
                 for m in info.methods.values():
@@ -547,11 +573,17 @@ class ModuleTranslator:
             except Unsupported as e:
                 info.rejected = e
         for info in own:
-            if info.rejected is None:
+            if base_ok(info):
                 try:
                     if info.plain:
                         self.infer_init_fields(info)
                     self._field_defaults(info)
+                except Unsupported as e:
+                    info.rejected = e
+        for info in own:
+            if base_ok(info) and info.ref:
+                try:
+                    self._check_overrides_of(info)
                 except Unsupported as e:
                     info.rejected = e
         try:
@@ -562,10 +594,13 @@ class ModuleTranslator:
                 c.rejected = c.rejected or e
             self.class_order = []
         changed = True
-        while changed:  # a class holding a rejected class is rejected too
+        while changed:  # a class holding a rejected class is rejected too, as is a subclass of one
             changed = False
             for info in own:
                 if info.rejected is not None:
+                    continue
+                if not base_ok(info):
+                    changed = True
                     continue
                 for f in info.fields:
                     t = f.type.inner if isinstance(f.type, OptionalType) else f.type
@@ -580,14 +615,65 @@ class ModuleTranslator:
                     self.fdefs.pop(m.key, None)
                     self.sigs.pop(m.key, None)
 
+    def _check_overrides_of(self, info):
+        """A method a subclass redefines becomes virtual (C++ then calls the object's own version, as
+        Python does). C++ picks default arguments and parameter types by the variable's class, not
+        the object's, so an override must keep the base method's parameters and return type."""
+        if info.base is None:
+            kin = ", ".join(d.name for d in info.descendants())
+            info.notes.append(f"{info.name}{' and its subclasses (' + kin + ')' if kin else ''} live behind a "
+                              f"std::shared_ptr: a {info.name} variable, parameter or list element can hold any of "
+                              "them, and assigning or passing one shares the object, as in Python")
+        for m in info.methods.values():
+            if m.kind in ("post_init", "init") or m.name in cls_.DUNDERS_SKIPPED or m.key not in self.sigs:
+                continue
+            sig = self.sigs[m.key]
+            sig.abstract = m.abstract
+            above = next((a for a in info.ancestors() if m.name in a.methods), None)
+            below = any(m.name in d.methods for d in info.descendants())
+            if above is not None:
+                bm = above.methods[m.name]
+                if bm.key not in self.sigs:
+                    continue
+                bs = self.sigs[bm.key]
+                where = f"{info.name}.{m.name} overrides {above.name}.{m.name}"
+                if bm.kind != m.kind:
+                    raise Unsupported(m.fdef, f"{where} but is a {m.kind} method there, a {bm.kind} one in "
+                                              f"{above.name}", "keep the same kind of method")
+                if m.kind in ("static", "class"):
+                    continue  # a static method is not virtual: Call.f() and Payoff.f() are just two functions
+                if [p.name for p in sig.params] != [p.name for p in bs.params]:
+                    raise Unsupported(m.fdef, f"{where} with other parameter names "
+                                              f"({', '.join(p.name for p in sig.params)} vs "
+                                              f"{', '.join(p.name for p in bs.params)}): a call by keyword would "
+                                              "then depend on the object's class", "use the base method's names")
+                if [str(p.type) for p in sig.params] != [str(p.type) for p in bs.params] or str(sig.ret) != str(bs.ret):
+                    raise Unsupported(m.fdef, f"{where} with other types ({self._sig_text(sig)} vs "
+                                              f"{self._sig_text(bs)}): a C++ override must keep them",
+                                      "annotate it as the base method is")
+                da = [ast.dump(d) for d in m.fdef.args.defaults]
+                db = [ast.dump(d) for d in bm.fdef.args.defaults]
+                if da != db:
+                    raise Unsupported(m.fdef, f"{where} with other default arguments: C++ takes a default from "
+                                              "the variable's class, Python from the object's",
+                                      "give both the same defaults")
+                sig.virtual = "override"
+            elif below and m.kind in ("instance", "property") or m.abstract or (
+                    m.name in cls_.TEXT_METHODS and info.descendants()):
+                sig.virtual = "virtual"
+
+    @staticmethod
+    def _sig_text(sig):
+        return f"({', '.join(str(p.type) for p in sig.params)}) -> {sig.ret}"
+
     def infer_init_fields(self, info):
         """Types of a plain class's fields from __init__: each `self.x` is read as a local
         `x` and the usual type inference runs over __init__ (so `self.n = len(w)` is an int,
         `self.total = 0.0` a float). A field it can't type needs an annotation."""
-        m = info.methods["__init__"]
         missing = [f for f in info.fields if f.type is None]
         if not missing:
             return
+        m = info.methods["__init__"]
         alias = {f.name: f"qtrans_self_{f.name}" for f in info.fields}
 
         class AsLocals(ast.NodeTransformer):
@@ -1007,6 +1093,7 @@ class ModuleTranslator:
             self.skipped_globals.pop(name, None)
         self._collect_classes()
         self._find_printing()
+        self._find_py_random_users()
         for f in self.fdefs.values():
             self._strip_errstate(f)
         pending = {}
@@ -1023,7 +1110,54 @@ class ModuleTranslator:
         if pending:
             self._infer_from_calls(pending)
         self.analyze_array_params()
+        self._find_object_mutators()
         self._find_strict()
+
+    def _find_object_mutators(self):
+        """Functions and methods that may change an object of a class hierarchy (a field stored, a
+        method that isn't const), themselves or through what they call. Such objects are shared,
+        as in Python, so another name in the same statement may see the change: the evaluation
+        order check (FunctionTranslator._check_order) treats a call to one as a change to every
+        object there."""
+        self.object_mutators = set()
+        if not any(c.ref for c in self.classes.values()):
+            return
+        nonconst = {m.name for c in self.classes.values() if c.ref for m in c.methods.values()
+                    if m.key in self.sigs and m.kind == "instance" and not self.sigs[m.key].const}
+        calls = {}
+        for name, f in self.fdefs.items():
+            sig = self.sigs.get(name)
+            if sig is None:
+                continue
+            owner = self.classes.get(sig.owner) if sig.owner else None
+            hit, callees = False, set()
+            for n in ast.walk(f):
+                if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                        for leaf in target_leaves(t):
+                            if isinstance(leaf, (ast.Attribute, ast.Subscript)):
+                                root = subscript_root(leaf)
+                                if root != "self" or (owner is not None and owner.ref):
+                                    hit = True
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                    if n.func.attr in nonconst:
+                        hit = True
+                    if isinstance(n.func.value, ast.Name) and n.func.value.id == "self" and owner is not None:
+                        m = owner.find_method(n.func.attr)
+                        if m is not None:
+                            callees.add(m.key)
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in self.sigs:
+                    callees.add(n.func.id)
+            if hit:
+                self.object_mutators.add(name)
+            calls[name] = callees
+        changed = True
+        while changed:
+            changed = False
+            for name, cs in calls.items():
+                if name not in self.object_mutators and cs & self.object_mutators:
+                    self.object_mutators.add(name)
+                    changed = True
 
     # --- code whose float errors a Python `except` may catch ------------------------------------
     def _catches_float_errors(self, t: ast.Try) -> bool:
@@ -1431,6 +1565,74 @@ class ModuleTranslator:
                     self.printing.add(name)
                     changed = True
 
+    def _random_module_call(self, call) -> str | None:
+        """'gauss' for random.gauss(...) (or gauss(...) imported from random), else None."""
+        f = call.func
+        if not isinstance(f, (ast.Name, ast.Attribute)):
+            return None
+        q = _ConstTranslator(self).qualify(f)
+        return q.split(".", 1)[1] if q and q.startswith("random.") and q.count(".") == 1 else None
+
+    def _find_py_random_users(self):
+        """The functions and methods that use the random module's generator, themselves or through
+        what they call: a call to one draws (or seeds), so its order matters (see
+        FunctionTranslator._effect), and `qtrans verify` seeds both sides before calling it."""
+        users, calls = set(), {}
+        for name, f in self.fdefs.items():
+            called = set()
+            for n in ast.walk(f):
+                if isinstance(n, ast.Call):
+                    if self._random_module_call(n) is not None:
+                        users.add(name)
+                    if isinstance(n.func, ast.Name):
+                        called.add(n.func.id)
+                    elif isinstance(n.func, ast.Attribute):
+                        called.add("." + n.func.attr)
+            calls[name] = called
+        for name, sig in self.sigs.items():  # imported from another module of the project
+            if getattr(sig, "py_random", False):
+                users.add(name)
+        changed = True
+        while changed:
+            changed = False
+            methods = {"." + k.split(".", 1)[1] for k in users if "." in k}
+            for name, called in calls.items():
+                if name not in users and (called & users or called & methods):
+                    users.add(name)
+                    changed = True
+        self.py_random_users = users
+        for name in users:
+            if name in self.sigs:
+                self.sigs[name].py_random = True
+
+    def uses_py_random(self, node) -> bool:
+        """Does this code (a statement, an expression) use the random module's generator?"""
+        users = getattr(self, "py_random_users", set())
+        methods = {"." + k.split(".", 1)[1] for k in users if "." in k}
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                if self._random_module_call(n) is not None:
+                    return True
+                if isinstance(n.func, ast.Name) and n.func.id in users:
+                    return True
+                if isinstance(n.func, ast.Attribute) and "." + n.func.attr in methods:
+                    return True
+        return False
+
+    def _seeded_first(self):
+        """A program's numbers from the random module are Python's only if the program seeds it
+        before anything draws: Python seeds it from the operating system when it is imported."""
+        for st in self.main_body:
+            if not self.uses_py_random(st):
+                continue
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and \
+                    self._random_module_call(st.value) == "seed":
+                return None
+            return Unsupported(st, "this draws from the random module before the program calls random.seed(...): "
+                                   "Python seeds it from the operating system when it is imported, so the numbers "
+                                   "change on every run", "call random.seed(42) (any int) first, at the top of the program")
+        return None
+
     def fdef_named(self, name):
         """The def of a module function by its Python name (its versions share one)."""
         if name in self.fdefs:
@@ -1576,10 +1778,18 @@ class ModuleTranslator:
                             ip.add(root)
                     if isinstance(n.func, ast.Name) and n.func.id in self.sigs:
                         callee = n.func.id
+                    elif isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Call) and \
+                            isinstance(n.func.value.func, ast.Name) and n.func.value.func.id == "super" and \
+                            sig.owner and self.classes[sig.owner].base is not None:
+                        m = self.classes[sig.owner].base.find_method(n.func.attr)  # super().f(): the base's f on self
+                        if m is not None and m.key in self.sigs and m.kind == "instance":
+                            callee = m.key
+                            if "self" in arr:
+                                cl.append((callee, "self", "self"))
                     elif isinstance(n.func, ast.Attribute):
                         bt = self.chain_type(n.func.value, ptypes)
                         if isinstance(bt, StructType) and bt.name in self.classes:
-                            m = self.classes[bt.name].methods.get(n.func.attr)
+                            m = self.classes[bt.name].find_method(n.func.attr)
                             if m is not None and m.key in self.sigs:
                                 callee = m.key
                                 root = subscript_root(n.func.value) if not isinstance(n.func.value, ast.Name) \
@@ -1607,9 +1817,17 @@ class ModuleTranslator:
                     if root in arr and root != "self":
                         idx = next(i for i, p in enumerate(sig.params) if p.name == root)
                         self.returns_alias.setdefault(name, set()).add(idx)
+        groups = self._virtual_groups()
         changed = True
         while changed:  # passing an array or object to a function that modifies it modifies it too
             changed = False
+            for group in groups:  # a virtual method and its overrides: one C++ signature for all
+                keys = [k for k in group if k in inplace]
+                union = set().union(*(inplace[k] for k in keys)) if keys else set()
+                for k in keys:
+                    if not union <= inplace[k]:
+                        inplace[k] |= union
+                        changed = True
             for name, lst in calls.items():
                 for callee, i, arg in lst:
                     cs = self.sigs[callee]
@@ -1651,7 +1869,9 @@ class ModuleTranslator:
                             "not supported", f"check for None, then work on a copy: {p.name}_ = {p.name}.copy()")
                     p.mode = "value" if p.name in rebound[name] else "cref"
                     continue
-                if isinstance(p.type, StructType) and self.immutable(p.type):
+                if isinstance(p.type, StructType) and (p.type.ref or self.immutable(p.type)):
+                    # (an object of a class hierarchy is behind a shared_ptr: changes through it reach
+                    # the caller's object, and rebinding the name doesn't, both as in Python)
                     p.mode = "value" if p.name in rebound[name] else "cref"  # can't change: never copied
                     continue
                 if not (is_array(p.type) or isinstance(p.type, StructType)):
@@ -1666,6 +1886,20 @@ class ModuleTranslator:
                 p.mode = "ref" if p.name in ip else "value" if p.name in rebound[name] else "cref"
         self._check_post_init_sharing()
 
+    def _virtual_groups(self) -> list:
+        """[method keys] for each virtual method: the one that introduces it and every override."""
+        groups = []
+        for info in self.classes.values():
+            if info.external or info.rejected is not None or not info.ref:
+                continue
+            for m in info.methods.values():
+                sig = self.sigs.get(m.key)
+                if sig is None or sig.virtual != "virtual":
+                    continue
+                keys = [m.key] + [d.methods[m.name].key for d in info.descendants() if m.name in d.methods]
+                groups.append(keys)
+        return groups
+
     def _check_post_init_sharing(self):
         """__post_init__ changing an array or object field in place changes the caller's own
         array in Python (the field *is* the argument); the C++ object holds a copy."""
@@ -1673,7 +1907,8 @@ class ModuleTranslator:
             m = info.methods.get("__init__" if info.plain else "__post_init__")
             if info.external or info.rejected is not None or m is None or m.key not in self.sigs:
                 continue
-            shared = {f.name for f in info.init_fields if is_array(f.type) or isinstance(f.type, StructType)}
+            shared = {f.name for f in info.init_fields if is_array(f.type) or
+                      (isinstance(f.type, StructType) and not f.type.ref)}
             if info.plain:  # self.w = w (or a view of w): the field *is* the caller's array
                 ptypes = {p.name: p.type for p in self.sigs[m.key].params}
                 for n in ast.walk(m.fdef):
@@ -1831,6 +2066,10 @@ class ModuleTranslator:
                     self.rejected[name] = bad
                     progress = True
                     continue
+                if self.sigs[name].abstract:  # declared `= 0`: the subclasses supply the body
+                    bodies[name], notes[name], self.line_notes[name] = [], [], []
+                    self.array_users[name] = False
+                    continue
                 tr = FunctionTranslator(self, f, self.sigs[name])
                 ov = self._override(name)
                 if ov is not None:
@@ -1875,6 +2114,14 @@ class ModuleTranslator:
                         e = self.rejected[bad.key]
                         info.rejected = Unsupported(bad.fdef, f"method {bad.name} could not be translated: "
                                                               f"{e.message}", e.hint)
+                        progress = True
+            for info in self.classes.values():  # a class of a hierarchy stands or falls with the rest of it
+                if info.rejected is None and not info.external and info.ref:
+                    kin = info.ancestors() + info.descendants()
+                    bad = next((k for k in kin if k.rejected is not None), None)
+                    if bad is not None:
+                        info.rejected = Unsupported(info.node, f"{bad.name}, in the same class hierarchy, could not "
+                                                               f"be translated: {bad.rejected.message}", bad.rejected.hint)
                         progress = True
             if not progress:
                 break
@@ -1938,6 +2185,9 @@ class ModuleTranslator:
 
     def _finish(self, bodies, notes, general):
         self._check_overrides()
+        for name in getattr(self, "py_random_users", ()):  # (signatures may have been made again since)
+            if name in self.sigs:
+                self.sigs[name].py_random = True
         self.report.module_notes += self.hint_problems
         for info in self.classes.values():
             if info.external:
@@ -2028,6 +2278,10 @@ class ModuleTranslator:
         if not self.main_body:
             self.main_error = Unsupported(None, "the `if __name__ == \"__main__\":` block has nothing to run")
             return
+        unseeded = self._seeded_first()
+        if unseeded is not None:
+            self.main_error = unseeded
+            return
         later = {}
         for name, f in self.fdefs.items():
             later[name.split("(")[0]] = f.lineno
@@ -2112,6 +2366,8 @@ class ModuleTranslator:
     # --- structs ------------------------------------------------------------------------------
     def _ctor_params(self, info, defaults):
         if info.plain:  # the constructor is __init__, with its own parameters
+            if "__init__" not in info.methods:
+                return []  # inherited (using Base::Base), or none at all
             sig = self.sigs[info.methods["__init__"].key]
             parts = self.cpp_signature(sig, defaults=defaults)
             inner = parts[parts.index("(") + 1:parts.rindex(")")]
@@ -2129,69 +2385,23 @@ class ModuleTranslator:
             out.append((f, pname, f"{ty.strip()} {pname}{d}"))
         return out
 
-    def render_struct(self, info, bodies) -> list:
-        """The struct: fields, constructors and member declarations. Member functions are
-        defined after the module's function declarations, so they can call anything."""
-        out = []
-        if info.doc:
-            d = info.node.body[0]
-            out += [("/// " + line).rstrip() + source_mark(d.lineno, d.end_lineno)
-                    for line in inspect.cleandoc(info.doc).splitlines()]
-        kind = "NamedTuple" if info.namedtuple else "class" if info.plain else \
-            ("frozen dataclass" if info.frozen else "dataclass")
-        cls = info.node.lineno
-        top = min([cls] + [d.lineno for d in info.node.decorator_list])
-        start = len(out)
-        out.append(f"struct {info.cpp} {{  // {kind}" + source_mark(top, cls))
-        for f in info.fields:
-            note = "" if f.init else "  // init=False: set by __post_init__ or its default"
-            ln = getattr(f.annotation, "lineno", None)
-            out.append(f"    {f.type.cpp()} {f.cpp}{{}};{note}" + (source_mark(ln, getattr(f.annotation, "end_lineno", ln)) if ln else ""))
-        out.append("")
-        params = self._ctor_params(info, defaults=True)
-        if params or not info.plain:
-            out.append(f"    {info.cpp}() = default;  // only so a variable can be declared before it is assigned")
-        if info.plain:
-            sig = self.sigs[info.methods["__init__"].key]
-            required = sum(1 for p in sig.params if p.default_code is None)
-            if not sig.params:
-                params = []
-        else:
-            required = sum(1 for f, _, _ in params if f.default_code is None)
-        explicit = "explicit " if params and required <= 1 else ""  # no silent conversions
-        out.append(f"    {explicit}{info.cpp}({', '.join(p for _, _, p in params)});")
-        for m in info.methods.values():
-            if m.key not in bodies or m.kind in ("post_init", "init"):
-                continue
-            sig = self.sigs[m.key]
-            decl = self.cpp_signature(sig, defaults=True)
-            if m.kind in ("static", "class"):
-                decl = "static " + decl
-            elif sig.const:
-                decl += " const"
-            out.append(f"    {decl};" + ("  // @property" if m.kind == "property" else ""))
-        if info.name in getattr(self, "repr_needed", set()) and "__repr__" not in info.methods:
-            out.append("    std::string repr() const;  // repr(), as Python writes it for this class")
-        if info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields):
-            out.append(f"    bool operator==(const {info.cpp}& other) const;")
-            out.append(f"    bool operator!=(const {info.cpp}& other) const {{ return !(*this == other); }}")
-        out.append("};")
-        # the struct's other lines (constructors, member declarations, the closing brace) belong
-        # with the class line in the source map; fields carry their own lines
-        mark = source_mark(cls, cls)
-        out[start:] = [l if not l.strip() or "\x1f" in l else l + mark for l in out[start:]]
-        out.append("")
-        return out
-
-    def render_members(self, info, bodies) -> list:
+    def _render_ctor(self, info, bodies) -> list:
         out = []
         params = self._ctor_params(info, defaults=False)
         if info.plain:
             inits = []
+            b = getattr(self, "base_init", {}).get(info.name)
+            if b is not None:  # super().__init__(...): the base part first
+                inits.append(f"{b[0]}({', '.join(b[2])})")
         else:
-            inits = [f"{f.cpp}(std::move({pname}))" if not isinstance(f.type, Scalar) else f"{f.cpp}({pname})"
-                     for f, pname, _ in params]
-        for f in info.fields:
+            inherited = {f.name for f in info.base.init_fields} if info.base is not None else set()
+            mine = [(f, pname) for f, pname, _ in params if f.name not in inherited]
+            inits = []
+            if info.base is not None:
+                inits.append(f"{info.base.cpp}({', '.join(pn for f, pn, _ in params if f.name in inherited)})")
+            inits += [f"{f.cpp}(std::move({pname}))" if not isinstance(f.type, Scalar) else f"{f.cpp}({pname})"
+                      for f, pname in mine]
+        for f in info.own_fields:
             if not f.init and f.default_code is not None:
                 inits.append(f"{f.cpp}({f.default_code})")
         head = f"inline {info.cpp}::{info.cpp}({', '.join(p for _, _, p in params)})"
@@ -2207,8 +2417,126 @@ class ModuleTranslator:
             out += body
             out.append("}" + (source_mark(post.fdef.end_lineno, post.fdef.end_lineno) if post is not None else ""))
         out.append("")
+        return out
+
+    def _holds_hierarchy_dataclass(self, info) -> bool:
+        """A field holding a dataclass object of a hierarchy: Python's == compares it by class and
+        fields, which a pointer comparison doesn't (== on such objects is refused, so no operator==)."""
+        return any(f.compare and isinstance(f.type, StructType) and f.type.ref and not self.classes[f.type.name].plain
+                   for f in info.fields)
+
+    def _repr_virtual(self, info, method="__repr__") -> str:
+        """virtual / override / "" for the repr() (or str()) of a class: its own __repr__, the
+        dataclass one, or a `= 0` one in an abstract class Python never shows."""
+        if not info.ref:
+            return ""
+        needed = getattr(self, "repr_needed", set()) if method == "__repr__" else set()
+        pure = getattr(self, "text_pure", set())
+        if any(method in a.methods or a.name in needed or (a.name, method) in pure for a in info.ancestors()):
+            return "override"
+        return "virtual" if info.descendants() else ""
+
+    def render_struct(self, info, bodies) -> list:
+        """The struct: fields, constructors and member declarations. Member functions are
+        defined after the module's function declarations, so they can call anything."""
+        out = []
+        if info.doc:
+            d = info.node.body[0]
+            out += [("/// " + line).rstrip() + source_mark(d.lineno, d.end_lineno)
+                    for line in inspect.cleandoc(info.doc).splitlines()]
+        kind = "NamedTuple" if info.namedtuple else "class" if info.plain else \
+            ("frozen dataclass" if info.frozen else "dataclass")
+        if info.abc and info.abstract_left():
+            kind = "abstract " + kind
+        cls = info.node.lineno
+        top = min([cls] + [d.lineno for d in info.node.decorator_list])
+        start = len(out)
+        bases = f" : public {info.base.cpp}" if info.base is not None else ""
+        pyb = f"({', '.join(ast.unparse(b) for b in info.node.bases)})" if info.node.bases else ""
+        out.append(f"struct {info.cpp}{bases} {{  // {kind} {info.name}{pyb}".rstrip() + source_mark(top, cls)
+                   if info.ref else f"struct {info.cpp} {{  // {kind}" + source_mark(top, cls))
+        for f in info.own_fields:
+            note = "" if f.init else "  // init=False: set by __post_init__ or its default"
+            ln = getattr(f.annotation, "lineno", None)
+            out.append(f"    {f.type.cpp()} {f.cpp}{{}};{note}" + (source_mark(ln, getattr(f.annotation, "end_lineno", ln)) if ln else ""))
+        if info.own_fields:
+            out.append("")
+        params = self._ctor_params(info, defaults=True)
+        init = info.methods.get("__init__") if info.plain else None
+        if info.ref:  # objects live behind a shared_ptr: a variable never holds an empty object
+            if info.base is None:
+                out.append(f"    virtual ~{info.cpp}() = default;  // a pointer to {info.name} may hold a subclass")
+            if info.plain and init is not None:
+                out.append(f"    {info.cpp}() = default;  // an object with its fields not set yet (qtrans verify "
+                           "fills one in field by field)")
+            if info.plain and init is None:
+                if info.base is not None and info.base.find_method("__init__") is not None:
+                    out.append(f"    using {info.base.cpp}::{info.base.cpp};  // __init__ is {info.base.method_owner('__init__').name}'s")
+                params = None
+        elif params or not info.plain:
+            out.append(f"    {info.cpp}() = default;  // only so a variable can be declared before it is assigned")
+        if params is not None:
+            if info.plain:
+                sig = self.sigs[init.key]
+                required = sum(1 for p in sig.params if p.default_code is None)
+                if not sig.params:
+                    params = []
+            else:
+                required = sum(1 for f, _, _ in params if f.default_code is None)
+            explicit = "explicit " if params and required <= 1 else ""  # no silent conversions
+            out.append(f"    {explicit}{info.cpp}({', '.join(p for _, _, p in params)});")
         for m in info.methods.values():
             if m.key not in bodies or m.kind in ("post_init", "init"):
+                continue
+            sig = self.sigs[m.key]
+            decl = self.cpp_signature(sig, defaults=True)
+            if m.kind in ("static", "class"):
+                decl = "static " + decl
+            elif sig.const:
+                decl += " const"
+            v = self._repr_virtual(info, m.name) if m.name in cls_.TEXT_METHODS else sig.virtual
+            if v == "virtual":
+                decl = "virtual " + decl
+            elif v == "override":
+                decl += " override"
+            if sig.abstract:
+                decl += " = 0"
+            note = "  // @property" if m.kind == "property" else "  // @abstractmethod" if sig.abstract else ""
+            out.append(f"    {decl};" + note)
+        if info.name in getattr(self, "repr_needed", set()) and "__repr__" not in info.methods:
+            v = self._repr_virtual(info)
+            out.append(f"    {'virtual ' if v == 'virtual' else ''}std::string repr() const"
+                       f"{' override' if v == 'override' else ''};  // repr(), as Python writes it for this class")
+        for meth, cpp in (("__repr__", "repr"), ("__str__", "str")):
+            if (info.name, meth) in getattr(self, "text_pure", set()):
+                v = self._repr_virtual(info, meth)
+                out.append(f"    {'virtual ' if v != 'override' else ''}std::string {cpp}() const"
+                           f"{' override' if v == 'override' else ''} = 0;  // each subclass shows itself")
+        if info.ref and info.name in getattr(self, "type_name_needed", set()):
+            v = "override" if info.base is not None else "virtual"
+            out.append(f"    {'virtual ' if v == 'virtual' else ''}std::string type_name() const"
+                       f"{' override' if v == 'override' else ''} {{ return \"{info.name}\"; }}  // type(obj).__name__")
+        if info.ref:
+            pass  # == on objects of a hierarchy: identity for a plain class (pointer ==), else refused
+        elif info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields) \
+                and not self._holds_hierarchy_dataclass(info):
+            out.append(f"    bool operator==(const {info.cpp}& other) const;")
+            out.append(f"    bool operator!=(const {info.cpp}& other) const {{ return !(*this == other); }}")
+        out.append("};")
+        # the struct's other lines (constructors, member declarations, the closing brace) belong
+        # with the class line in the source map; fields carry their own lines
+        mark = source_mark(cls, cls)
+        out[start:] = [l if not l.strip() or "\x1f" in l else l + mark for l in out[start:]]
+        out.append("")
+        return out
+
+    def render_members(self, info, bodies) -> list:
+        out = []
+        cls = info.node.lineno
+        if not (info.ref and info.plain and "__init__" not in info.methods):
+            out += self._render_ctor(info, bodies)
+        for m in info.methods.values():
+            if m.key not in bodies or m.kind in ("post_init", "init") or self.sigs[m.key].abstract:
                 continue
             sig = self.sigs[m.key]
             if sig.doc:
@@ -2230,7 +2558,8 @@ class ModuleTranslator:
             for k, f in enumerate(x for x in info.fields if x.repr):
                 text += ("" if k == 0 else ", ") + f"{f.name}="
                 pieces += [cpp_string_literal(text),
-                           f"{f.cpp}.repr()" if isinstance(f.type, StructType) else f"qt::py::repr({f.cpp})"]
+                           (f"{f.cpp}->repr()" if f.type.ref else f"{f.cpp}.repr()") if isinstance(f.type, StructType)
+                           else f"qt::py::repr({f.cpp})"]
                 text = ""
             pieces.append(cpp_string_literal(text + ")"))
             code = " + ".join(pieces)
@@ -2238,7 +2567,8 @@ class ModuleTranslator:
             out.append(f"    return {code};" + mark)
             out.append("}" + mark)
             out.append("")
-        if info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields):
+        if not info.ref and info.eq and not info.has_array_field(self.classes) and any(f.compare for f in info.fields) \
+                and not self._holds_hierarchy_dataclass(info):
             terms = [f"{f.cpp} == other.{f.cpp}" for f in info.fields if f.compare]
             eq_mark = source_mark(cls, cls)  # dataclass equality: from the class itself
             out.append(f"inline bool {info.cpp}::operator==(const {info.cpp}& other) const {{" + eq_mark)
@@ -2337,6 +2667,7 @@ class ModuleTranslator:
                   ("<stdexcept>", r"throw std::"), ("<tuple>", r"std::(tuple|tie|ignore|make_tuple)"),
                   ("<initializer_list>", r"(?m)std::(max|min)\(\{|^\s*for \([^:;]+ : \{"), ("<string>", r"std::(string|to_string)\b"),
                   ("<optional>", r"std::optional"), ("<utility>", r"std::move\("),
+                  ("<memory>", r"std::(shared_ptr|make_shared|dynamic_pointer_cast)\b"),
                   ("<iostream>", r"std::(cout|cerr)\b"), ("<exception>", r"std::exception\b")]
         code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text)  # not what string literals say
         for inc, pat in checks:
@@ -2352,6 +2683,8 @@ class ModuleTranslator:
             inc_lines.append('#include "qtrans_arrays.hpp"  // Eigen, plus NumPy semantics')
         elif "qt::" in code.replace("qt::py::", ""):
             inc_lines.append('#include "qtrans_runtime.hpp"')
+        if "qt::py::random_module()" in code:
+            inc_lines.append('#include "qtrans_pyrandom.hpp"  // Python\'s random module, number for number')
         if "std::vector<" in code or re.search(r"qt::py::(" + "|".join(sorted(_list_names())) + r")\b", code):
             inc_lines.append('#include "qtrans_list.hpp"  // lists, dicts, text, and print(), str(), repr(), format() as Python writes them')
         elif "qt::py::" in code:
@@ -2430,15 +2763,15 @@ def translate_file(path, out_dir=None) -> TranslationResult:
             (out / f"{path.stem}.cpp").write_text(result.program, encoding="utf-8")
         (out / f"{path.stem}_report.md").write_text(result.report.to_markdown(), encoding="utf-8")
         if result.uses_runtime:
-            for h in (RUNTIME_HEADER, PYTHON_HEADER):
+            for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER):
                 (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
         everything = result.header + (result.program or "")
         if result.uses_arrays or "qtrans_arrays.hpp" in everything or "qtrans_random.hpp" in everything:
-            for h in (ARRAYS_HEADER, RUNTIME_HEADER, PYTHON_HEADER):
+            for h in (ARRAYS_HEADER, RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER):
                 (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
         if result.uses_random or "qtrans_random.hpp" in everything:
             (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")
         if re.search(r"qtrans_(print|list)\.hpp", result.header + (result.program or "")):
-            for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+            for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
                 (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
     return result

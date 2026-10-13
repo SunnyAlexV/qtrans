@@ -22,7 +22,7 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
+from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
 
 
 class ProjectError(Exception):
@@ -84,7 +84,7 @@ class ProjectResult:
             if r.program is not None:
                 (out / f"{name}.cpp").write_text(r.program, encoding="utf-8")
             (out / f"{name}_report.md").write_text(r.report.to_markdown(), encoding="utf-8")
-        headers = [RUNTIME_HEADER, PYTHON_HEADER]
+        headers = [RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER]
         texts = [r.header + (r.program or "") for r in self.modules.values()]
         if any("qtrans_print.hpp" in t or "qtrans_list.hpp" in t for t in texts):
             headers += [PRINT_HEADER, LIST_HEADER, UNICODE_HEADER]

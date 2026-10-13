@@ -57,7 +57,7 @@ from pathlib import Path
 import numpy as np
 
 from . import verify as V
-from .translator import ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
+from .translator import ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
 from .types import (ListType, DictType, BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
                     VoidType)
 
@@ -249,6 +249,8 @@ class Binder:
     # --- parameters -------------------------------------------------------------------------------
     def _param(self, w: _Wrap, p: _Param):
         t, v = p.type, p.cpp
+        if isinstance(t, ListType) and isinstance(t.elem, StructType):
+            raise BindError(f"parameter '{p.name}' is a list of {t.elem} objects, which the bindings don't support yet")
         if isinstance(t, OptionalType) and not (_native(t) or isinstance(t.inner, ArrayType)):
             raise BindError(f"parameter '{p.name}' of type {t} can't be bound yet")
         pyarg = f"py::arg({_cstr(p.name)})"
@@ -292,7 +294,8 @@ class Binder:
         elif isinstance(t, StructType):
             info = self.classes.get(t.name)
             if info is None:
-                raise BindError(f"uses class {t.name}, which isn't translated")
+                raise BindError(f"uses class {t.name}, which isn't bound" if t.ref else
+                                f"uses class {t.name}, which isn't translated")
             cpp = info.cpp
             w.pre.append(f"std::optional<{cpp}> {v}_tmp;")
             decl = f"const {cpp}&" if p.mode == "cref" else f"{cpp}&" if p.mode == "ref" else cpp
@@ -320,8 +323,10 @@ class Binder:
         inner = t.inner if isinstance(t, OptionalType) else t
         if inner == RNG:
             raise BindError("returning a generator can't be bound yet")
+        if isinstance(inner, ListType) and isinstance(inner.elem, StructType):
+            raise BindError(f"returns a list of {inner.elem} objects, which the bindings don't support yet")
         if isinstance(inner, StructType) and inner.name not in self.classes:
-            raise BindError(f"returns a {inner.name}, which isn't translated")
+            raise BindError(f"returns a {inner.name}, which isn't " + ("bound" if inner.ref else "translated"))
 
     def _lambda(self, w: _Wrap, call: str, self_decl: str | None = None, self_leaf=None) -> str:
         """`[](decls) { pre; return call; }`, with the write-backs run afterwards (also when the
@@ -358,6 +363,9 @@ class Binder:
 
     # --- functions ---------------------------------------------------------------------------------
     def bind_function(self, name, sig) -> list:
+        if getattr(sig, "py_random", False):
+            raise BindError("it uses the random module's generator: the compiled module's would be a separate one "
+                            "from your Python's, so the numbers wouldn't continue yours (qtrans verify checks it)")
         self._ret_ok(sig.ret)
         lam, pyargs, notes = self._callable(sig, lambda a: f"{sig.cpp}({', '.join(a)})")
         if notes:
@@ -394,6 +402,9 @@ class Binder:
     def from_python(self, info) -> list:
         """C++ object from your Python object, field by field (no constructor runs: the fields
         are the object's state)."""
+        if info.ref:
+            raise BindError(f"{info.name} is part of a class hierarchy, which the bindings don't support yet "
+                            "(qtrans verify checks the C++ of it)")
         cpp = info.cpp
         out = [f"static {cpp} qtrans_from_py_{info.name}(py::handle o, const char* arg) {{",
                f"    qtb::expect_class(o, {_cstr(info.name)}, {_cstr(_article(info.name))}, arg);",
@@ -465,6 +476,10 @@ class Binder:
                 notes.append("a generator given to the constructor is copied: the object and you no longer share it")
         if notes:
             self.notes.setdefault(info.name, []).extend(notes)
+        init = info.methods.get("__init__" if info.plain else "__post_init__")
+        if init is not None and getattr(sigs.get(init.key), "py_random", False):
+            raise BindError(f"creating a {info.name} uses the random module's generator, which the compiled module "
+                            "would have a separate copy of")
         lines.append(f"    {var}.def(py::init({lam}){''.join(', ' + a for a in pyargs)});")
         # fields
         mutable = self._mutable(info)
@@ -498,6 +513,9 @@ class Binder:
             sig = sigs[m.key]
             try:
                 self._use_variant(self.methods.get((info.name, m.name)))
+                if getattr(sig, "py_random", False):
+                    raise BindError("it uses the random module's generator, which the compiled module would have "
+                                    "a separate copy of")
                 self._ret_ok(sig.ret)
                 doc = _doc(sig.doc)
                 if m.kind == "property":
@@ -829,7 +847,7 @@ def build_extension(path, out_dir=None, build_dir=None, eigen=None, module_name=
     if not any(b.bound or b.bound_classes for b in binders.values()):
         raise RuntimeError(f"nothing in {first.name} could be translated and bound")
     path = first
-    for h in (RUNTIME_HEADER, PYTHON_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER, PYBIND_HEADER):
+    for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER, PYBIND_HEADER):
         shutil.copy(h, build / h.name)
     cpp = build / f"{name}_bind.cpp"
     cpp.write_text(src, encoding="utf-8")

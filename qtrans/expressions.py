@@ -23,6 +23,7 @@ from .printing import TextOps
 from .dicts import DictOps, dict_of
 from .strings import StrOps
 from .lists import ListOps, list_of
+from .pyrandom import PyRandomOps
 from .types import (ExcType, ListType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
                     TupleType, assignable, is_array, join)
 
@@ -62,6 +63,46 @@ _REJECTED_BUILTINS = {
     "map": "write a comprehension instead: [f(x) for x in xs], or sum(f(x) for x in xs)",
     "filter": "write a comprehension instead: [x for x in xs if keep(x)]",
 }
+
+
+class _ObjectChecks:
+    """isinstance(p, Call) and type(p).__name__ for objects of a class hierarchy (0.13)."""
+
+    def isinstance_check(self, node):
+        x_node, c_node = node.args
+        names = c_node.elts if isinstance(c_node, ast.Tuple) else [c_node]
+        if not all(isinstance(n, ast.Name) and n.id in self.mod.classes and not self.is_variable(n.id) for n in names):
+            return None
+        e = self.expr(x_node)
+        if not isinstance(e.type, StructType):
+            raise Unsupported(node, f"isinstance() of a {e.type} with a class: Python says False; write that")
+        if not e.simple:
+            raise Unsupported(x_node, "isinstance() of an expression: store it in a variable first")
+        terms = []
+        for n in names:
+            info = self.class_info(n.id, n)
+            if e.type.derives_from(info.type):
+                return Expr("true", P_ATOM, BOOL)  # a Call is always a Payoff
+            if info.type.derives_from(e.type):  # a Payoff that may be a Call: ask the object
+                if e.code == "(*this)":
+                    terms.append(f"dynamic_cast<const {info.cpp}*>(this) != nullptr")
+                else:
+                    terms.append(f"std::dynamic_pointer_cast<{info.cpp}>({e.code}) != nullptr")
+        if not terms:
+            return Expr("false", P_ATOM, BOOL)  # unrelated classes: never
+        if len(terms) == 1:
+            return Expr(terms[0], P_EQ, BOOL)
+        return Expr(" || ".join(f"({t})" for t in terms), 14, BOOL)
+
+    def class_name_of(self, node, e):
+        info = self.class_info(e.type.name, node)
+        if not info.ref or not info.descendants():
+            return Expr(f'std::string("{info.name}")', P_ATOM, STR, value=info.name)
+        root = ([info] + info.ancestors())[-1]
+        need = self.mod.__dict__.setdefault("type_name_needed", set())
+        need |= {root.name} | {d.name for d in root.descendants()}
+        call = "type_name()" if e.code == "(*this)" else f"{wrap(e, P_ATOM)}->type_name()"
+        return Expr(call, P_ATOM, STR)
 
 
 class _Unknown(Exception):
@@ -104,7 +145,7 @@ def _outer_call(code: str):
     return None
 
 
-class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
+class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _ObjectChecks, PyRandomOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
@@ -320,6 +361,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             e = self.expr(node.value.args[0])
             if isinstance(e.type, ExcType):  # type(e).__name__ of a caught exception: its Python class
                 return Expr(f"std::string({e.code}.type_name())", P_ATOM, STR)
+            if isinstance(e.type, StructType):
+                return self.class_name_of(node, e)
         q = self.qualify(node)
         src = ast.unparse(node)
         if isinstance(node.value, ast.Name) and node.value.id in self.mod.classes \
@@ -463,7 +506,9 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
                                             "OverflowError where Python prints the number)",
                               "use a float if an approximate value is enough (2.0 ** 100)")
 
-    def power(self, node, L: Expr, R: Expr) -> Expr:
+    def power(self, node, L: Expr, R: Expr, ufunc: bool = False) -> Expr:
+        """L ** R on numbers (ufunc: np.power, whose fast paths square, take the square root and
+        the reciprocal for the exponents 2, 0.5 and -1, where ** calls the C library's pow)."""
         node = node or self.current
         self.need_scalar(L, node, "**")
         self.need_scalar(R, node, "**")
@@ -476,7 +521,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
                 if n < 0:
                     if self._python_raises(node):  # 0 ** -1 raises ZeroDivisionError
                         return Expr(f"qt::py::power({self.as_double(L).code}, {n}.0, true)", P_ATOM, FLOAT)
-                    return Expr(f"std::pow({self.as_double(L).code}, {n}.0)", P_ATOM, FLOAT)
+                    return Expr(f"qt::pow({self.as_double(L).code}, {n}.0)", P_ATOM, FLOAT)
                 a = self.as_type(L, INT)
                 lo, hi = iv_of(L)
                 ends = [lo ** n, hi ** n]
@@ -495,9 +540,15 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
         if self._python_raises(node):  # 0.0 ** -1 and overflow raise, as Python's float_pow
             L, R = self.promote(L, FLOAT), self.promote(R, FLOAT)
             return Expr(f"qt::py::power({self.as_double(L).code}, {self.as_double(R).code})", P_ATOM, FLOAT)
-        if R.value is not None and float(R.value) == 2.0 and L.simple and L.prec == P_ATOM:
-            # x ** 2 == x * x exactly (one correctly rounded multiplication)
-            return Expr(f"{L.code} * {L.code}", P_MUL, FLOAT)
+        if ufunc and R.value is not None and not isinstance(R.value, str) and float(R.value) in (2.0, 0.5, -1.0):
+            L = self.promote(L, FLOAT)
+            v = float(R.value)
+            if v == 2.0 and L.simple and L.prec == P_ATOM:
+                return Expr(f"{L.code} * {L.code}", P_MUL, FLOAT)  # np.power(x, 2) is np.square(x)
+            if v == 0.5:
+                return Expr(f"std::sqrt({L.code})", P_ATOM, FLOAT)
+            if v == -1.0:
+                return Expr(f"1.0 / {wrap(L, P_MUL)}", P_MUL, FLOAT)
         self.note("powoverflow", "float ** raises OverflowError in Python when the result "
                                  "overflows; C++ returns inf")
         integral = R.type != FLOAT or (R.value is not None and float(R.value) == int(float(R.value)))
@@ -505,7 +556,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             self.note("complexpow", "x ** y with a negative x and non-integer y gives a complex "
                                     "number for a Python float but NaN in C++ (and for np.float64)")
         L, R = self.promote(L, FLOAT), self.promote(R, FLOAT)
-        return Expr(f"std::pow({L.code}, {R.code})", P_ATOM, FLOAT)
+        return Expr(f"qt::pow({self.as_double(L).code}, {self.as_double(R).code})", P_ATOM, FLOAT)
 
     def e_UnaryOp(self, node):
         if isinstance(node.op, ast.Not):
@@ -666,7 +717,14 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
         a, b = node.left, node.comparators[0]
         none = lambda n: isinstance(n, ast.Constant) and n.value is None  # noqa: E731
         if not (none(a) or none(b)):
-            raise Unsupported(node, "`is` is supported only as `x is None` / `x is not None`",
+            x, y = self.expr(a), self.expr(b)
+            if isinstance(x.type, StructType) and isinstance(y.type, StructType) and x.type.ref and y.type.ref \
+                    and x.code != "(*this)" and y.code != "(*this)":
+                # the same object: the same pointer (objects of a class hierarchy are shared, as in Python)
+                sym = "==" if isinstance(node.ops[0], ast.Is) else "!="
+                return Expr(f"{wrap(x, P_EQ)} {sym} {wrap(y, P_EQ - 1)}", P_EQ, BOOL)
+            raise Unsupported(node, "`is` is supported only as `x is None` / `x is not None` (and between objects "
+                                    "of a class hierarchy)",
                               "compare values with == or !=")
         e = self.expr_raw(b if none(a) else a)
         negate = isinstance(node.ops[0], ast.IsNot)
@@ -771,6 +829,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
                     raise Unsupported(node, f"built-in {name}() of an array is not supported",
                                       f"for arrays use the numpy function np.{name}(...): built-in sum() "
                                       "adds left to right, np.sum pairwise, so their results differ")
+            if name == "isinstance" and len(node.args) == 2 and not node.keywords:
+                r = self.isinstance_check(node)
+                if r is not None:
+                    return r
             if name in _REJECTED_BUILTINS:
                 raise Unsupported(node, f"{name}() is not supported", _REJECTED_BUILTINS[name])
             if name in self.mod.skipped_globals:
@@ -875,6 +937,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             return self.to_optional(e, p.type).code
         if is_array(p.type) or isinstance(p.type, StructType) or p.type == STR:
             e = self.expr(a)
+            if isinstance(p.type, StructType) and p.type.ref:
+                if not assignable(p.type, e.type):
+                    raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
+                return e.code  # a shared_ptr: the callee shares the object, as in Python
             if e.type != p.type:
                 raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
             if getattr(p, "mode", "") == "ref":
@@ -891,7 +957,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
                 passed.append(a.id)
             return e.code
         if isinstance(p.type, ListType):  # passed as `const std::vector<T>&`
-            e = self.expr(a)
+            e = self.expr_for(a, p.type)
             if not isinstance(e.type, ListType) or e.type.elem not in (None, p.type.elem):
                 raise Unsupported(a, f"argument '{p.name}' of {display}() must be a {p.type}, got {e.type}")
             return f"{p.type.cpp()}{{}}" if e.type.elem is None else e.code
@@ -1064,6 +1130,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             return self.array_literal(node, src)
         if qual == "numpy.random.default_rng":
             return self.default_rng(node)
+        if qual.startswith("random.") and qual.count(".") == 1:
+            return self.py_random_call(node, qual)
+        if qual == "math.fsum":
+            return self.fsum_call(node)
         if qual.startswith("numpy.random."):
             raise Unsupported(node, f"{src}() uses NumPy's legacy global random state",
                               "create a generator and draw from it: rng = np.random.default_rng(seed); "
@@ -1079,6 +1149,9 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             if len(node.args) != 1 or node.keywords:
                 raise Unsupported(node, f"{src}(x) takes one argument here")
             e = self.expr(node.args[0])
+            if isinstance(e.type, StructType) and e.type.ref:
+                raise Unsupported(node, f"{src}() of a {e.type}, a class of a hierarchy, is not supported yet",
+                                  "create a new object with the fields you want")
             if qual == "copy.copy" and (isinstance(e.type, StructType) or is_array(e.type)):
                 raise Unsupported(node, "copy.copy is a shallow copy: arrays inside stay shared",
                                   "use copy.deepcopy (an independent copy, which is what C++ makes)")
@@ -1144,10 +1217,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps):
             return Expr(f"qt::to_int(std::{fn}({a.code}))", P_ATOM, INT)
         if qual == "math.pow":
             self._arity(node, args, 2)
-            return Expr(f"std::pow({args[0].code}, {args[1].code})", P_ATOM, FLOAT)
+            return Expr(f"qt::pow({args[0].code}, {args[1].code})", P_ATOM, FLOAT)
         if qual == "numpy.power":
             self._arity(node, args, 2)
-            return self.power(node, args[0], args[1])
+            return self.power(node, args[0], args[1], ufunc=True)
         if qual in ("numpy.abs", "numpy.absolute"):
             self._arity(node, args, 1)
             return self.absolute(args[0])

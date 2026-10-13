@@ -5,6 +5,7 @@
 // depends only on the standard library, and is written to be read.
 #pragma once
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <limits>
@@ -247,6 +248,14 @@ inline long long to_int(double x) {
 // ---------------------------------------------------------------------------------
 // int ** int for a non-negative constant exponent, by repeated squaring.
 // ---------------------------------------------------------------------------------
+// x ** y and math.pow(x, y) on Python floats: the C library's pow, as CPython calls it. Not
+// std::pow(x, 2.0) as written: a C++ compiler turns that into x * x (and pow(x, -1.0) into 1.0 / x),
+// and glibc's pow(x, 2.0) differs from x * x by one bit for about 1 value in 1,000.
+inline double pow(double x, double y) {
+    volatile double y_ = y;  // the exponent is known only when the program runs: the call stays
+    return std::pow(x, y_);
+}
+
 inline long long ipow(long long base, long long exp) {
     // checked: base is squared only while higher exponent bits remain, so an overflowing square
     // means the result itself overflows (for |base| >= 2)
@@ -391,5 +400,76 @@ inline double norm_ppf(double q, double loc, double scale) {
     if (!(scale > 0.0)) return nan;
     return norm_ppf(q) * scale + loc;
 }
+
+namespace py {
+// math.fsum(xs): CPython's own (Shewchuk's exact partials, Modules/mathmodule.c), so the result
+// is the correctly rounded sum, half-even rounding across partials included, and the errors are
+// its: OverflowError when a partial overflows, ValueError for inf + -inf.
+template <class C>
+double fsum(const C& xs) {
+    double partials[64];
+    std::size_t m = 64;
+    double* p = partials;
+    double* heap = nullptr;
+    std::size_t n = 0;
+    double special_sum = 0.0, inf_sum = 0.0, lo = 0.0;
+    struct Free { double*& h; ~Free() { delete[] h; } } free_{heap};
+    for (const auto& item : xs) {
+        double x = static_cast<double>(item);
+        const double xsave = x;
+        std::size_t i = 0;
+        for (std::size_t j = 0; j < n; j++) {  // for y in partials
+            double y = p[j];
+            if (std::fabs(x) < std::fabs(y)) std::swap(x, y);
+            const double hi = x + y;
+            const double yr = hi - x;
+            lo = y - yr;
+            if (lo != 0.0) p[i++] = lo;
+            x = hi;
+        }
+        n = i;
+        if (x != 0.0) {
+            if (!std::isfinite(x)) {  // an overflow on the way, or a nan or inf among the values
+                if (std::isfinite(xsave)) throw OverflowError(msg::fsum_overflow);
+                if (std::isinf(xsave)) inf_sum += xsave;
+                special_sum += xsave;
+                n = 0;
+            } else {
+                if (n >= m) {  // more partials than fit: grow, as CPython does
+                    double* bigger = new double[2 * m];
+                    std::copy(p, p + n, bigger);
+                    delete[] heap;
+                    heap = p = bigger;
+                    m *= 2;
+                }
+                p[n++] = x;
+            }
+        }
+    }
+    if (special_sum != 0.0) {
+        if (std::isnan(inf_sum)) throw ValueError(msg::fsum_inf_minus_inf);
+        return special_sum;
+    }
+    double hi = 0.0;
+    if (n > 0) {
+        hi = p[--n];
+        while (n > 0) {  // the exact sum from the top, until it is no longer exact
+            const double x = hi;
+            const double y = p[--n];
+            hi = x + y;
+            const double yr = hi - x;
+            lo = y - yr;
+            if (lo != 0.0) break;
+        }
+        if (n > 0 && ((lo < 0.0 && p[n - 1] < 0.0) || (lo > 0.0 && p[n - 1] > 0.0))) {  // half-even across partials
+            const double y = lo * 2.0;
+            const double x = hi + y;
+            const double yr = x - hi;
+            if (y == yr) hi = x;
+        }
+    }
+    return hi;
+}
+}  // namespace py
 
 }  // namespace qt

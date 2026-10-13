@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.13.0
+
+- **Class hierarchies.** A class may derive from one class of the same file, plain or
+  `@dataclass`, abstract (`abc.ABC`, `@abstractmethod`) or not. Objects of a hierarchy live
+  behind a `std::shared_ptr`, which is how Python holds every object: a `Payoff` variable,
+  parameter, field or list element holds a `Call` or a `Put`, calls go to the object's own
+  method (`virtual` / `override` / `= 0`), and assigning or passing an object shares it.
+  `super().__init__(...)` becomes the base in the constructor's initializer list,
+  `super().value(s)` becomes `Call::value(s)`, an inherited `__init__` becomes `using
+  Base::Base;`, a dataclass subclass takes its base's fields first. Also `isinstance(p, Call)`
+  (`std::dynamic_pointer_cast`), `type(p).__name__`, `p is q`, `==` between plain objects
+  (identity, as in Python), `print(p)` with each class's own repr, `list[Payoff]`, and a
+  variable given a `Call` here and a `Put` there typed as their common base.
+- Refused, with the reason: two bases, a base from another module, mixing `@dataclass` and plain
+  classes, an override with other parameter names, types or defaults, creating an object with
+  abstract methods left, `super().__init__` not first, `self` passed on as a value,
+  `@classmethod` in a hierarchy, `==` on dataclass objects of a hierarchy, and a statement that
+  calls something that may change a shared object while reading another name for it.
+- `qtrans verify` builds random objects of every concrete class for a `Payoff` parameter
+  (`@Call` travels before the fields), and compares objects a function may change after the
+  call. `qtrans bind` leaves class hierarchies out for now, saying so.
+- **Python's random module**, reproduced exactly (`qtrans_pyrandom.hpp`): CPython's Mersenne
+  Twister seeded as CPython seeds it, and `random`, `getrandbits`, `randrange`, `randint`,
+  `uniform`, `triangular`, `gauss`, `normalvariate`, `lognormvariate`, `expovariate`, `choice`,
+  `shuffle`, `sample` and `choices` as `Lib/random.py` computes them, with the running Python's
+  messages and defaults. A program must seed it before drawing (Python seeds it from the OS);
+  `qtrans verify` seeds both sides before each call of a function that draws and compares the
+  generator afterwards. Checked on 4,453 calls and 73 seeds, on Python 3.10, 3.13 and 3.14.
+- **`math.fsum`**: CPython's algorithm (exact partials, half-even rounding across them, its errors).
+- **Fixed: `x ** 2` is Python's again.** It was written `x * x`, but Python calls the C library's
+  `pow`, and glibc's `pow(x, 2.0)` differs from `x * x` in the last bit for about 1 value in
+  1,000. Compilers make the same substitution (`std::pow(x, 2.0)` becomes `x * x`, and
+  `std::pow(x, -1.0)` becomes `1.0 / x`, at `-O2`), so `**` and `math.pow` now go through
+  `qt::pow`, which keeps the call. `np.power(x, 2)` is NumPy's square (`x * x`), and stays so.
+- `qtrans_python.hpp` holds a facts version, so a cached copy written by an older qtrans is
+  written again.
+
 ## 0.12.0
 
 - **Exceptions, as Python has them.** Your own exception classes (`class PricingError(ValueError):

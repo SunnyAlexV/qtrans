@@ -63,6 +63,11 @@ def _tokens(v, t, scale=None) -> list:
     if isinstance(t, ListType):
         return [str(len(v))] + [tok for x in v for tok in _tokens(x, t.elem)]
     if isinstance(t, StructType):
+        if t.ref:  # the object's class first (@Call), then its fields, as verify's driver reads them
+            name = v["__class__"] if isinstance(v, dict) else type(v).__name__
+            info, _ = V._CLASSES[name]
+            return [f"@{name}"] + [tok for f in info.fields for tok in
+                                   _tokens(v[f.name] if isinstance(v, dict) else getattr(v, f.name), f.type)]
         info, _ = V._CLASSES[t.name]
         return [tok for f in info.fields for tok in _tokens(v[f.name] if isinstance(v, dict) else getattr(v, f.name), f.type)]
     if isinstance(t, OptionalType):
@@ -129,7 +134,7 @@ static bool number(const std::string& t, double& v) {
 // one token of the C++ against Python's: equal, or numbers within tolerance of `scale`
 static bool same(const std::string& cpp, const std::string& py, double rtol, double atol) {
     const auto at = py.find('@');
-    if (at == std::string::npos) return cpp == py;  // an int, a length, a string, N
+    if (at == std::string::npos || at == 0) return cpp == py;  // an int, a length, a string, N, a class (@Call)
     double a, b, scale;
     if (!number(cpp, a) || !number(py.substr(0, at), b) || !number(py.substr(at + 1), scale)) return false;
     if (std::isnan(a) || std::isnan(b)) return std::isnan(a) && std::isnan(b);
@@ -394,7 +399,7 @@ def export(paths, out_dir, name=None, cases=50, seed=0, golden=True, build=True,
                     if c.py_out != c.cpp_out:
                         left_out["printed"] += 1  # agreed only up to rounding in printed numbers
                         continue
-                    enc = " ".join(V._encode(v, p.type) for v, p in zip(c.args, sig.params))
+                    enc = V.encode_call(c.args, sig)
                     if c.py[0] == "ok":
                         expect = " ".join(["OK"] + _tokens(c.py[1], out_t))
                     else:
@@ -435,8 +440,8 @@ def export(paths, out_dir, name=None, cases=50, seed=0, golden=True, build=True,
         (tests / "qtrans_driver.cpp").write_text(drv, encoding="utf-8")
         # the driver always uses these runtime headers; they go beside the others (one copy of
         # each, so #pragma once sees one file)
-        from .translator import LIST_HEADER, PRINT_HEADER, PYTHON_HEADER, RUNTIME_HEADER, UNICODE_HEADER
-        for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+        from .translator import LIST_HEADER, PRINT_HEADER, PYRANDOM_HEADER, PYTHON_HEADER, RUNTIME_HEADER, UNICODE_HEADER
+        for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
             if not (inc / h.name).exists():
                 shutil.copy(h, inc / h.name)
         report.append(f"golden tests: {recorded} cases of Python's results recorded in tests/golden.txt"

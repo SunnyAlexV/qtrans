@@ -1018,7 +1018,7 @@ inline double math_lgamma(long long x) {
 // math.pow(x, y): CPython's rules (errors only for finite x and y)
 inline double math_pow(double x, double y) {
     if (msg::math_pow_zero_to_minus_inf_raises && x == 0.0 && y == -qt::inf) throw ValueError(msg::math_domain_pow);
-    const double r = std::pow(x, y);
+    const double r = qt::pow(x, y);
     if (std::isfinite(x) && std::isfinite(y)) {
         if (std::isnan(r)) throw ValueError(msg::math_domain_pow);
         if (std::isinf(r)) {
@@ -1050,7 +1050,7 @@ inline double power(double x, double y, bool ints = false) {
     if (y == 0.0) return 1.0;
     if (std::isfinite(y) && x == 0.0 && y < 0.0)
         throw ZeroDivisionError(ints ? msg::int_zero_negative_power : msg::zero_negative_power);
-    const double r = std::pow(x, y);
+    const double r = qt::pow(x, y);
     if (std::isinf(r) && std::isfinite(x) && std::isfinite(y)) throw OverflowError(msg::float_pow_overflow);
     return r;
 }

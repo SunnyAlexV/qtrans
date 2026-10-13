@@ -50,6 +50,7 @@ class FieldInfo:
     compare: bool = True            # part of ==
     repr: bool = True               # shown by the dataclass's repr
     default_code: str | None = None  # C++ for the default, once translated
+    owner: str | None = None        # the class that declares it (a base class, for an inherited field)
 
 
 @dataclass
@@ -58,6 +59,7 @@ class MethodInfo:
     fdef: ast.FunctionDef
     kind: str                       # "instance", "property", "static", "class", "post_init"
     key: str = ""                   # "Class.name": its key in the module's signature table
+    abstract: bool = False          # @abstractmethod in a class derived from ABC: no body, `= 0` in C++
 
 
 @dataclass
@@ -75,6 +77,10 @@ class ClassInfo:
     notes: list = field(default_factory=list)
     ns: str | None = None           # the C++ namespace of the module that defines it, when imported
     external: bool = False          # imported from another module of the project: not rendered here
+    base: object = None             # the ClassInfo of its base class (0.13: single inheritance)
+    abc: bool = False               # derives from abc.ABC (itself or through its base)
+    ref: bool = False               # part of a class hierarchy: objects behind std::shared_ptr
+    children: list = field(default_factory=list)  # the ClassInfos of its direct subclasses
 
     @property
     def cpp(self) -> str:
@@ -82,10 +88,61 @@ class ClassInfo:
 
     @property
     def type(self) -> StructType:
-        return StructType(self.name, self.cpp)
+        bases, b = [], self.base
+        while b is not None:
+            bases.append((b.name, b.cpp))
+            b = b.base
+        return StructType(self.name, self.cpp, self.ref, tuple(bases))
 
     def field(self, name):
         return next((f for f in self.fields if f.name == name), None)
+
+    @property
+    def own_fields(self):
+        """The fields this class declares (fields lists the inherited ones first)."""
+        return [f for f in self.fields if f.owner in (None, self.name)]
+
+    def find_method(self, name):
+        """The method `name` as an object of this class has it: its own, or the nearest base's."""
+        c = self
+        while c is not None:
+            if name in c.methods:
+                return c.methods[name]
+            c = c.base
+        return None
+
+    def method_owner(self, name):
+        c = self
+        while c is not None:
+            if name in c.methods:
+                return c
+            c = c.base
+        return None
+
+    def ancestors(self) -> list:
+        out, b = [], self.base
+        while b is not None:
+            out.append(b)
+            b = b.base
+        return out
+
+    def descendants(self) -> list:
+        out = []
+        for c in self.children:
+            out += [c] + c.descendants()
+        return out
+
+    def abstract_left(self) -> list:
+        """Abstract methods no class on the way down to this one implements (Python then refuses
+        to create the object: TypeError, can't instantiate abstract class)."""
+        left = {}
+        for c in reversed([self] + self.ancestors()):
+            for m in c.methods.values():
+                if m.abstract:
+                    left[m.name] = c.name
+                else:
+                    left.pop(m.name, None)
+        return sorted(left)
 
     @property
     def init_fields(self):
@@ -145,27 +202,57 @@ def dataclass_options(mod, node: ast.ClassDef):
                     raise Unsupported(dec, "@dataclass(init=False) is not supported", "let the dataclass write __init__")
                 else:
                     raise Unsupported(dec, f"@dataclass({k.arg}=...) is not supported")
-    namedtuple = False
+    namedtuple, base, abc = False, None, False
     for b in node.bases:
         q = mod._qualify_path(b) if isinstance(b, ast.Attribute) else mod.imports.get(getattr(b, "id", None))
         if isinstance(b, ast.Name) and b.id == "object":
             continue
         if q == "typing.NamedTuple":
             namedtuple = True
+        elif q == "abc.ABC":
+            abc = True
+        elif isinstance(b, ast.Name) and b.id in mod.classes and q is None:
+            if base is not None:
+                raise Unsupported(node, f"class {node.name} has two base classes ({base.name}, {b.id}): multiple "
+                                        "inheritance is not supported", "derive from one class; hold the other as a field")
+            base = mod.classes[b.id]
+        elif isinstance(b, ast.Name) and b.id in getattr(mod, "imported", {}):
+            raise Unsupported(node, f"class {node.name} inherits from {b.id}, a class from another module of the "
+                                    "project: a base class must be in the same file for now",
+                              f"move {node.name} next to {b.id}")
         else:
-            raise Unsupported(node, f"class {node.name} inherits from {ast.unparse(b)}: inheritance is not supported",
-                              "use composition: a field holding the other object")
+            raise Unsupported(node, f"class {node.name} inherits from {ast.unparse(b)}, which is not a class of "
+                                    "this file (or abc.ABC)", "use composition: a field holding the other object")
     if node.keywords:
         raise Unsupported(node, "class keywords (metaclass=...) are not supported")
     if namedtuple and is_dc:
         raise Unsupported(node, "a NamedTuple can't also be a @dataclass")
-    return is_dc, frozen or namedtuple, eq, namedtuple
+    if namedtuple and (base is not None or abc):
+        raise Unsupported(node, "a NamedTuple with another base class is not supported (Python refuses most of them)")
+    if base is not None:
+        if base.rejected is not None:
+            raise Unsupported(node, f"its base class {base.name} could not be translated: {base.rejected.message}")
+        if base.namedtuple:
+            raise Unsupported(node, f"deriving from the NamedTuple {base.name} is not supported",
+                              "make the base a @dataclass")
+        base_dc = not base.plain
+        if base_dc != is_dc:
+            kind = "a @dataclass" if base_dc else "a plain class"
+            raise Unsupported(node, f"{node.name} derives from {base.name}, which is {kind}, but "
+                                    f"{node.name} {'is not' if base_dc else 'is'}: mixing the two changes who writes "
+                                    "__init__", f"make both @dataclass, or neither")
+        if is_dc and base.frozen != frozen:
+            raise Unsupported(node, f"{node.name} and its base {base.name} must both be frozen or both not "
+                                    "(Python raises TypeError)")
+    return is_dc, frozen or namedtuple, eq, namedtuple, base, abc
 
 
 def collect_class_body(mod, info: ClassInfo):
     """Fields (annotated names, in order), their defaults, and the methods."""
     node = info.node
     body = list(node.body)
+    if info.base is not None and not info.plain:  # a dataclass's inherited fields come first, as in Python
+        info.fields = list(info.base.fields)
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
             and isinstance(body[0].value.value, str):
         info.doc = body[0].value.value
@@ -183,10 +270,14 @@ def collect_class_body(mod, info: ClassInfo):
                 raise Unsupported(s, "class fields must be plain names")
             if "ClassVar" in ast.unparse(s.annotation):
                 raise Unsupported(s, "ClassVar class attributes are not supported", "use a module-level constant")
-            f = FieldInfo(s.target.id, cpp_ident(s.target.id), annotation=s.annotation)
+            f = FieldInfo(s.target.id, cpp_ident(s.target.id), annotation=s.annotation, owner=info.name)
             if s.value is not None:
                 _field_default(mod, info, f, s.value)
-            if any(g.name == f.name for g in info.fields):
+            g = info.field(f.name)
+            if g is not None and g.owner not in (None, info.name):
+                raise Unsupported(s, f"field '{f.name}' is declared again in {info.name}, which inherits it from "
+                                     f"{g.owner}", "keep one declaration, in the base class")
+            if g is not None:
                 raise Unsupported(s, f"field '{f.name}' is declared twice")
             info.fields.append(f)
             continue
@@ -209,13 +300,25 @@ def collect_class_body(mod, info: ClassInfo):
     for m in info.methods:
         if m in names:
             raise Unsupported(info.methods[m].fdef, f"method '{m}' has the same name as a field")
+    for a in info.ancestors():
+        for m in a.methods:
+            if m in {f.name for f in info.own_fields}:
+                raise Unsupported(node, f"field '{m}' of {info.name} has the name of a method of {a.name}")
 
 
 def _fields_from_init(info):
     """A plain class's fields: names annotated in the class body (`x: float`), then every
     `self.x = ...` in __init__, in order of first assignment."""
+    if info.base is not None:
+        info.fields = list(info.base.fields)  # the base's __init__ (through super().__init__) sets these
     init = info.methods.get("__init__")
     if init is None:
+        if info.base is not None:  # inherits the base's __init__, and so its fields
+            _no_new_attributes(info)
+            return
+        if info.ref:  # an interface: abstract methods, no state
+            _no_new_attributes(info)
+            return
         raise Unsupported(info.node, f"class {info.name} has no __init__", "add one, or use @dataclass")
     for n in ast.walk(init.fdef):
         targets = []
@@ -228,7 +331,11 @@ def _fields_from_init(info):
                 if isinstance(leaf, ast.Attribute) and isinstance(leaf.value, ast.Name) and leaf.value.id == "self":
                     if info.field(leaf.attr) is None:
                         ann = n.annotation if isinstance(n, ast.AnnAssign) else None
-                        info.fields.append(FieldInfo(leaf.attr, cpp_ident(leaf.attr), annotation=ann))
+                        info.fields.append(FieldInfo(leaf.attr, cpp_ident(leaf.attr), annotation=ann, owner=info.name))
+    _no_new_attributes(info)
+
+
+def _no_new_attributes(info):
     for m in info.methods.values():
         if m.kind in ("instance", "property"):
             for n in ast.walk(m.fdef):
@@ -279,7 +386,18 @@ def _is_field_call(mod, call) -> bool:
 
 def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
     kind = "instance"
+    abstract = False
+    decs = []
     for dec in s.decorator_list:
+        q = mod._qualify_path(dec) if isinstance(dec, ast.Attribute) else mod.imports.get(getattr(dec, "id", None))
+        if q == "abc.abstractmethod":
+            if not info.abc:
+                raise Unsupported(dec, f"@abstractmethod in {info.name}, which doesn't derive from abc.ABC: Python "
+                                       "ignores it there", f"derive {info.name} from ABC (from abc import ABC)")
+            abstract = True
+        else:
+            decs.append(dec)
+    for dec in decs:
         d = ast.unparse(dec)
         if d == "property":
             kind = "property"
@@ -291,8 +409,13 @@ def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
             raise Unsupported(dec, "property setters are not supported", "use a method or dataclasses.replace")
         else:
             raise Unsupported(dec, f"decorator @{d} on a method is not supported")
-    if len(s.decorator_list) > 1:
+    if len(decs) > 1:
         raise Unsupported(s, "a method with more than one decorator is not supported")
+    if abstract and kind not in ("instance", "property"):
+        raise Unsupported(s, f"an abstract {kind} method is not supported")
+    if info.ref and kind == "class":
+        raise Unsupported(s, f"@classmethod in a class hierarchy: `cls` is whichever class it is called on, "
+                             "which C++ fixes when it compiles", "use a @staticmethod or a plain function")
     if s.name == "__post_init__":
         if info.namedtuple or info.plain:
             raise Unsupported(s, "__post_init__ is only called by @dataclass")
@@ -315,7 +438,7 @@ def _method(mod, info, s: ast.FunctionDef) -> MethodInfo:
             raise Unsupported(s, f"the first parameter of {s.name} must be '{want}'")
     if kind in ("property", "post_init") and len(args.args) != 1:
         raise Unsupported(s, f"{s.name} takes only self")
-    return MethodInfo(s.name, s, kind, f"{info.name}.{s.name}")
+    return MethodInfo(s.name, s, kind, f"{info.name}.{s.name}", abstract=abstract)
 
 
 def auto_repr(info: ClassInfo) -> bool:
@@ -357,6 +480,9 @@ def struct_order(classes) -> list:
         if state.get(name) == "active":
             raise Unsupported(classes[name].node, "classes that hold each other in a cycle are not supported")
         state[name] = "active"
+        b = classes[name].base
+        if b is not None and b.name in classes:
+            visit(b.name, chain + [name])  # a base class is defined before its subclasses
         for f in classes[name].fields:
             t = f.type.inner if isinstance(f.type, OptionalType) else f.type
             if isinstance(t, StructType) and t.name in classes:

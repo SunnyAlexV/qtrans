@@ -132,6 +132,7 @@ def _own_nodes(fdef):
 class _FunctionOrigins:
     def __init__(self, owner, fdef, sig):
         self.owner, self.mod, self.fdef = owner, owner.mod, fdef
+        self.cls = getattr(sig, "owner", None)  # the class of a method (for super())
         self.env = {}
         if sig is not None:
             for p in sig.params:
@@ -328,6 +329,10 @@ class _FunctionOrigins:
                 if isinstance(f.type, Scalar) and all(self.mod.struct_repr_problem(c) is None for c in owners):
                     return PY  # obj.x: every value the file puts in x is a Python number
             base = self.of(node.value)
+            if base not in (NP, _BOTTOM) and isinstance(node.value, (ast.Name, ast.Attribute)):
+                out = self._method_returns(node.attr, ("property",))
+                if out is not None:
+                    return out
             return NP if base == NP else (_BOTTOM if base == _BOTTOM else None)
         if isinstance(node, ast.Subscript):
             base = self.of(node.value)
@@ -405,9 +410,21 @@ class _FunctionOrigins:
                 return RNG_
             if q.startswith("math."):
                 return PY  # the math module always returns Python numbers
+            if q.startswith("random.") and q.count(".") == 1:
+                if q.split(".")[1] in ("choice", "choices", "sample") and node.args:
+                    o = self.of(node.args[0])  # an element (or elements) of the population
+                    if q.endswith(".choice"):
+                        return o[1] if isinstance(o, tuple) and o[0] == "list" else (None if o != _BOTTOM else _BOTTOM)
+                    return o if isinstance(o, tuple) and o[0] == "list" else (None if o != _BOTTOM else _BOTTOM)
+                return PY  # random(), gauss(), randint(), ...: Python's own floats and ints
             if q.startswith(("numpy.", "scipy.")):
                 return NP
             return None
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call) and isinstance(f.value.func, ast.Name) \
+                and f.value.func.id == "super" and self.cls in self.mod.classes:
+            base = self.mod.classes[self.cls].base  # super().f(...): the base class's f
+            m = base.find_method(f.attr) if base is not None else None
+            return self.owner.returns(m.key) if m is not None and not m.abstract else None
         if isinstance(f, ast.Attribute):
             base = self.of(f.value)
             if base == _BOTTOM:
@@ -444,4 +461,23 @@ class _FunctionOrigins:
                 return ("list", PY)
             if base == NP:
                 return NP
+            out = self._method_returns(f.attr, ("instance", "static", "class"))
+            if out is not None:
+                return out
         return None
+
+    def _method_returns(self, name, kinds):
+        """obj.f(...): what any class's method f returns (the object may be of any class that has
+        one, as with a virtual method), when they all agree."""
+        keys = [c.methods[name].key for c in self.mod.classes.values()
+                if name in c.methods and not c.external and c.methods[name].kind in kinds
+                and not c.methods[name].abstract and c.rejected is None]
+        if not keys:
+            return None
+        out = _BOTTOM
+        for k in keys:
+            r = self.owner.returns(k)
+            if r is None:
+                return None
+            out = join(out, r)
+        return None if out == _BOTTOM else out

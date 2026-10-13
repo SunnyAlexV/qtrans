@@ -45,6 +45,8 @@ _FIXED = {
     "math_range": lambda: math.exp(1000.0),
     "math_domain_pow": lambda: math.pow(0.0, -1.0),
     "math_domain_fmod": lambda: math.fmod(1.0, 0.0),
+    "fsum_overflow": lambda: math.fsum([1e308, 1e308]),
+    "fsum_inf_minus_inf": lambda: math.fsum([math.inf, -math.inf]),
 }
 
 
@@ -123,6 +125,56 @@ def _math_messages(name):
     return {k: _template(v) for k, v in found.items()}
 
 
+def _random_facts() -> list:
+    """The random module's error messages (they changed in 3.11, 3.12 and 3.14), as C++ lines.
+    A message holding values is matched to one of the forms Python has used, on two probes."""
+    import random
+
+    def msg(f):
+        try:
+            f()
+        except Exception as e:  # noqa: BLE001 - the point is to see what Python raises
+            return type(e).__name__, str(e)
+        raise AssertionError("expected an error")
+
+    def form(call, args_list, forms):
+        """Which of `forms` (functions of the args giving the text after the prefix) every probe
+        follows, with one prefix: (index, prefix)."""
+        for k, fmt in enumerate(forms):
+            pres = set()
+            for args in args_list:
+                text = msg(lambda: call(*args))[1]
+                tail = fmt(*args)
+                pres.add(text[:-len(tail)] if tail and text.endswith(tail) else None if tail else text)
+            if len(pres) == 1 and None not in pres:
+                return k, pres.pop()
+        raise AssertionError(f"no known form for {call.__name__}: {msg(lambda: call(*args_list[0]))}")
+
+    two_k, two_p = form(random.randrange, [(5, 3), (9, 2)], [lambda a, b: f"({a}, {b}, {b - a})", lambda a, b: f"({a}, {b})"])
+    three_k, three_p = form(random.randrange, [(5, 3, 2), (9, 2, 3)], [lambda a, b, s: "", lambda a, b, s: f"({a}, {b}, {s})"])
+    int_k, int_p = form(random.randint, [(5, 3), (9, 2)],
+                        [lambda a, b: f"({a}, {b + 1}, {b + 1 - a})", lambda a, b: f"({a}, {b + 1})",
+                         lambda a, b: f"({a}, {b})"])
+    choice_cls, choice_text = msg(lambda: random.choice([]))
+    out = ["", "// the random module: the words of its errors (randrange's changed in 3.12, randint's in 3.14)",
+           f"inline constexpr const char* random_choice_empty = {_cstr(choice_text)};  // {choice_cls}",
+           f"inline constexpr const char* random_randrange_empty = {_cstr(msg(lambda: random.randrange(0))[1])};",
+           f"inline constexpr const char* random_randrange_two = {_cstr(two_p)};",
+           f"inline constexpr int random_randrange_two_form = {two_k};  // 0: (start, stop, width), 1: (start, stop)",
+           f"inline constexpr const char* random_randrange_three = {_cstr(three_p)};",
+           f"inline constexpr int random_randrange_three_form = {three_k};  // 0: no values, 1: (start, stop, step)",
+           f"inline constexpr const char* random_randint = {_cstr(int_p)};",
+           f"inline constexpr int random_randint_form = {int_k};  // 0, 1: randrange(a, b + 1)'s; 2: (a, b)",
+           f"inline constexpr const char* random_zero_step = {_cstr(msg(lambda: random.randrange(5, 9, 0))[1])};",
+           f"inline constexpr const char* random_sample_size = {_cstr(msg(lambda: random.sample([1, 2], 3))[1])};",
+           f"inline constexpr const char* random_weights_total = {_cstr(msg(lambda: random.choices([1], [0.0]))[1])};",
+           f"inline constexpr const char* random_weights_finite = "
+           f"{_cstr(msg(lambda: random.choices([1], [float('inf')]))[1])};",
+           f"inline constexpr const char* random_weights_count = {_cstr(msg(lambda: random.choices([1], [1.0, 2.0]))[1])};",
+           f"inline constexpr bool random_choice_empty_is_index_error = {'true' if choice_cls == 'IndexError' else 'false'};"]
+    return out
+
+
 def _cstr(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -132,7 +184,8 @@ def generate() -> str:
     lines = [f"// qtrans_python.hpp: the error messages of Python {version}, and when its math functions raise.",
              "// Written by qtrans.pyfacts from that Python, by making each error happen; do not edit.",
              "#pragma once", "", "#include <cmath>", "#include <string>", "",
-             f'#define QTRANS_PYTHON_VERSION "{version}"', "", "namespace qt {", "namespace msg {", ""]
+             f'#define QTRANS_PYTHON_VERSION "{version}"', f"#define QTRANS_PYTHON_FACTS {FACTS}", "",
+             "namespace qt {", "namespace msg {", ""]
     for key, f in _FIXED.items():
         lines.append(f"inline constexpr const char* {key} = {_cstr(_message(f)[1])};")
     try:  # math.pow(0.0, -inf): ValueError up to 3.10, inf from 3.11 (IEEE 754)
@@ -157,15 +210,21 @@ def generate() -> str:
                 cells.append("{" + (f"{_cstr(t[0])}, {_cstr(t[1])}, {'true' if t[2] else 'false'}, "
                                     f"{'true' if t[3] else 'false'}" if t else '"math domain error", "", false, false') + "}")
             lines.append(f"inline constexpr DomainText {name}_{kind}[] = {{{', '.join(cells)}}};")
+    lines += _random_facts()
     lines += ["", "}  // namespace msg", "}  // namespace qt", ""]
     return "\n".join(lines)
 
 
 SHIPPED = Path(__file__).parent / "runtime" / "qtrans_python.hpp"  # for the Python qtrans was built with
+FACTS = 2  # what the header holds: 2 added the random module's messages (0.14); a cached one of another is rewritten
 
 
 def _version_of(text: str):
-    for line in text.splitlines()[:12]:
+    """The Python version a header was written by, if it holds this qtrans's facts."""
+    lines = text.splitlines()[:14]
+    if f"#define QTRANS_PYTHON_FACTS {FACTS}" not in lines:
+        return None
+    for line in lines:
         if line.startswith("#define QTRANS_PYTHON_VERSION"):
             return line.split('"')[1]
     return None
@@ -185,8 +244,11 @@ def header_path() -> Path:
     text = None
     for folder in (base, Path(tempfile.gettempdir()) / "qtrans"):
         path = folder / f"python-{tag}" / "qtrans_python.hpp"
-        if path.exists():
-            return path
+        try:
+            if path.exists() and _version_of(path.read_text(encoding="utf-8")) == version:
+                return path
+        except OSError:
+            pass
         try:
             text = text or generate()
             path.parent.mkdir(parents=True, exist_ok=True)

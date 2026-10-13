@@ -154,7 +154,7 @@ def test_a_frozen_object_holding_a_generator_is_not_immutable():
      "changes field 'w' in place"),
     ("class C:\n    x: float = 1.0\n\n    def __init__(self):\n        self.y = 2.0\n", "shared by every object"),
     ("class Base:\n    def __init__(self):\n        self.x = 1.0\n\nclass C(Base):\n    def __init__(self):\n"
-     "        self.y = 1.0\n", "inheritance"),
+     "        self.y = 1.0\n", "doesn't call super().__init__"),
 ])
 def test_plain_class_refusals(src, why):
     assert why in rejection(src, "class C")

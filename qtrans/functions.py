@@ -69,12 +69,14 @@ def view_root(node, types, mod=None):
     that variable's name; otherwise None (a new array or object)."""
     if isinstance(node, ast.Name):
         t = types.get(node.id)
+        if isinstance(t, StructType) and t.ref:
+            return None  # behind a shared_ptr: C++ shares it on assignment too, as Python does
         if is_array(t) or (mod is not None and isinstance(t, StructType) and not mod.immutable(t)):
             return node.id
         return None
     if isinstance(node, ast.Attribute) and node.attr != "T" and mod is not None:
         t = _chain_type(node, types, mod)
-        if is_array(t) or (isinstance(t, StructType) and not mod.immutable(t)):
+        if is_array(t) or (isinstance(t, StructType) and not t.ref and not mod.immutable(t)):
             return subscript_root(node)  # obj.w is obj's own array
     if isinstance(node, ast.Attribute) and node.attr == "T":
         return view_root(node.value, types, mod)
@@ -279,6 +281,37 @@ def python_reads(fdef) -> set:
             and id(n) not in selfs}
 
 
+def _is_super_init(st) -> bool:
+    c = st.value if isinstance(st, ast.Expr) else None
+    return isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "__init__" \
+        and isinstance(c.func.value, ast.Call) and isinstance(c.func.value.func, ast.Name) \
+        and c.func.value.func.id == "super" and not c.func.value.args
+
+
+_SELF_TEXT_CALLS = {"print", "str", "repr", "isinstance", "type"}
+
+
+def check_self_values(fdef, cls_name):
+    """In a class of a hierarchy, `self` may be used for its fields and methods (self.x, self.f())
+    and shown (print(self), f"{self}"), but not handed on as a value: return self, f(self),
+    xs.append(self). The C++ object would then need to find its own shared_ptr."""
+    parents = {}
+    for n in ast.walk(fdef):
+        for c in ast.iter_child_nodes(n):
+            parents[id(c)] = n
+    for n in ast.walk(fdef):
+        if not (isinstance(n, ast.Name) and n.id == "self" and isinstance(n.ctx, ast.Load)):
+            continue
+        p = parents.get(id(n))
+        if isinstance(p, ast.Attribute) or isinstance(p, ast.FormattedValue):
+            continue
+        if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id in _SELF_TEXT_CALLS:
+            continue
+        raise Unsupported(p if isinstance(p, ast.AST) and hasattr(p, "lineno") else fdef,
+                          f"`self` is passed on as a value in a method of {cls_name}, a class of a hierarchy: "
+                          "not supported yet", "use its fields, or a function that takes them")
+
+
 class FunctionTranslator(ExprTranslator):
     def __init__(self, mod, fdef, sig):
         super().__init__(mod)
@@ -288,6 +321,12 @@ class FunctionTranslator(ExprTranslator):
         self.doc_end = fdef.lineno
         if self.body and is_docstring(self.body[0]):
             self.doc_end = self.body[0].end_lineno
+            self.body = self.body[1:]
+        # super().__init__(...) first in a subclass's __init__: the base part of the object, which
+        # C++ builds in the constructor's initializer list (see render_members)
+        self.super_init = None
+        if fdef.name == "__init__" and self.body and _is_super_init(self.body[0]):
+            self.super_init = self.body[0].value
             self.body = self.body[1:]
         self.loop_vars: set[str] = set()
         self.loop_types: dict = {}      # loop variable -> INT (range) or FLOAT (iterating a Vec)
@@ -563,11 +602,15 @@ class FunctionTranslator(ExprTranslator):
     # --- driver ----------------------------------------------------------------------
     def translate(self):
         self._locals_cache = set()
+        if self.owner is not None and self.owner.ref and self.has_self:
+            check_self_values(self.fdef, self.owner.name)
         self.scan(self.body)
         self.check_loop_vars()
         self.finish_scan()
         self.infer_types()
         self.infer_dims()
+        if self.sig.kind == "init" and self.owner is not None:
+            self._base_init()
         if self.fdef.name in self.mod.errstate_funcs:
             self.note("errstate", "np.errstate(...) blocks are translated as their contents: they only "
                                   "change which floating-point warnings NumPy prints, never the values")
@@ -585,6 +628,37 @@ class FunctionTranslator(ExprTranslator):
         self.flush_comments(self.fdef.end_lineno + 1)
         self._mark_unread_locals()
         return self.lines
+
+    def _base_init(self):
+        """The base class's __init__, run by super().__init__(...): its arguments, for the
+        constructor's initializer list (`: Payoff(strike)`)."""
+        info = self.owner
+        base_init = info.base.find_method("__init__") if info.base is not None else None
+        call = self.super_init
+        if call is None:
+            later = next((n for st in self.body for n in ast.walk(st) if isinstance(n, ast.Expr) and _is_super_init(n)), None)
+            if later is not None:
+                raise Unsupported(later, "super().__init__(...) must be the first statement of __init__ (C++ builds "
+                                         "the base part of an object before the rest)", "move it to the top of __init__")
+            if base_init is not None:
+                raise Unsupported(self.fdef, f"{info.name}.__init__ doesn't call super().__init__(...): the fields "
+                                             f"{info.base.name} sets would not exist (AttributeError in Python)",
+                                  "call super().__init__(...) first")
+            return
+        if info.base is None:
+            raise Unsupported(call, f"super().__init__() in {info.name}, which has no base class of this file")
+        for n in ast.walk(call):
+            if isinstance(n, ast.Name) and n.id == "self":
+                raise Unsupported(call, "the arguments of super().__init__(...) use self: C++ builds the base part "
+                                        "of the object before anything else", "pass the parameters themselves")
+        if base_init is None:
+            if call.args or call.keywords:
+                raise Unsupported(call, f"{info.base.name} takes no arguments to __init__ (Python raises TypeError)")
+            return
+        sig = self._method_sig(base_init, call)
+        args = self.bind_args(call, sig, f"{info.base.name}.__init__")
+        holder = info.base.method_owner("__init__")
+        self.mod.__dict__.setdefault("base_init", {})[self.sig.owner] = (info.base.cpp, holder.name, args)
 
     def check_lists(self):
         """A Python list is one object, however many names it has: `b = a` shares it, a function
@@ -609,6 +683,10 @@ class FunctionTranslator(ExprTranslator):
                             and n.func.attr in ("append", "extend", "insert", "pop", "sort", "reverse", "clear", "remove",
                                                 "setdefault", "update", "popitem"):
                         mark(n.func.value.id, st)
+                    if isinstance(n, ast.Call) and self.mod._random_module_call(n) == "shuffle":
+                        x = n.args[0] if n.args else next((k.value for k in n.keywords if k.arg == "x"), None)
+                        if isinstance(x, ast.Name):
+                            mark(x.id, st)  # random.shuffle(xs) changes xs
             if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
                 targets = st.targets if isinstance(st, (ast.Assign, ast.Delete)) else [st.target]
                 for t in targets:
@@ -1261,7 +1339,7 @@ class FunctionTranslator(ExprTranslator):
                 elif isinstance(n.func, ast.Attribute) and not self._is_module_path(n.func.value):
                     bt = _chain_type(n.func.value, types, self.mod)
                     if isinstance(bt, StructType) and bt.name in self.mod.classes:
-                        m = self.mod.classes[bt.name].methods.get(n.func.attr)
+                        m = self.mod.classes[bt.name].find_method(n.func.attr)
                         if m is not None and m.key in self.mod.sigs:
                             callee = self.mod.sigs[m.key]
                             if m.kind == "instance" and not callee.const:
@@ -1339,6 +1417,9 @@ class FunctionTranslator(ExprTranslator):
         roots, draw = set(), False
         f = n.func
         callee = None
+        rname = self.mod._random_module_call(n)
+        if rname is not None:  # the random module's generator: one hidden, shared state
+            return {"<random>"}, True
         if isinstance(f, ast.Attribute) and not self._is_module_path(f.value):
             bt = _chain_type(f.value, types, self.mod)
             if bt == RNG:
@@ -1350,15 +1431,25 @@ class FunctionTranslator(ExprTranslator):
             elif isinstance(bt, DictType) and f.attr in ("pop", "popitem", "setdefault", "update", "clear"):
                 roots.add(subscript_root(f.value))  # d.pop(k) changes d
             elif isinstance(bt, StructType) and bt.name in self.mod.classes:
-                m = self.mod.classes[bt.name].methods.get(f.attr)
+                m = self.mod.classes[bt.name].find_method(f.attr)
                 if m is not None and m.key in self.mod.sigs:
                     callee = self.mod.sigs[m.key]
                     if m.kind == "instance" and not callee.const:
                         roots.add(subscript_root(f.value))
+                    if m.key in getattr(self.mod, "object_mutators", ()):
+                        roots.add("<objects>")  # a shared object may have other names here
+                    if m.key in getattr(self.mod, "py_random_users", ()):
+                        roots.add("<random>")
+                        draw = True
         elif isinstance(f, ast.Name) and f.id in self.mod.sigs:
             callee = self.mod.sigs[f.id]
             if f.id in self.mod.printing:
                 roots.add("<output>")  # it prints: where its output goes depends on when it runs
+            if f.id in getattr(self.mod, "py_random_users", ()):
+                roots.add("<random>")
+                draw = True
+            if f.id in getattr(self.mod, "object_mutators", ()):
+                roots.add("<objects>")
         if callee is not None:
             pos = {p.name: i for i, p in enumerate(callee.params)}
             pairs = list(enumerate(n.args)) + [(pos.get(k.arg, -1), k.value) for k in n.keywords]
@@ -1442,10 +1533,19 @@ class FunctionTranslator(ExprTranslator):
                                   "draw into separate variables, one per line")
             raise Unsupported(s, "two calls that change something, in one statement: Python runs them left to "
                                  "right, C++ in an unspecified order", "make each call on its own line")
+        def holds_objects(t):  # a value through which a shared object of a hierarchy can be reached
+            t = t.elem if isinstance(t, ListType) else t
+            return isinstance(t, StructType)
         for call, roots, _ in effects:
             inside = {id(x) for x in ast.walk(call)}
             for e in reads:
                 for x in ast.walk(e):
+                    if isinstance(x, ast.Name) and id(x) not in inside and "<objects>" in roots and \
+                            holds_objects(types.get(x.id)):
+                        raise Unsupported(s, f"this statement calls {ast.unparse(call.func)}(...), which may change "
+                                             f"an object that '{x.id}' also reaches (objects of a class hierarchy are "
+                                             "shared), and reads it: Python does them left to right, C++ in an "
+                                             "unspecified order", "make the call on its own line, into a variable")
                     if isinstance(x, ast.Name) and x.id in roots and id(x) not in inside:
                         raise Unsupported(s, f"this statement calls {ast.unparse(call.func)}(...), which changes "
                                              f"'{x.id}', and also reads '{x.id}': Python does them left to right, "
@@ -1803,6 +1903,7 @@ class FunctionTranslator(ExprTranslator):
         for n in self.hoist_at.get(id(s), ()):
             t = self.local_types[n]
             self.emit(f"{self._unused(n)}{t.cpp()} {self.ident(n)} = {t.zero()};" if isinstance(t, Scalar)
+                      else f"{self._unused(n)}{t.cpp()} {self.ident(n)};" if isinstance(t, StructType) and t.ref
                       else f"{self._unused(n)}{t.cpp()} {self.ident(n)}{{}};")
             if n in getattr(self, "flagged", ()):
                 self.emit(f"bool {self.flag_name(n)} = false;  // does Python hold an int in {n} here?")
@@ -1906,7 +2007,7 @@ class FunctionTranslator(ExprTranslator):
                 self.mod.is_asarray_of(value_node, name) and name not in inline_set:
             self.emit(f"// {ast.unparse(s)}: already a float64 array, so NumPy returns it unchanged")
             return
-        e = self.expr_raw(value_node) if isinstance(vt, OptionalType) else self.expr(value_node)
+        e = self.expr_raw(value_node) if isinstance(vt, OptionalType) else self.expr_for(value_node, vt)
         if e.type == VOID:
             raise Unsupported(s, "assigning the result of a function that returns None")
         what = f"parameter '{name}'" if name in self.params else f"'{name}'"
@@ -2455,6 +2556,10 @@ class FunctionTranslator(ExprTranslator):
                 arr = self.str_chars(arr)
             if isinstance(arr.type, ListType) and arr.type.elem is not None:
                 decl = "const std::string&" if arr.type.elem == STR else arr.type.elem.cpp()
+                if isinstance(arr.type.elem, StructType) and not any(
+                        isinstance(n, ast.Name) and n.id == s.target.id and isinstance(n.ctx, ast.Store)
+                        for b in s.body for n in ast.walk(b)):
+                    decl = f"const {decl}&"  # the pointer itself is not copied (the object never is)
                 self.emit(f"for ({decl} {self.ident(s.target.id)} : {arr.code}) {{")
                 self._block(s.body)
                 self.emit("}")
@@ -2614,7 +2719,7 @@ class FunctionTranslator(ExprTranslator):
                 parts.append(self.as_double(e).code if et == FLOAT else e.code)
             self.emit(f"return {{{', '.join(parts)}}};")
             return
-        e = self.expr(s.value)
+        e = self.expr_for(s.value, ret)
         self.check_assignable(ret, e, s, "the return value")
         if ret == FLOAT and (e.type in (INT, BOOL) or self.maybe_int(s.value)):
             maybe.add((self.fdef.name, None))  # `return 0` from a float function: a Python int here

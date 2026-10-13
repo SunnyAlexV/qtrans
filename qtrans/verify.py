@@ -31,6 +31,7 @@ import dataclasses
 import importlib.util
 import inspect
 import math
+import random
 import os
 import platform
 import re
@@ -43,12 +44,13 @@ import tempfile
 import time
 import uuid
 import warnings
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
+from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
                          library_tree, translate_file)
 from .types import BOOL, FLOAT, INT, MAT, RNG, STR, VEC, VOID, ArrayType, DictType, ListType, OptionalType, StructType, TupleType
 
@@ -525,6 +527,13 @@ def random_value(rng, t, n=3, shape=None):
         return out
     if isinstance(t, StructType):
         info, cls = _CLASSES[t.name]
+        if t.ref:  # a Payoff may be any class that is one: a Call, a Put, ...
+            options = [c for c in [info] + info.descendants() if not (c.abc and c.abstract_left())]
+            if not options:
+                raise _CantBuild(t.name)
+            info = options[int(rng.integers(0, len(options)))]
+            cls = _CLASSES[info.name][1]
+            t = info.type
         for _ in range(30):
             params = [p.type for p in _INIT_PARAMS[t.name]] if info.plain else [f.type for f in info.init_fields]
             args = [np.random.default_rng(random_value(rng, RNG)) if pt == RNG else random_value(rng, pt, n)
@@ -645,6 +654,9 @@ def _encode(v, t):
         m = (1 << 64) - 1
         return f"{st['state'] >> 64} {st['state'] & m} {st['inc'] >> 64} {st['inc'] & m}"
     if isinstance(t, StructType):
+        if t.ref:  # its class first: the C++ builds an object of that class
+            info, _ = _CLASSES[type(v).__name__]
+            return " ".join([f"@{info.name}"] + [_encode(getattr(v, f.name), f.type) for f in info.fields])
         info, _ = _CLASSES[t.name]
         return " ".join(_encode(getattr(v, f.name), f.type) for f in info.fields)
     if t == STR:
@@ -686,12 +698,57 @@ def _flatten(t):
     return list(t.elts) if isinstance(t, TupleType) else [t]
 
 
+def _changes_shown(p) -> bool:
+    """Is the argument compared after the call too? One the function modifies in place, and any
+    object of a class hierarchy (or list of them): behind a shared_ptr, a change made inside
+    reaches the caller's object, as in Python."""
+    t = p.type.elem if isinstance(p.type, ListType) else p.type
+    return getattr(p, "mode", "") == "ref" or (isinstance(t, StructType) and t.ref)
+
+
+def random_seed(args, sig) -> int:
+    """The seed both sides give the random module's generator before calling a function that
+    uses it: from the function's name and the call's ints and sizes (not its floats, so the
+    nudged calls that measure conditioning draw the same numbers)."""
+    parts = [sig.name.split("(")[0]]
+
+    def walk(v):
+        if isinstance(v, (bool, int, np.integer)):
+            parts.append(str(int(v)))
+        elif isinstance(v, (list, tuple)):
+            parts.append(f"[{len(v)}")
+            for x in v:
+                walk(x)
+        elif isinstance(v, dict):
+            parts.append(f"{{{len(v)}")
+        elif isinstance(v, np.ndarray):
+            parts.append(str(v.shape))
+        elif isinstance(v, str):
+            parts.append(v)
+    for a in args:
+        walk(a)
+    return zlib.crc32("|".join(parts).encode("utf-8"))
+
+
+def encode_call(args, sig) -> str:
+    """A call's arguments for the driver (CALL <function> <this>): the random module's seed
+    first for a function that uses it."""
+    enc = " ".join(_encode(v, p.type) for v, p in zip(args, sig.params))
+    return f"{random_seed(args, sig)} {enc}" if getattr(sig, "py_random", False) else enc
+
+
+def _compared_after(sig) -> bool:
+    return any(_changes_shown(p) for p in sig.params) or getattr(sig, "py_random", False)
+
+
 def output_type(sig):
     """What a call produces: the return value, plus the final state of every array the
     function modifies in place (in Python the caller sees those changes too)."""
     # a generator passed in is reported as its next raw output after the call: equal only if
     # both sides consumed exactly the same number of draws
-    refs = [INT if p.type == RNG else p.type for p in sig.params if getattr(p, "mode", "") == "ref"]
+    refs = [INT if p.type == RNG else p.type for p in sig.params if _changes_shown(p)]
+    if getattr(sig, "py_random", False):  # the random module's generator: its next 32 bits, gauss()'s saved value
+        refs += [INT, OptionalType(FLOAT)]
     if not refs:
         return sig.ret
     returned = [] if sig.ret.cpp() == "void" else _flatten(sig.ret)
@@ -739,7 +796,8 @@ def _py_value(v, t):
             raise TypeError("a list of floats holding an int (Python prints it as one)")
         return [_py_value(x, t.elem) for x in v]
     if isinstance(t, StructType):
-        if not _is_object(v) or type(v).__name__ != t.name:
+        ok = {b.__name__ for b in type(v).__mro__} if t.ref else {type(v).__name__}  # a Call is a Payoff
+        if not _is_object(v) or t.name not in ok:
             raise TypeError(f"expected a {t.name}, got {type(v).__name__}")
         return copy.deepcopy(v)
     if t == STR:
@@ -950,6 +1008,9 @@ def _run_python_printed(fn, args, sig):
 
 
 def _call_python(fn, args, sig):
+    rnd = getattr(sig, "py_random", False)
+    if rnd:
+        random.seed(random_seed(args, sig))
     args = _call_args(args, sig)
     try:
         with warnings.catch_warnings():
@@ -958,11 +1019,15 @@ def _call_python(fn, args, sig):
                 v = fn(*args)
     except Exception as e:  # noqa: BLE001 - every exception is a test outcome
         return ("exc", _py_category(e), str(e))
-    if sig.ret == VOID and not any(getattr(p, "mode", "") == "ref" for p in sig.params):
+    if sig.ret == VOID and not _compared_after(sig):
         return ("ok", None)  # a function that only prints
     try:
         refs = [int(args[i].bit_generator.random_raw()) if p.type == RNG else args[i]
-                for i, p in enumerate(sig.params) if getattr(p, "mode", "") == "ref"]
+                for i, p in enumerate(sig.params) if _changes_shown(p)]
+        if rnd:
+            after = random.Random()
+            after.setstate(random.getstate())
+            refs += [after.getrandbits(32), random._inst.gauss_next]
         if refs:
             flat = list(v) if isinstance(sig.ret, TupleType) else [] if sig.ret.cpp() == "void" else [v]
             return ("ok", _py_value(tuple(flat + refs), output_type(sig)))
@@ -1139,6 +1204,7 @@ _DRIVER_PRELUDE = r"""// Test driver generated by qtrans verify. Reads one call 
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <typeinfo>
 #include <vector>
 
 struct Reader {
@@ -1368,7 +1434,7 @@ def driver_source(result, header_name=None, namespace=None, targets=None) -> str
         for name, sig in res.signatures.items():
             if sig.owner:
                 continue  # methods are exercised through the functions that call them
-            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params) and name not in res.prints:
+            if sig.ret.cpp() == "void" and not _compared_after(sig) and name not in res.prints:
                 continue
             branches.append(_branch(name if single else f"{module}:{name}", sig, namespace))
     uses_arrays = any(r.uses_arrays for r, _ in modules.values()) if single else result.uses_arrays
@@ -1397,7 +1463,12 @@ def _branch(key, sig, namespace) -> str:
     vreads = " ".join(read(i, p, True) for i, p in enumerate(sig.params))
     args = ", ".join(f"p{i}" for i in range(len(sig.params)))
     opaque = "".join(f"qtrans_opaque(p{i}); " for i, p in enumerate(sig.params) if p.type not in _CTYPE)
-    refs = "".join(f" out(p{i});" for i, p in enumerate(sig.params) if p.mode == "ref")
+    refs = "".join(f" out(p{i});" for i, p in enumerate(sig.params) if _changes_shown(p))
+    if getattr(sig, "py_random", False):  # seeded first, compared after
+        reads = "qt::py::random_module().seed(I(r)); " + reads
+        vreads = "qt::py::random_module().seed(I(r)); " + vreads
+        refs += (" out(static_cast<long long>(qt::py::random_module().peek32()));"
+                 " out(qt::py::random_module().gauss_next());")
     call = f"{namespace}::{sig.cpp}({args})"
     if sig.ret.cpp() == "void":
         do_call = f'{call}; std::printf("OK");{refs} std::printf("\\n");'
@@ -1421,7 +1492,8 @@ def _reader(t, ns, r="r") -> str:
         inner = t.inner
         return (f"qtrans_optional<{inner.cpp()}>({r}, [](Reader& rr) {{ return {_reader(inner, ns, 'rr')}; }})")
     if isinstance(t, ListType):
-        return f"qtrans_list<{t.elem.cpp()}>({r}, [](Reader& rr) {{ return {_reader(t.elem, ns, 'rr')}; }})"
+        et = f"decltype(read_{t.elem.name}(std::declval<Reader&>()))" if isinstance(t.elem, StructType) else t.elem.cpp()
+        return f"qtrans_list<{et}>({r}, [](Reader& rr) {{ return {_reader(t.elem, ns, 'rr')}; }})"
     if isinstance(t, TupleType):  # a braced list: its elements are read in order (a call's arguments aren't)
         return f"{t.cpp()}{{{', '.join(_reader(e, ns, r) for e in t.elts)}}}"
     if isinstance(t, DictType):
@@ -1445,9 +1517,19 @@ def _struct_io(classes) -> str:
                   "    const std::uint64_t ih = U(r);", "    const std::uint64_t il = U(r);",
                   "    return qt::Rng::from_state(sh, sl, ih, il);", "}"]
     for info, ns in classes:
-        lines.append(f"static {ns}::{info.cpp} read_{info.name}(Reader& r);")
+        c = f"{ns}::{info.cpp}"
+        if info.ref:
+            lines.append(f"static std::shared_ptr<{c}> read_{info.name}(Reader& r);")
+            if not (info.abc and info.abstract_left()):
+                lines.append(f"static std::shared_ptr<{c}> read_{info.name}_exactly(Reader& r);")
+            lines.append(f"static void out(const std::shared_ptr<{c}>& o);")
+        else:
+            lines.append(f"static {c} read_{info.name}(Reader& r);")
     for info, ns in classes:
         c = f"{ns}::{info.cpp}"
+        if info.ref:
+            lines += _hierarchy_io(info, ns)
+            continue
         body = [f"static {c} read_{info.name}(Reader& r) {{"]
         for k, f in enumerate(info.fields):
             body.append(f"    auto f{k} = {_reader(f.type, ns)};")
@@ -1469,6 +1551,44 @@ def _struct_io(classes) -> str:
         first = f"num(o.{info.fields[0].cpp})" if info.fields else "0.0"
         lines.append(f"static double num(const {c}& o) {{ return {first}; }}")
     return "\n".join(lines) + "\n"
+
+
+def _hierarchy_io(info, ns) -> list:
+    """read_X / out / num for a class of a hierarchy: the object's class travels first (@Call),
+    then that class's fields; reading builds an object of exactly that class."""
+    c = f"{ns}::{info.cpp}"
+    concrete = [k for k in [info] + info.descendants() if not (k.abc and k.abstract_left())]
+    lines = []
+    if info in concrete:
+        body = [f"static std::shared_ptr<{c}> read_{info.name}_exactly(Reader& r) {{"]
+        for k, f in enumerate(info.fields):
+            body.append(f"    auto f{k} = {_reader(f.type, ns)};")
+        if info.plain:  # Python already ran __init__: set the fields it produced
+            body.append(f"    auto o = std::make_shared<{c}>();")
+            set_ = list(enumerate(info.fields))
+        else:
+            args = ", ".join(f"f{k}" for k, f in enumerate(info.fields) if f.init)
+            body.append(f"    auto o = std::make_shared<{c}>({args});")
+            set_ = [(k, f) for k, f in enumerate(info.fields) if not f.init]
+        body += [f"    o->{f.cpp} = f{k};" for k, f in set_]
+        body += ["    return o;", "}"]
+        lines += body
+    lines.append(f"static std::shared_ptr<{c}> read_{info.name}(Reader& r) {{")
+    lines.append("    const std::string tag = r.next();")
+    for k in concrete:
+        lines.append(f'    if (tag == "@{k.name}") return read_{k.name}_exactly(r);')
+    lines += ['    throw std::runtime_error("driver: unknown class " + tag);', "}"]
+    lines.append(f"static void out(const std::shared_ptr<{c}>& o) {{")
+    for k in concrete:
+        kc = f"{ns}::{k.cpp}"
+        outs = " ".join(f"{{ qt::Rng g = q.{f.cpp}; out(g); }}" if f.type == RNG else f"out(q.{f.cpp});"
+                        for f in k.fields)
+        lines.append(f"    if (typeid(*o) == typeid({kc})) {{ const auto& q = static_cast<const {kc}&>(*o); "
+                     f'std::printf(" @{k.name}"); {outs} return; }}')
+    lines += ['    throw std::runtime_error("driver: an object of a class it doesn\'t know");', "}"]
+    first = f"num(o->{info.fields[0].cpp})" if info.fields else "0.0"
+    lines.append(f"static double num(const std::shared_ptr<{c}>& o) {{ return {first}; }}")
+    return lines
 
 
 class _Toks:
@@ -1519,6 +1639,9 @@ def _parse_value(t, toks):
         n = int(next(toks))
         return [_parse_value(t.elem, toks) for _ in range(n)]
     if isinstance(t, StructType):
+        if t.ref:
+            info, _ = _CLASSES[next(toks)[1:]]
+            return {"__class__": info.name, **{f.name: _parse_value(f.type, toks) for f in info.fields}}
         info, _ = _CLASSES[t.name]
         return {f.name: _parse_value(f.type, toks) for f in info.fields}
     if isinstance(t, OptionalType):
@@ -1707,6 +1830,12 @@ def _compare_values(pv, cv, t, rtol, atol):
         return worst
     if isinstance(t, StructType):
         info, _ = _CLASSES[t.name]
+        if t.ref:  # the same class on both sides, then that class's fields
+            pc = type(pv).__name__
+            cc = cv["__class__"] if isinstance(cv, dict) else type(cv).__name__
+            if pc != cc:
+                return (False, math.inf, 0)
+            info, _ = _CLASSES[pc]
         worst = (True, 0.0, 0)
         get = (lambda o, k: o[k]) if isinstance(cv, dict) else getattr  # (a nudged Python object on both sides)
         for f in info.fields:
@@ -2042,8 +2171,11 @@ def setup_inputs(project, pymods):
     # code that takes text apart also gets text made to test it: spaces, case, digits, Unicode
     _STRINGS = sorted(lits) + ["", "no such option"] + (_TEXT_PROBES if text else [])
     _CLASSES = {n: (info, getattr(pymods[m], n)) for n, (info, m) in project.classes().items()}
-    _INIT_PARAMS = {n: project.modules[m].signatures[f"{n}.__init__"].params
-                    for n, (info, m) in project.classes().items() if info.plain}
+    _INIT_PARAMS = {}
+    for n, (info, m) in project.classes().items():
+        if info.plain:  # its own __init__, or the one it inherits (none: an interface)
+            init = info.find_method("__init__")
+            _INIT_PARAMS[n] = project.modules[m].signatures[init.key].params if init is not None else []
 
 
 def module_cases(project, module, pymod) -> tuple[dict, dict]:
@@ -2190,7 +2322,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         for name, sig in result.signatures.items():
             if sig.owner:
                 continue  # methods are checked through the functions that use them
-            if sig.ret.cpp() == "void" and not any(p.mode == "ref" for p in sig.params) and name not in result.prints:
+            if sig.ret.cpp() == "void" and not _compared_after(sig) and name not in result.prints:
                 continue  # nothing to compare
             tol = tolerances.get(name, rtol)
             f_rtol, f_atol = (tol, atol) if isinstance(tol, (int, float)) else tuple(tol)
@@ -2260,6 +2392,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
     if not (build / "qtrans_runtime.hpp").exists():
         shutil.copy(RUNTIME_HEADER, build / "qtrans_runtime.hpp")
     shutil.copy(PYTHON_HEADER, build / "qtrans_python.hpp")
+    shutil.copy(PYRANDOM_HEADER, build / "qtrans_pyrandom.hpp")
     shutil.copy(PRINT_HEADER, build / "qtrans_print.hpp")
     shutil.copy(LIST_HEADER, build / "qtrans_list.hpp")
     shutil.copy(UNICODE_HEADER, build / "qtrans_unicode.hpp")
@@ -2287,7 +2420,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         sigs = project.modules[module].signatures
         for fc in checks[module]:
             for c in fc.cases:
-                enc = " ".join(_encode(v, p.type) for v, p in zip(c.args, sigs[fc.name].params))
+                enc = encode_call(c.args, sigs[fc.name])
                 lines.append(f"CALL {fc.key} {enc}")
                 index.append((fc, c))
     run = subprocess.run([str(exe)], input="".join(x + "\n" for x in lines), capture_output=True, text=True,
@@ -2364,7 +2497,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                     continue
                 fn = getattr(pymods[module], fc.py_name or fc.name)
                 fc.py_ns = _bench_python(fn, _call_args(case.args, sigs[fc.name]))
-                enc = " ".join(_encode(v, p.type) for v, p in zip(case.args, sigs[fc.name].params))
+                enc = encode_call(case.args, sigs[fc.name])
                 r = subprocess.run([str(exe)], input=f"BENCH {fc.key} {enc}\n", capture_output=True, text=True,
                                    encoding="utf-8", errors="replace")
                 fc.cpp_ns = float(r.stdout.split()[1])
@@ -2379,7 +2512,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         if result.program is not None:  # a program: run it both ways and compare what it prints
             src = build / f"{module}.cpp"
             src.write_text(result.program, encoding="utf-8")
-            for h in (RUNTIME_HEADER, PYTHON_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+            for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
                 shutil.copy(h, build / h.name)
             prog_system = list(system)
             if "qtrans_arrays.hpp" in result.program or "qtrans_random.hpp" in result.program:

@@ -386,7 +386,7 @@ def test_deep_copy_breaks_the_sharing():
     ("@dataclass\nclass P:\n    w: Vec\n\n    def __post_init__(self):\n        self.w /= np.sum(self.w)\n",
      "changes field 'w' in place"),
     ("@dataclass\nclass P:\n    w: Vec = np.zeros(3)\n", "default_factory"),
-    ("class Base:\n    pass\n\n@dataclass\nclass P(Base):\n    x: float\n", "inheritance"),
+    ("class Base:\n    pass\n\n@dataclass\nclass P(Base):\n    x: float\n", "mixing the two"),
     ("class P:\n    def __init__(self, x: float):\n        self.x = x\n\n    def later(self) -> None:\n"
      "        self.y = 1.0\n", "which __init__ doesn't set"),
     ("@dataclass\nclass P:\n    rng: np.random.Generator\n\n    def draw(self) -> float:\n"

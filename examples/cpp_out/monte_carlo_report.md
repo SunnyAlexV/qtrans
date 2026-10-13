@@ -32,6 +32,7 @@
 
 These only matter on inputs where Python would raise an exception or overflow.
 
+- float ** raises OverflowError in Python when the result overflows; C++ returns inf (applies to: european_mc, european_from_draws, gbm_paths, geometric_asian_call, down_and_out_call_mc, heston_call_mc)
 - division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: european_mc, gbm_paths, geometric_asian_call, asian_call_mc, down_and_out_call_mc, heston_call_mc, portfolio_var_mc)
 - int arithmetic that could leave 64 bits is checked: where Python's unbounded int would exceed ±9.2e18, C++ raises OverflowError (applies to: gbm_paths, geometric_asian_call)
 
