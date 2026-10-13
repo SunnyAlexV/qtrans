@@ -10,7 +10,6 @@
   - np.einsum is computed by direct summation; NumPy's kernels add in a different order, so results agree to rounding rather than bit for bit
 - `_ewma_weights` (line 61)
   - x ** y with a negative x and non-integer y gives a complex number for a Python float but NaN in C++ (and for np.float64)
-  - np.arange of ints is stored as doubles (exact for |values| < 2^53)
 - `horizon_returns` (line 67)
 - `variance_ratio` (line 82)
   - np.errstate(...) blocks are translated as their contents: they only change which floating-point warnings NumPy prints, never the values

@@ -24,8 +24,9 @@ from .dicts import DictOps, dict_of
 from .strings import StrOps
 from .lists import ListOps, list_of
 from .pyrandom import PyRandomOps
+from .intarrays import IntArrayOps
 from .types import (ExcType, ListType, DictType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
-                    TupleType, assignable, is_array, join)
+                    TupleType, IVEC, assignable, is_array, is_iarray, join)
 
 from .core import cpp_string
 from .core import SIZE_IV, dims_of, int_token, iv_clip, iv_fits, iv_of, iv_op, same_dim
@@ -145,7 +146,7 @@ def _outer_call(code: str):
     return None
 
 
-class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _ObjectChecks, PyRandomOps):
+class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _ObjectChecks, PyRandomOps, IntArrayOps):
     def __init__(self, mod):
         self.mod = mod  # the ModuleTranslator: imports, constants, function signatures
         self.notes: list[str] = []
@@ -372,6 +373,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
             base = self.expr(node.value)
             if is_array(base.type):
                 return self.array_attribute(node, base)
+            if is_iarray(base.type):
+                return self.int_array_attribute(node, base)
             if isinstance(base.type, StructType):
                 return self.struct_attribute(node, base)
         if q is None:
@@ -405,6 +408,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                 return Expr(f"{wrap(self.as_string(L), P_ADD)} + {wrap(R, P_ADD - 1)}", P_ADD, STR)
             raise Unsupported(node, "on strings only + (joining two strings) and * (repeating one) are supported",
                               "Python raises TypeError for str + number; formatting isn't supported")
+        if any(is_iarray(e.type) for e in (L, R)):
+            return self.int_array_binop(node, op, L, R)
         if any(is_array(e.type) or isinstance(e.type, MaskType) for e in (L, R)):
             return self.array_binop(node, op, L, R)
         if isinstance(op, ast.MatMult):
@@ -565,6 +570,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                 return Expr(f"{wrap(self.as_string(raw), P_ATOM)}.empty()", P_ATOM, BOOL)
             return Expr(f"!{wrap(self.truth(raw, node.operand), P_ATOM)}", P_UNARY, BOOL)
         e = self.expr(node.operand)
+        if is_iarray(e.type):
+            return self.int_array_unary(node, e)
         if isinstance(e.type, MaskType) and isinstance(node.op, ast.Invert):
             return Expr(f"!{wrap(e, P_ATOM)}", P_UNARY, e.type, dims=e.dims)
         if is_array(e.type):
@@ -631,6 +638,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
             if len(node.ops) > 1:
                 raise Unsupported(node, "chained comparisons of objects are not supported")
             return self.struct_compare(node, exprs[0], node.ops[0], exprs[1])
+        if any(is_iarray(e.type) for e in exprs):
+            if len(node.ops) > 1:
+                raise Unsupported(node, "chained comparisons of arrays raise ValueError in NumPy")
+            return self.int_array_compare(node, exprs[0], node.ops[0], exprs[1])
         if any(is_array(e.type) for e in exprs):
             if len(node.ops) > 1:
                 raise Unsupported(node, "chained comparisons of arrays raise ValueError in NumPy")
@@ -823,6 +834,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                 if is_array(a.type):
                     return Expr(f"{wrap(a, P_ATOM)}.{'size' if a.type.rank == 1 else 'rows'}()", P_ATOM, INT,
                                 iv=SIZE_IV, dimtok=dims_of(a)[0])
+                if is_iarray(a.type):
+                    return Expr(f"static_cast<long long>({wrap(a, P_ATOM)}.size())", P_ATOM, INT, iv=SIZE_IV)
             if name in ("sum", "max", "min") and node.args:
                 a = self.expr(node.args[0])
                 if is_array(a.type):
@@ -845,6 +858,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
         q = self.qualify(f)
         if q is None and isinstance(f, ast.Attribute) and not self._is_module_path(f.value):
             base = self.expr(f.value)
+            if is_iarray(base.type):
+                return self.int_array_method(node, base, f.attr)
             if is_array(base.type) or isinstance(base.type, MaskType):
                 return self.array_method(node, base, f.attr)
             if list_of(base.type):
@@ -935,7 +950,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
             if not assignable(p.type, e.type):
                 raise Unsupported(a, f"argument '{p.name}' of {display}() is declared {p.type} but a {e.type} is passed")
             return self.to_optional(e, p.type).code
-        if is_array(p.type) or isinstance(p.type, StructType) or p.type == STR:
+        if is_array(p.type) or isinstance(p.type, StructType) or p.type == STR or is_iarray(p.type):
             e = self.expr(a)
             if isinstance(p.type, StructType) and p.type.ref:
                 if not assignable(p.type, e.type):
@@ -1161,6 +1176,11 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
         if qual == "numpy.einsum":
             return self.einsum_call(node)
         args = [self.expr(a) for a in node.args]
+        if any(is_iarray(a.type) for a in args) and qual.startswith("numpy."):
+            r = self.int_array_call(node, qual, args)
+            if r is not None:
+                return r
+            args = [self.as_float_array(a) for a in args]  # a float function: NumPy converts to float64 first
         if qual == "numpy.where" and len(args) == 3 and not node.keywords and \
                 not any(is_array(a.type) or isinstance(a.type, MaskType) for a in args):
             for a, n in zip(args, node.args):

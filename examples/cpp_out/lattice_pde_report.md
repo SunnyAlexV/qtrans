@@ -5,11 +5,8 @@
 ## Translated
 
 - `american_binomial` (line 9)
-  - np.arange of ints is stored as doubles (exact for |values| < 2^53)
 - `early_exercise_premium` (line 34)
-  - np.arange of ints is stored as doubles (exact for |values| < 2^53)
 - `bs_explicit_fd` (line 50)
-  - np.arange of ints is stored as doubles (exact for |values| < 2^53)
 - `fd_price` (line 73)
   - float -> int beyond ±9.2e18 raises OverflowError in C++; Python returns a big integer
 

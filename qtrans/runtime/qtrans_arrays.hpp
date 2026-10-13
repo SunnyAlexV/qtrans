@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <optional>
@@ -51,6 +52,7 @@ using Vec = Eigen::ArrayXd;
 using Mat = Eigen::Array<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 using Mask = Eigen::Array<bool, Eigen::Dynamic, 1>;  // a stored comparison: tail = pnl <= -var
 using Mask2 = Eigen::Array<bool, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using IVec = Eigen::Array<long long, Eigen::Dynamic, 1>;  // a 1-D int64 array (0.14)
 using Index = Eigen::Index;
 inline constexpr std::nullopt_t none = std::nullopt;
 
@@ -1288,6 +1290,199 @@ inline Vec einsum1(const std::string& spec, std::initializer_list<EinsumArg> mat
 }
 inline Mat einsum2(const std::string& spec, std::initializer_list<EinsumArg> mats, const std::vector<int>& ranks) {
     return einsum_core(spec, mats, ranks);
+}
+
+
+// =====================================================================================
+// int64 arrays (0.14): np.arange of ints, rng.integers, index arrays. NumPy's int64
+// arithmetic wraps around at 2**64 without an error, so it is done in unsigned arithmetic
+// here (where signed overflow would be undefined behaviour in C++).
+// =====================================================================================
+namespace ia {
+inline long long wrap_add(long long a, long long b) { return static_cast<long long>(static_cast<unsigned long long>(a) + static_cast<unsigned long long>(b)); }
+inline long long wrap_sub(long long a, long long b) { return static_cast<long long>(static_cast<unsigned long long>(a) - static_cast<unsigned long long>(b)); }
+inline long long wrap_mul(long long a, long long b) { return static_cast<long long>(static_cast<unsigned long long>(a) * static_cast<unsigned long long>(b)); }
+// NumPy's int floor division and modulo: Python's signs, x // 0 == x % 0 == 0 (with a warning)
+inline long long np_floordiv(long long a, long long b) {
+    if (b == 0) return 0;
+    if (b == -1) return wrap_sub(0, a);  // (LLONG_MIN // -1 wraps to LLONG_MIN)
+    long long q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) --q;
+    return q;
+}
+inline long long np_mod(long long a, long long b) {
+    if (b == 0 || b == -1) return 0;
+    long long r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) r += b;
+    return r;
+}
+// NumPy's int ** int: int64, wrapping (a product mod 2**64 doesn't depend on the order it is
+// worked out in, so squaring gives NumPy's result); a negative exponent raises, element by element
+inline long long np_pow(long long a, long long b) {
+    if (b < 0) throw ValueError("Integers to negative integer powers are not allowed.");
+    unsigned long long base = static_cast<unsigned long long>(a), r = 1;
+    for (unsigned long long e = static_cast<unsigned long long>(b); e != 0; e >>= 1) {
+        if (e & 1) r *= base;
+        base *= base;
+    }
+    return static_cast<long long>(r);
+}
+}  // namespace ia
+
+inline IVec ivec(std::initializer_list<long long> values) {  // np.array([1, 2, 3])
+    IVec out(static_cast<Index>(values.size()));
+    Index i = 0;
+    for (long long v : values) out(i++) = v;
+    return out;
+}
+
+// np.arange(start, stop, step) of ints: length ceil((stop - start) / step), as NumPy works it out
+inline IVec iarange(long long start, long long stop, long long step = 1) {
+    if (step == 0) throw ZeroDivisionError(msg::int_truediv_zero);
+    const double len = std::ceil((static_cast<double>(stop) - static_cast<double>(start)) / static_cast<double>(step));
+    const Index n = len > 0 ? static_cast<Index>(len) : 0;
+    IVec out(n);
+    for (Index i = 0; i < n; ++i) out(i) = ia::wrap_add(start, ia::wrap_mul(static_cast<long long>(i), step));
+    return out;
+}
+inline IVec iarange(long long stop) { return iarange(0, stop, 1); }
+
+inline IVec izeros(long long n) { check_dim(n); return IVec::Zero(static_cast<Index>(n)); }
+inline IVec iones(long long n) { check_dim(n); return IVec::Ones(static_cast<Index>(n)); }
+inline IVec ifull(long long n, long long v) { check_dim(n); return IVec::Constant(static_cast<Index>(n), v); }
+
+// elementwise int64 arithmetic, wrapping as NumPy's does
+template <class F>
+IVec imap2(const IVec& a, const IVec& b, F f) {
+    if (a.size() != b.size() && a.size() != 1 && b.size() != 1)
+        throw shape_error("operands could not be broadcast together with shapes (" + std::to_string(a.size()) +
+                          ",) (" + std::to_string(b.size()) + ",)");
+    const Index n = std::max(a.size(), b.size());
+    IVec out(n);
+    for (Index i = 0; i < n; ++i) out(i) = f(a(a.size() == 1 ? 0 : i), b(b.size() == 1 ? 0 : i));
+    return out;
+}
+template <class F>
+IVec imap1(const IVec& a, long long k, F f, bool k_first = false) {
+    IVec out(a.size());
+    for (Index i = 0; i < a.size(); ++i) out(i) = k_first ? f(k, a(i)) : f(a(i), k);
+    return out;
+}
+inline IVec iadd(const IVec& a, const IVec& b) { return imap2(a, b, ia::wrap_add); }
+inline IVec isub(const IVec& a, const IVec& b) { return imap2(a, b, ia::wrap_sub); }
+inline IVec imul(const IVec& a, const IVec& b) { return imap2(a, b, ia::wrap_mul); }
+inline IVec ifloordiv(const IVec& a, const IVec& b) { return imap2(a, b, ia::np_floordiv); }
+inline IVec imod(const IVec& a, const IVec& b) { return imap2(a, b, ia::np_mod); }
+inline IVec iadd(const IVec& a, long long k) { return imap1(a, k, ia::wrap_add); }
+inline IVec isub(const IVec& a, long long k) { return imap1(a, k, ia::wrap_sub); }
+inline IVec isub(long long k, const IVec& a) { return imap1(a, k, ia::wrap_sub, true); }
+inline IVec imul(const IVec& a, long long k) { return imap1(a, k, ia::wrap_mul); }
+inline IVec ifloordiv(const IVec& a, long long k) { return imap1(a, k, ia::np_floordiv); }
+inline IVec ifloordiv(long long k, const IVec& a) { return imap1(a, k, ia::np_floordiv, true); }
+inline IVec imod(const IVec& a, long long k) { return imap1(a, k, ia::np_mod); }
+inline IVec imod(long long k, const IVec& a) { return imap1(a, k, ia::np_mod, true); }
+inline IVec ipow(const IVec& a, const IVec& b) { return imap2(a, b, ia::np_pow); }
+inline IVec ipow(const IVec& a, long long k) { return imap1(a, k, ia::np_pow); }
+inline IVec ipow(long long k, const IVec& a) { return imap1(a, k, ia::np_pow, true); }
+inline IVec ineg(const IVec& a) { return imap1(a, 0, ia::wrap_sub, true); }
+inline IVec iabs(const IVec& a) {  // (abs(LLONG_MIN) stays LLONG_MIN, as in NumPy)
+    IVec out(a.size());
+    for (Index i = 0; i < a.size(); ++i) out(i) = a(i) < 0 ? ia::wrap_sub(0, a(i)) : a(i);
+    return out;
+}
+
+inline long long isum(const IVec& a) {
+    long long s = 0;
+    for (Index i = 0; i < a.size(); ++i) s = ia::wrap_add(s, a(i));
+    return s;
+}
+inline long long iprod(const IVec& a) {
+    long long s = 1;
+    for (Index i = 0; i < a.size(); ++i) s = ia::wrap_mul(s, a(i));
+    return s;
+}
+inline IVec icumsum(const IVec& a) {
+    IVec out(a.size());
+    long long s = 0;
+    for (Index i = 0; i < a.size(); ++i) out(i) = s = ia::wrap_add(s, a(i));
+    return out;
+}
+inline long long imax(const IVec& a) {
+    if (a.size() == 0) throw ValueError("zero-size array to reduction operation maximum which has no identity");
+    return a.maxCoeff();
+}
+inline long long imin(const IVec& a) {
+    if (a.size() == 0) throw ValueError("zero-size array to reduction operation minimum which has no identity");
+    return a.minCoeff();
+}
+
+// one element: idx[i] (a negative i counts from the end), with NumPy's IndexError
+inline Index np_index(long long i, Index n) {
+    if (i < -static_cast<long long>(n) || i >= static_cast<long long>(n))
+        throw IndexError("index " + std::to_string(i) + " is out of bounds for axis 0 with size " + std::to_string(n));
+    return static_cast<Index>(i < 0 ? i + static_cast<long long>(n) : i);
+}
+
+// x[idx]: the elements at those positions (NumPy's fancy indexing: a new array)
+template <class A>
+A take(const A& x, const IVec& idx) {
+    A out(idx.size());
+    for (Index k = 0; k < idx.size(); ++k) out(k) = x(np_index(idx(k), x.size()));
+    return out;
+}
+// A[idx]: those rows of a matrix
+inline Mat take_rows(const Mat& m, const IVec& idx) {
+    Mat out(idx.size(), m.cols());
+    for (Index k = 0; k < idx.size(); ++k) out.row(k) = m.row(np_index(idx(k), m.rows()));
+    return out;
+}
+
+// x.astype(np.int64): toward zero; NaN and values out of range give what the CPU's conversion
+// gives, as NumPy's own C cast does (x86: the smallest int64; ARM: saturated, NaN as 0)
+inline long long to_int64(double v) {
+    if (v >= -9223372036854775808.0 && v < 9223372036854775808.0) return static_cast<long long>(v);
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm64__)
+    if (std::isnan(v)) return 0;
+    return v < 0 ? std::numeric_limits<long long>::min() : std::numeric_limits<long long>::max();
+#else
+    return std::numeric_limits<long long>::min();
+#endif
+}
+template <class D>
+IVec astype_int(const Eigen::ArrayBase<D>& x) {
+    const auto v = x.eval();
+    IVec out(v.size());
+    for (Index i = 0; i < v.size(); ++i) out(i) = to_int64(v(i));
+    return out;
+}
+inline Vec astype_float(const IVec& a) { return a.cast<double>(); }
+
+inline long long iargmax(const IVec& a) {  // the first position of the largest
+    if (a.size() == 0) throw ValueError("attempt to get argmax of an empty sequence");
+    Index k = 0;
+    for (Index i = 1; i < a.size(); ++i) if (a(i) > a(k)) k = i;
+    return static_cast<long long>(k);
+}
+inline long long iargmin(const IVec& a) {
+    if (a.size() == 0) throw ValueError("attempt to get argmin of an empty sequence");
+    Index k = 0;
+    for (Index i = 1; i < a.size(); ++i) if (a(i) < a(k)) k = i;
+    return static_cast<long long>(k);
+}
+inline IVec isorted(IVec a) {  // np.sort of ints: any correct sort gives the same array
+    std::sort(a.data(), a.data() + a.size());
+    return a;
+}
+// two int arrays compared element by element (a length-1 side stretches, as in NumPy)
+template <class F>
+Mask icmp(const IVec& a, const IVec& b, F f) {
+    if (a.size() != b.size() && a.size() != 1 && b.size() != 1)
+        throw shape_error("operands could not be broadcast together with shapes (" + std::to_string(a.size()) +
+                          ",) (" + std::to_string(b.size()) + ",)");
+    const Index n = std::max(a.size(), b.size());
+    Mask out(n);
+    for (Index i = 0; i < n; ++i) out(i) = f(a(a.size() == 1 ? 0 : i), b(b.size() == 1 ? 0 : i));
+    return out;
 }
 
 }  // namespace qt

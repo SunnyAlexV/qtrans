@@ -33,7 +33,7 @@ import numpy as np
 
 from . import verify as V
 from .translator import VERSION
-from .types import BOOL, FLOAT, INT, RNG, STR, VOID, ArrayType, DictType, ListType, OptionalType, StructType, TupleType
+from .types import BOOL, FLOAT, INT, RNG, STR, VOID, ArrayType, DictType, IntArrayType, ListType, OptionalType, StructType, TupleType
 
 
 def _source_hash(p) -> str:
@@ -74,6 +74,9 @@ def _tokens(v, t, scale=None) -> list:
         return ["N"] if v is None else _tokens(v, t.inner)
     if t == STR:
         return ["S" + str(v).encode("utf-8").hex()]
+    if isinstance(t, IntArrayType):  # ints: compared exactly
+        a = np.asarray(v)
+        return [str(a.shape[0])] + [str(int(x)) for x in a.ravel()]
     if isinstance(t, ArrayType):
         a = np.asarray(v, dtype=np.float64)
         head = [str(a.shape[0])] if t.rank == 1 else [str(a.shape[0]), str(a.shape[1])]
@@ -84,7 +87,7 @@ def _tokens(v, t, scale=None) -> list:
     if t == RNG and isinstance(v, np.random.Generator):
         # a generator inside an object: the driver prints its next raw output (as verify compares it)
         import copy
-        return [str(int(copy.deepcopy(v).bit_generator.random_raw()))]
+        return [str(V.rng_fingerprint(copy.deepcopy(v)))]
     if t in (INT, RNG):
         return [str(int(v))]
     if t == BOOL:

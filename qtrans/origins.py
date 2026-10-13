@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import ast
 
-from .types import RNG, ArrayType, DictType, ListType, Scalar, TupleType, is_array
+from .types import RNG, ArrayType, DictType, ListType, Scalar, TupleType, is_array, is_arraylike
 
 PY, NP, RNG_ = "py", "np", "rng"
 _BOTTOM = "bottom"  # no assignment seen yet (the start of the fixpoint)
@@ -66,7 +66,7 @@ def of_type(t):
     """The origin of a parameter of type t: the caller's value (verify passes Python numbers)."""
     if isinstance(t, Scalar):
         return PY
-    if is_array(t):
+    if is_arraylike(t):
         return NP
     if t == RNG:
         return RNG_
@@ -430,6 +430,8 @@ class _FunctionOrigins:
             if base == _BOTTOM:
                 return _BOTTOM
             if base == RNG_:
+                if f.attr == "integers":
+                    return NP  # an np.int64, or an int64 array
                 k = _SCALAR_DRAWS.get(f.attr)
                 if k is None:
                     return None

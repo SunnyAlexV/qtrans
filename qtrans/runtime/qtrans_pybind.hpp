@@ -264,6 +264,60 @@ inline T& obtain(py::handle o, std::optional<T>& tmp, From from) {
     return tmp.emplace(from(o));
 }
 
+// --- int64 arrays (0.14) ---------------------------------------------------------------------------
+// Only an int64 NumPy array: a float array (or a list) would compute differently in Python.
+inline qt::IVec ivec_arg(py::handle o, const char* name) {
+    if (!py::isinstance<py::array>(o))
+        throw py::type_error(std::string("'") + name + "' must be a 1-D int64 NumPy array, got " + type_name(o));
+    py::array a = py::reinterpret_borrow<py::array>(o);
+    if (a.ndim() != 1 || !(a.dtype().kind() == 'i' && a.dtype().itemsize() == 8))
+        throw py::type_error(std::string("'") + name + "' must be a 1-D int64 NumPy array, got " +
+                             std::to_string(a.ndim()) + "-D " + py::str(a.dtype()).cast<std::string>());
+    auto c = py::array_t<std::int64_t, py::array::c_style | py::array::forcecast>::ensure(a);
+    qt::IVec v(static_cast<Eigen::Index>(c.size()));
+    for (py::ssize_t i = 0; i < c.size(); ++i) v(static_cast<Eigen::Index>(i)) = c.data()[i];
+    return v;
+}
+inline py::array own_ivec(py::handle h, const char* name) {
+    const bool ok = py::isinstance<py::array>(h) && [&] {
+        py::array a = py::reinterpret_borrow<py::array>(h);
+        return a.dtype().kind() == 'i' && a.dtype().itemsize() == 8 && a.ndim() == 1 &&
+               (a.flags() & py::array::c_style) && a.writeable();
+    }();
+    if (!ok)
+        throw py::type_error(std::string("'") + name + "' is modified in place, so it must be a writeable, "
+                             "C-contiguous 1-D int64 NumPy array, got " + type_name(h));
+    return py::reinterpret_borrow<py::array>(h);
+}
+inline void ivec_back(py::array& a, const qt::IVec& v) {
+    if (static_cast<py::ssize_t>(v.size()) != a.size()) throw py::value_error("an array modified in place changed size");
+    if (v.size() > 0) std::memcpy(a.mutable_data(), v.data(), sizeof(long long) * static_cast<std::size_t>(v.size()));
+}
+}  // namespace qtb
+
+namespace pybind11 {
+namespace detail {
+// a qt::IVec comes back to Python as an int64 array (np.int64 elements, as NumPy's own)
+template <>
+struct type_caster<qt::IVec> {
+    PYBIND11_TYPE_CASTER(qt::IVec, const_name("numpy.ndarray[int64]"));
+    bool load(handle src, bool) {
+        if (!isinstance<array>(src)) return false;
+        array a = reinterpret_borrow<array>(src);
+        if (a.ndim() != 1 || !(a.dtype().kind() == 'i' && a.dtype().itemsize() == 8)) return false;
+        value = qtb::ivec_arg(src, "");
+        return true;
+    }
+    static handle cast(const qt::IVec& v, return_value_policy, handle) {
+        array_t<std::int64_t> out(static_cast<ssize_t>(v.size()));
+        for (Eigen::Index i = 0; i < v.size(); ++i) out.mutable_data()[i] = static_cast<std::int64_t>(v(i));
+        return out.release();
+    }
+};
+}  // namespace detail
+}  // namespace pybind11
+
+namespace qtb {
 // --- arrays modified in place --------------------------------------------------------------------
 inline py::array own_array(py::handle h, const char* name, int ndim) {
     const bool ok = py::isinstance<py::array>(h) && [&] {
@@ -373,7 +427,9 @@ inline qt::Rng rng_in(py::handle gen, const char* name) {
     const py::int_ mask(0xFFFFFFFFFFFFFFFFULL), shift(64);
     auto hi = [&](const py::int_& v) { return py::reinterpret_steal<py::object>(PyNumber_Rshift(v.ptr(), shift.ptr())).cast<std::uint64_t>(); };
     auto lo = [&](const py::int_& v) { return py::reinterpret_steal<py::object>(PyNumber_And(v.ptr(), mask.ptr())).cast<std::uint64_t>(); };
-    return qt::Rng::from_state(hi(state), lo(state), hi(inc), lo(inc));
+    qt::Rng g = qt::Rng::from_state(hi(state), lo(state), hi(inc), lo(inc));
+    g.set_uint32(st["has_uint32"].cast<int>() != 0, st["uinteger"].cast<std::uint32_t>());  // integers()'s half word
+    return g;
 }
 
 inline py::object join128(std::uint64_t hi, std::uint64_t lo) {
@@ -391,7 +447,9 @@ inline void rng_back(py::handle gen, const qt::Rng& g) {
     py::dict s;
     s["state"] = join128(w[0], w[1]);
     s["inc"] = join128(w[2], w[3]);
-    st["state"] = s;  // has_uint32 / uinteger stay: qt::Rng draws only 64-bit words, as NumPy does here
+    st["state"] = s;
+    st["has_uint32"] = g.has_uint32() ? 1 : 0;  // the half word integers() keeps for its next 32-bit draw
+    st["uinteger"] = g.uinteger();
     bitgen.attr("state") = st;
 }
 
@@ -408,7 +466,9 @@ inline void rng_field_back(py::handle o, const char* name, const qt::Rng& g, boo
         std::uint64_t a[4], b[4];
         g.state_words(a);
         rng_in(cur, name).state_words(b);
-        if (std::memcmp(a, b, sizeof a) == 0) return;  // no draws: the object keeps its generator
+        const qt::Rng c = rng_in(cur, name);
+        if (std::memcmp(a, b, sizeof a) == 0 && c.has_uint32() == g.has_uint32() && c.uinteger() == g.uinteger())
+            return;  // no draws: the object keeps its generator
         if (!rebind) {
             rng_back(cur, g);
             return;

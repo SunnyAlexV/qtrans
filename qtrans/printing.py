@@ -26,7 +26,7 @@ from .structs import THIS
 from .errors import Unsupported
 from .origins import NP, PY
 from .types import (ArrayType, DictType, ExcType, BOOL, FLOAT, INT, NONE, RNG, STR, VOID, ListType, MaskType, OptionalType, Scalar, StructType,
-                    TupleType, is_array)
+                    TupleType, is_array, is_arraylike)
 
 _SAMPLE = {"float": 1.5, "int": 7, "bool": True}  # a value of each type, to try a format spec on
 _PERCENT = re.compile(r"%(?:\((\w*)\))?([-+ 0#]*)(\*|\d+)?(?:\.(\*|\d*))?[hlL]?([diouxXeEfFgGcrsa%])")
@@ -497,7 +497,7 @@ class TextOps:
         if t == BOOL:
             c = f"({e.code} ? \"True\" : \"False\")"
             return Piece(code=c, stream=c, std=False)
-        if isinstance(t, OptionalType) and isinstance(t.inner, Scalar) or is_array(t):
+        if isinstance(t, OptionalType) and isinstance(t.inner, Scalar) or is_arraylike(t):
             c = f"qt::py::str({e.code})"
             return Piece(code=c, stream=c)
         if isinstance(t, (TupleType, ListType, DictType)):
@@ -530,7 +530,7 @@ class TextOps:
             self._scalar_origin(node, t.inner, "repr", allow_np=False)
             c = f"qt::py::repr({e.code})"
             return Piece(code=c, stream=c)
-        if is_array(t):
+        if is_arraylike(t):
             c = f"qt::py::repr({e.code})"
             return Piece(code=c, stream=c)
         if isinstance(t, StructType):

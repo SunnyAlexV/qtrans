@@ -19,7 +19,7 @@ import ast
 from .core import SIZE_IV, dims_of, int_token, same_dim
 from .core import P_ADD, P_ATOM, P_EQ, P_MUL, P_REL, P_UNARY, Expr, wrap
 from .errors import Unsupported
-from .types import BOOL, FLOAT, INT, MAT, RNG, VEC, ArrayType, MaskType, Scalar, StructType, TupleType, is_array
+from .types import BOOL, FLOAT, INT, IVEC, MAT, RNG, VEC, ArrayType, MaskType, Scalar, StructType, TupleType, is_array, is_iarray
 
 _ARITH = {ast.Add: ("+", P_ADD), ast.Sub: ("-", P_ADD), ast.Mult: ("*", P_MUL), ast.Div: ("/", P_MUL)}
 _CMP = {ast.Lt: ("<", P_REL), ast.LtE: ("<=", P_REL), ast.Gt: (">", P_REL), ast.GtE: (">=", P_REL),
@@ -268,7 +268,7 @@ class ArrayOps:
                 raise Unsupported(node, "tuples can only be indexed with a constant in range")
             k %= len(B.type.elts)
             return Expr(f"std::get<{k}>({B.code})", P_ATOM, B.type.elts[k])
-        if not is_array(B.type):
+        if not (is_array(B.type) or is_iarray(B.type)):
             raise Unsupported(node, "indexing / subscripts are only supported on arrays",
                               "lists and dicts are not supported")
         named = _is_named(base_node)  # a variable or a field of one: safe to name twice
@@ -280,7 +280,15 @@ class ArrayOps:
         if len(parts) == 1 and not isinstance(parts[0], ast.Slice):
             M = self.expr(parts[0])
             if isinstance(M, Expr) and isinstance(M.type, MaskType):
+                if is_iarray(B.type):
+                    raise Unsupported(node, "a mask into an int array is not supported yet")
                 return self._mask_subscript(node, B, M, target)
+            if isinstance(M, Expr) and is_iarray(M.type):  # x[idx]: the elements at those positions, a new array
+                if target:
+                    raise Unsupported(node, "assigning through an index array (x[idx] = ...) is not supported yet")
+                if B.type == MAT:
+                    return Expr(f"qt::take_rows({B.code}, {M.code})", P_ATOM, MAT)
+                return Expr(f"qt::take({B.code}, {M.code})", P_ATOM, B.type)
         if B.type == VEC and len(parts) == 2 and any(self._is_newaxis(q) for q in parts):
             if target:
                 raise Unsupported(node, "assigning through a new axis (v[:, None] = ...) is not supported")
@@ -294,16 +302,20 @@ class ArrayOps:
         if any(slices) and not named:
             raise Unsupported(node, "slicing an expression", "store the array in a variable, then slice it")
 
-        if B.type == VEC:
+        if B.type == VEC or is_iarray(B.type):
             if len(parts) != 1:
                 raise Unsupported(node, "too many indices for a 1-D array")
             if slices[0]:
                 code = self._slice(B.code, parts[0])
+                if is_iarray(B.type):
+                    if target:
+                        raise Unsupported(node, "assigning into a slice of an int array is not supported yet")
+                    return Expr(code, P_ATOM, IVEC)
                 d = (self._slice_token(dims_of(B)[0], parts[0]),)
                 self._last_target_dims = d
                 return (code, "vec") if target else Expr(code, P_ATOM, VEC, dims=d)
             code = f"{b}({self._index(parts[0], f'{b}.size()', named)})"
-            return (code, "scalar") if target else Expr(code, P_ATOM, FLOAT)
+            return (code, "scalar") if target else Expr(code, P_ATOM, INT if is_iarray(B.type) else FLOAT)
 
         # Mat
         if len(parts) == 1:
@@ -422,9 +434,12 @@ class ArrayOps:
         if name == "copy" and not args:
             return Expr(B.code, B.prec, B.type, dims=B.dims)
         if name == "astype":
+            if len(node.args) == 1 and not node.keywords and B.type == VEC and ast.unparse(node.args[0]) in (
+                    "int", "np.int64", "numpy.int64", "'int64'", '"int64"'):
+                return Expr(f"qt::astype_int({B.code})", P_ATOM, IVEC)  # toward zero, as NumPy's cast
             if len(node.args) != 1 or node.keywords or ast.unparse(node.args[0]) not in (
                     "float", "np.float64", "numpy.float64", "'float64'", '"float64"'):
-                raise Unsupported(node, "only .astype(float) is supported (arrays are float64)")
+                raise Unsupported(node, "only .astype(float), and .astype(int) of a 1-D array, are supported")
             return Expr(B.code, B.prec, B.type, dims=B.dims)  # a copy, as astype makes
         if name in ("ravel", "flatten") and not node.args and not node.keywords:
             return Expr(f"qt::ravel({B.code})", P_ATOM, VEC) if B.type == MAT else Expr(B.code, B.prec, VEC, dims=B.dims)
@@ -544,46 +559,82 @@ class ArrayOps:
         self._last_shape_tokens = tuple(toks)
         return dims
 
-    def _check_dtype(self, node):
+    def _check_dtype(self, node, ints=False):
+        """The dtype= keyword: "float" (or not given: None), "int" where `ints`; else refused."""
+        kind = None
         for k in node.keywords:
             if k.arg == "dtype":
-                if ast.unparse(k.value) not in ("float", "np.float64", "numpy.float64"):
-                    raise Unsupported(node, "only float64 arrays are supported in stage 2")
+                src = ast.unparse(k.value)
+                if src in ("float", "np.float64", "numpy.float64"):
+                    kind = "float"
+                elif ints and src in ("int", "np.int64", "numpy.int64"):
+                    kind = "int"
+                else:
+                    raise Unsupported(node, "only float64 and int64 arrays are supported" if ints else
+                                            "only float64 arrays are supported here")
             else:
                 raise Unsupported(node, f"keyword '{k.arg}' is not supported here")
+        return kind
 
     def array_literal(self, node, src) -> Expr:
         """np.array([a, b, c]) / np.array([[..], [..]]) / np.array(existing_array)."""
-        self._check_dtype(node)
+        kind = self._check_dtype(node, ints=True)
         if len(node.args) != 1:
             raise Unsupported(node, f"{src}() takes one argument here")
         a = node.args[0]
         if isinstance(a, (ast.List, ast.Tuple)):
             if a.elts and all(isinstance(e, (ast.List, ast.Tuple)) for e in a.elts):
+                if kind == "int" or (kind is None and all(self.expr(x).type in (INT, BOOL) for r in a.elts for x in r.elts)):
+                    raise Unsupported(node, "a 2-D int array is not supported yet",
+                                      "write the numbers as floats (1.0), or use dtype=float")
                 rows = []
                 for row in a.elts:
                     rows.append("{" + ", ".join(self._scalar_operand(self.expr(e), e).code for e in row.elts) + "}")
                 widths = {len(r.elts) for r in a.elts}
                 cols = ("lit", widths.pop()) if len(widths) == 1 else None
                 return Expr(f"qt::mat({{{', '.join(rows)}}})", P_ATOM, MAT, dims=(("lit", len(a.elts)), cols))
-            vals = [self._scalar_operand(self.expr(e), e).code for e in a.elts]
+            items = [self.expr(e) for e in a.elts]
+            if (kind == "int" or (kind is None and items and all(x.type in (INT, BOOL) for x in items))) \
+                    and not any(x.type == BOOL for x in items):
+                if any(x.type not in (INT, BOOL) for x in items):
+                    raise Unsupported(node, "np.array of floats with dtype=int is not supported", "use .astype(int)")
+                return Expr(f"qt::ivec({{{', '.join(self.as_type(x, INT).code for x in items)}}})", P_ATOM, IVEC)
+            if kind is None and items and all(x.type == BOOL for x in items):
+                raise Unsupported(node, "np.array of bools makes a bool array, which is not supported here")
+            vals = [self._scalar_operand(x, e).code for x, e in zip(items, a.elts)]
             return Expr(f"qt::vec({{{', '.join(vals)}}})", P_ATOM, VEC, dims=(("lit", len(vals)),))
         e = self.expr(a)
+        if is_iarray(e.type):
+            return self.int_array_call(node, "numpy.asarray", [e])
         self._need_array(e, node, f"{src}()")
+        if kind == "int":
+            raise Unsupported(node, f"{src}(x, dtype=int) of a float array is not supported", "use x.astype(int)")
         return Expr(e.code, e.prec, e.type, dims=e.dims)  # a copy, as np.array(x) makes
 
     def array_call(self, node, qual, args, kws) -> Expr:
         src = ast.unparse(node.func)
         if qual in ("numpy.zeros", "numpy.ones"):
-            self._check_dtype(node)
+            kind = self._check_dtype(node, ints=True)
             dims = self._shape_args(node, node.args[0])
             fn = qual.split(".")[1]
+            if kind == "int":
+                if len(dims) != 1:
+                    raise Unsupported(node, "a 2-D int array is not supported yet")
+                return Expr(f"qt::i{fn}({dims[0]})", P_ATOM, IVEC)
             return Expr(f"qt::{fn}({', '.join(dims)})", P_ATOM, VEC if len(dims) == 1 else MAT,
                         dims=self._last_shape_tokens)
         if qual == "numpy.full":
-            self._check_dtype(node)
+            kind = self._check_dtype(node, ints=True)
             dims = self._shape_args(node, node.args[0])
             toks = self._last_shape_tokens
+            if args[1].type == BOOL and kind is None:
+                raise Unsupported(node, "np.full with True / False makes a bool array, which is not supported here")
+            if kind == "int" or (kind is None and args[1].type == INT):  # np.full(n, 3) is an int64 array
+                if len(dims) != 1:
+                    raise Unsupported(node, "a 2-D int array is not supported yet", "fill with a float: 3.0")
+                if args[1].type not in (INT, BOOL):
+                    raise Unsupported(node, "np.full(n, x, dtype=int) of a float x is not supported")
+                return Expr(f"qt::ifull({dims[0]}, {self.as_type(args[1], INT).code})", P_ATOM, IVEC)
             v = self._scalar_operand(args[1], node.args[1])
             return Expr(f"qt::full({', '.join(dims)}, {v.code})", P_ATOM, VEC if len(dims) == 1 else MAT, dims=toks)
         if qual in ("numpy.eye", "numpy.identity"):
@@ -606,10 +657,13 @@ class ArrayOps:
             return Expr(f"qt::linspace({', '.join(parts)})", P_ATOM, VEC,
                         dims=(int_token(num) if num is not None else ("lit", 50),))
         if qual == "numpy.arange":
-            self._check_dtype(node)
+            kind = self._check_dtype(node, ints=True)
             if not 1 <= len(args) <= 3:
                 raise Unsupported(node, "arange takes 1 to 3 arguments")
-            self.note("arange", "np.arange of ints is stored as doubles (exact for |values| < 2^53)")
+            if kind == "int" or (kind is None and all(a.type in (INT, BOOL) for a in args)):
+                if any(a.type not in (INT, BOOL) for a in args):
+                    raise Unsupported(node, "np.arange of floats with dtype=int is not supported")
+                return Expr(f"qt::iarange({', '.join(self.as_type(a, INT).code for a in args)})", P_ATOM, IVEC)
             return Expr(f"qt::arange({', '.join(self._scalar_operand(a, node).code for a in args)})", P_ATOM, VEC)
         if qual in ("numpy.array", "numpy.asarray"):
             return self.array_literal(node, src)
@@ -879,12 +933,56 @@ class ArrayOps:
                                     "are not supported)")
         return Expr(f"qt::Rng({seed.code})", P_ATOM, RNG)
 
+    def rng_integers(self, node, R: Expr) -> Expr:
+        """rng.integers(low, high=None, size=None): NumPy's int64 draws (Lemire's method), an
+        np.int64 or, with size=n, an int array."""
+        params = ["low", "high", "size"]
+        if len(node.args) > 3:
+            raise Unsupported(node, "Generator.integers() takes at most 3 positional arguments here")
+        bound = dict(zip(params, node.args))
+        for k in node.keywords:
+            if k.arg == "dtype":
+                if ast.unparse(k.value) not in ("int", "np.int64", "numpy.int64"):
+                    raise Unsupported(node, "only int64 draws are supported")
+                continue
+            if k.arg == "endpoint":
+                if isinstance(k.value, ast.Constant) and k.value.value is False:
+                    continue
+                raise Unsupported(node, "integers(..., endpoint=True) is not supported yet", "use high + 1")
+            if k.arg not in params or k.arg in bound:
+                raise Unsupported(node, f"unsupported argument '{k.arg}' for Generator.integers()")
+            bound[k.arg] = k.value
+        if "low" not in bound:
+            raise Unsupported(node, "Generator.integers() needs low (Python raises TypeError)")
+
+        def int_of(n, what):
+            e = self.expr(n)
+            if e.type not in (INT, BOOL):
+                raise Unsupported(n, f"{what} of Generator.integers() must be an int here (array bounds are not "
+                                     "supported)")
+            return self.int_arg(e).code
+        parts = [int_of(bound["low"], "low")]
+        high = bound.get("high")
+        if high is not None and not (isinstance(high, ast.Constant) and high.value is None):
+            parts.append(int_of(high, "high"))
+        size = bound.get("size")
+        if size is None or (isinstance(size, ast.Constant) and size.value is None):
+            return Expr(f"{wrap(R, P_ATOM)}.integers({', '.join(parts)})", P_ATOM, INT)
+        dims = self._shape_args(node, size)
+        if len(dims) != 1:
+            raise Unsupported(node, "a 2-D array of integers is not supported yet")
+        if len(parts) == 1:
+            parts = ["0", parts[0]]  # integers(high, size=n): [0, high)
+        return Expr(f"{wrap(R, P_ATOM)}.integers({', '.join(parts + dims)})", P_ATOM, IVEC)
+
     def rng_method(self, node, R: Expr, name: str) -> Expr:
         """rng.random / standard_normal / normal / uniform, with NumPy's argument order and
         defaults; size=None gives a float, an int a Vec, a pair a Mat (filled row by row)."""
+        if name == "integers":
+            return self.rng_integers(node, R)
         if name not in _RNG_METHODS:
             raise Unsupported(node, f"Generator.{name}() is not supported in stage 3",
-                              "supported: random, standard_normal, normal, uniform")
+                              "supported: random, standard_normal, normal, uniform, integers")
         params = [p for p, _ in _RNG_METHODS[name]] + ["size"]
         if len(node.args) > len(params):
             raise Unsupported(node, f"Generator.{name}() takes at most {len(params)} positional arguments")

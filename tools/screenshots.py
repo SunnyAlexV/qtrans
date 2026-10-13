@@ -21,6 +21,9 @@ DEMO = '''"""A small pricing script: what qtrans is for."""
 import math
 import random
 
+import numpy as np
+from qtrans.typing import Vec
+
 RATE = 0.05
 
 
@@ -60,6 +63,12 @@ def mc_value(p: Payoff, s0: float, vol: float, n: int) -> float:
     return total / n
 
 
+def bootstrap_mean(x: Vec, seed: int) -> float:
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(x), size=len(x))  # int64 indexes, as NumPy draws them
+    return float(x[idx].mean())
+
+
 def safe_ratio(a: float, b: float) -> float:
     try:
         return a / b
@@ -73,6 +82,7 @@ book: list[Payoff] = [Call(100.0), Put(95.0)]
 for p in book:
     print(type(p).__name__, round(mc_value(p, 100.0, 0.2, 1000), 4))
 print("annuity(10) =", round(annuity(10), 6))
+print("bootstrap:", bootstrap_mean(np.linspace(90.0, 110.0, 50), 3))
 print(safe_ratio(1.0, 4.0), safe_ratio(1.0, 0.0))
 '''
 
@@ -162,6 +172,10 @@ def main(out_dir):
         page.wait_for_timeout(400)
         page.screenshot(path=str(out / "2b_live_program_main.png"))
         shots.append("2b_live_program_main.png")
+        page.evaluate(f"goToLine({_line('x[idx].mean()')})")  # int arrays: the bootstrap's gather
+        page.wait_for_timeout(400)
+        page.screenshot(path=str(out / "2c_live_int_arrays.png"))
+        shots.append("2c_live_int_arrays.png")
         page.click("#verify")
         page.wait_for_function("document.querySelector('#why #closeverify') !== null", timeout=300000)
         page.wait_for_timeout(300)

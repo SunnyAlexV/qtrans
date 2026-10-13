@@ -28,7 +28,7 @@ from .types import VEC as VEC_T
 from .types import RNG, STR, DictType, ListType
 from .lists import list_elem_ok
 from .types import (BOOL, FLOAT, INT, MAT, NONE, VOID, ArrayType, MaskType, OptionalType, Scalar, StructType,
-                    TupleType, assignable, is_array, join)
+                    TupleType, IVEC, assignable, is_array, is_arraylike, is_iarray, join)
 
 _STATEMENT_MESSAGES = {
     "FunctionDef": ("nested functions", "move the function to module level"),
@@ -71,12 +71,12 @@ def view_root(node, types, mod=None):
         t = types.get(node.id)
         if isinstance(t, StructType) and t.ref:
             return None  # behind a shared_ptr: C++ shares it on assignment too, as Python does
-        if is_array(t) or (mod is not None and isinstance(t, StructType) and not mod.immutable(t)):
+        if is_arraylike(t) or (mod is not None and isinstance(t, StructType) and not mod.immutable(t)):
             return node.id
         return None
     if isinstance(node, ast.Attribute) and node.attr != "T" and mod is not None:
         t = _chain_type(node, types, mod)
-        if is_array(t) or (isinstance(t, StructType) and not t.ref and not mod.immutable(t)):
+        if is_arraylike(t) or (isinstance(t, StructType) and not t.ref and not mod.immutable(t)):
             return subscript_root(node)  # obj.w is obj's own array
     if isinstance(node, ast.Attribute) and node.attr == "T":
         return view_root(node.value, types, mod)
@@ -998,6 +998,8 @@ class FunctionTranslator(ExprTranslator):
             if t.key is None:
                 raise _Unknown(name) if self.inferring else Unsupported(it, "the dict's key type is not known")
             return t.key
+        if is_iarray(t):
+            return INT
         return FLOAT
 
     @staticmethod
@@ -1319,7 +1321,7 @@ class FunctionTranslator(ExprTranslator):
         if self.has_self:
             types["self"] = self.owner.type
         arrays = {n for n, t in types.items()
-                  if is_array(t) or (isinstance(t, StructType) and not self.mod.immutable(t))}
+                  if is_arraylike(t) or (isinstance(t, StructType) and not self.mod.immutable(t))}
         if not arrays:
             return
         mutated = set()
@@ -2117,6 +2119,19 @@ class FunctionTranslator(ExprTranslator):
                                  "an element it has already overwritten)",
                               f"write `{ast.unparse(value_node)}.copy()` for the usual meaning")
         v = self.expr(value_node)
+        if is_iarray(lt):  # an element of an int array: NumPy converts a float to int64 on the way in
+            if kind != "scalar":
+                raise Unsupported(s, "storing into part of an int array is not supported yet")
+            self.need_scalar(v, value_node, "the value stored into an int array")
+            val = self.as_type(v, INT).code if v.type in (INT, BOOL) else f"qt::to_int64({self.as_double(v).code})"
+            ops = {"=": None, "+=": "wrap_add", "-=": "wrap_sub", "*=": "wrap_mul"}
+            if sym not in ops:
+                raise Unsupported(s, f"{sym} on an element of an int array is not supported "
+                                     "(NumPy can't store a float result in it)")
+            if v.type == FLOAT and sym != "=":
+                raise Unsupported(s, f"{sym} with a float on an int array element is not supported")
+            self.emit(f"{code} = {val};" if ops[sym] is None else f"{code} = qt::ia::{ops[sym]}({code}, {val});")
+            return
         if kind == "mask":
             base, mask = code
             if is_array(v.type):
@@ -2561,6 +2576,12 @@ class FunctionTranslator(ExprTranslator):
                         for b in s.body for n in ast.walk(b)):
                     decl = f"const {decl}&"  # the pointer itself is not copied (the object never is)
                 self.emit(f"for ({decl} {self.ident(s.target.id)} : {arr.code}) {{")
+                self._block(s.body)
+                self.emit("}")
+                return
+            if is_iarray(arr.type):  # its elements: NumPy int64s
+                src = arr.code if arr.simple else f"qt::IVec({arr.code})"
+                self.emit(f"for (long long {self.ident(s.target.id)} : {src}) {{")
                 self._block(s.body)
                 self.emit("}")
                 return

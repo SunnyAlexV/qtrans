@@ -58,7 +58,7 @@ import numpy as np
 
 from . import verify as V
 from .translator import ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, VERSION, TranslationResult, translate_file
-from .types import (ListType, DictType, BOOL, FLOAT, INT, MAT, RNG, STR, VEC, ArrayType, OptionalType, Scalar, StructType, TupleType,
+from .types import (ListType, DictType, BOOL, FLOAT, INT, IVEC, MAT, RNG, STR, VEC, ArrayType, IntArrayType, OptionalType, Scalar, StructType, TupleType,
                     VoidType)
 
 PYBIND_HEADER = Path(__file__).parent / "runtime" / "qtrans_pybind.hpp"
@@ -75,7 +75,7 @@ def _desc(t) -> str:
     if isinstance(t, StructType):
         return _article(t.name)
     return {FLOAT: "a float", INT: "an int", BOOL: "a bool", STR: "a str", VEC: "a 1-D float array",
-            MAT: "a 2-D float array", RNG: "a numpy Generator"}.get(t, str(t))
+            MAT: "a 2-D float array", RNG: "a numpy Generator", IVEC: "a 1-D int64 array"}.get(t, str(t))
 
 
 def _article(name: str) -> str:
@@ -85,7 +85,7 @@ def _article(name: str) -> str:
 def _is_leafy(t) -> bool:
     """Can a value of type t hold memory the function could share with another argument?"""
     inner = t.inner if isinstance(t, OptionalType) else t
-    return isinstance(inner, (ArrayType, StructType)) or inner == RNG
+    return isinstance(inner, (ArrayType, StructType, IntArrayType)) or inner == RNG
 
 
 def _native(t) -> bool:
@@ -286,6 +286,15 @@ class Binder:
                 w.args.append(v)
             else:
                 w.pre.append(f"{t.cpp()} {v} = qtb::array_arg<{t.cpp()}>({o}, {_cstr(p.name)}, {_cstr(_desc(t))});")
+                w.args.append(f"std::move({v})" if p.mode == "value" else v)
+        elif isinstance(t, IntArrayType):
+            if modified:
+                w.pre.append(f"py::array {v}_arr = qtb::own_ivec({o}, {_cstr(p.name)});")
+                w.pre.append(f"qt::IVec {v} = qtb::ivec_arg({v}_arr, {_cstr(p.name)});")
+                w.post.append(f"qtb::ivec_back({v}_arr, {v});")
+                w.args.append(v)
+            else:
+                w.pre.append(f"qt::IVec {v} = qtb::ivec_arg({o}, {_cstr(p.name)});")
                 w.args.append(f"std::move({v})" if p.mode == "value" else v)
         elif t == RNG:
             w.pre.append(f"qt::Rng {v} = qtb::rng_in({o}, {_cstr(p.name)});")
@@ -1012,7 +1021,7 @@ def _trace(args, snap):
     and what does that old object contain now?"""
     def key(x):
         if isinstance(x, np.random.Generator):
-            return int(copy.deepcopy(x).bit_generator.random_raw())
+            return V.rng_fingerprint(copy.deepcopy(x))
         return x.tobytes() + str(x.shape).encode() if isinstance(x, np.ndarray) else None
 
     out = []
@@ -1092,7 +1101,7 @@ def _result(fn, args, sig_params, ret, ref_idx):
     refs = []
     for i in ref_idx:
         a = args[i]
-        refs.append(int(copy.deepcopy(a).bit_generator.random_raw()) if isinstance(a, np.random.Generator) else a)
+        refs.append(V.rng_fingerprint(copy.deepcopy(a)) if isinstance(a, np.random.Generator) else a)
     vals = [] if isinstance(ret, VoidType) else (list(v) if isinstance(ret, TupleType) else [v])
     if isinstance(ret, TupleType) and (not isinstance(v, tuple) or len(v) != len(ret.elts)):
         return ("ok", v), None

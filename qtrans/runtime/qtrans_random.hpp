@@ -377,6 +377,42 @@ public:
         return (x >> rot) | (x << ((64u - rot) & 63u));
     }
 
+    // PCG64's 32-bit output: the low half of a 64-bit one, the high half kept for the next
+    // call (bit_generator.state["has_uint32"] and ["uinteger"]).
+    std::uint32_t next_uint32() {
+        if (has_uint32_) {
+            has_uint32_ = false;
+            return uinteger_;
+        }
+        const std::uint64_t next = next_uint64();
+        has_uint32_ = true;
+        uinteger_ = static_cast<std::uint32_t>(next >> 32);
+        return static_cast<std::uint32_t>(next & 0xffffffffULL);
+    }
+    bool has_uint32() const { return has_uint32_; }
+    std::uint32_t uinteger() const { return uinteger_; }
+    void set_uint32(bool has, std::uint32_t value) {
+        has_uint32_ = has;
+        uinteger_ = value;
+    }
+
+    // Generator.integers(low, high): int64 in [low, high), NumPy's way (Lemire's method, on
+    // 32-bit draws when the range fits in 32 bits).
+    long long integers(long long low, long long high) {
+        check_bounds(low, high);
+        return bounded(low, static_cast<std::uint64_t>(high) - 1 - static_cast<std::uint64_t>(low));
+    }
+    long long integers(long long high) { return integers(0, high); }  // integers(high): [0, high)
+    IVec integers(long long low, long long high, long long n) {
+        check_dim(n);
+        if (n == 0) return IVec(0);  // (NumPy checks the bounds only when it draws)
+        check_bounds(low, high);
+        const std::uint64_t rng = static_cast<std::uint64_t>(high) - 1 - static_cast<std::uint64_t>(low);
+        IVec out(n);
+        for (Index i = 0; i < n; ++i) out(i) = bounded(low, rng);
+        return out;
+    }
+
     // Generator.random(): uniform on [0, 1) with 53 random bits.
     double random() { return static_cast<double>(next_uint64() >> 11) * (1.0 / 9007199254740992.0); }
 
@@ -441,6 +477,53 @@ public:
 
 private:
     detail::U128 state_{0, 0}, inc_{0, 0};
+    bool has_uint32_ = false;
+    std::uint32_t uinteger_ = 0;
+
+    static void check_bounds(long long low, long long high) {  // (NumPy's words: "high <= 0" when low is 0)
+        if (low >= high) throw ValueError(low == 0 ? "high <= 0" : "low >= high");
+    }
+
+    // off + a draw in [0, rng]: random_bounded_uint64 (distributions.c), with use_masked false
+    long long bounded(long long off, std::uint64_t rng) {
+        std::uint64_t r;
+        if (rng == 0) {
+            r = 0;
+        } else if (rng <= 0xFFFFFFFFULL) {
+            if (rng == 0xFFFFFFFFULL) {
+                r = next_uint32();
+            } else {  // buffered_bounded_lemire_uint32
+                const std::uint32_t rng32 = static_cast<std::uint32_t>(rng), excl = rng32 + 1;
+                std::uint64_t m = static_cast<std::uint64_t>(next_uint32()) * excl;
+                std::uint32_t leftover = static_cast<std::uint32_t>(m & 0xFFFFFFFFULL);
+                if (leftover < excl) {
+                    const std::uint32_t threshold = (0xFFFFFFFFU - rng32) % excl;
+                    while (leftover < threshold) {
+                        m = static_cast<std::uint64_t>(next_uint32()) * excl;
+                        leftover = static_cast<std::uint32_t>(m & 0xFFFFFFFFULL);
+                    }
+                }
+                r = m >> 32;
+            }
+        } else if (rng == 0xFFFFFFFFFFFFFFFFULL) {
+            r = next_uint64();
+        } else {  // bounded_lemire_uint64
+            const std::uint64_t excl = rng + 1;
+            std::uint64_t hi, lo;
+            mul64(next_uint64(), excl, hi, lo);
+            if (lo < excl) {
+                const std::uint64_t threshold = (0xFFFFFFFFFFFFFFFFULL - rng) % excl;
+                while (lo < threshold) mul64(next_uint64(), excl, hi, lo);
+            }
+            r = hi;
+        }
+        return static_cast<long long>(static_cast<std::uint64_t>(off) + r);
+    }
+    static void mul64(std::uint64_t a, std::uint64_t b, std::uint64_t& hi, std::uint64_t& lo) {
+        const detail::U128 p = detail::mul64(a, b);
+        hi = p.hi;
+        lo = p.lo;
+    }
 
     void step() {  // state = state * multiplier + inc  (mod 2^128)
         static constexpr detail::U128 multiplier{2549297995355413924ULL, 4865540595714422341ULL};

@@ -170,7 +170,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (536 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (664 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -446,7 +446,8 @@ makes these passes over each function:
 
 ### Stage 2: arrays
 
-Arrays are annotated `Vec` (1-D) or `Mat` (2-D) from `qtrans.typing`. Plain `np.ndarray`
+Arrays are annotated `Vec` (1-D) or `Mat` (2-D) from `qtrans.typing` (and `IVec` for a 1-D
+int64 array, below). Plain `np.ndarray`
 doesn't say the rank, and C++ needs it. They become Eigen *Arrays* rather than Matrices,
 because Eigen Arrays are elementwise by default, as NumPy is. Matrices are row-major, so
 memory order and flat reductions match NumPy's.
@@ -471,6 +472,33 @@ memory order and flat reductions match NumPy's.
 | `x[x >= c]` selects into a new array; `w[w < 0] = 0` changes only those elements | | `qt::select`, `qt::select_rows`, `qt::masked_update` |
 | `with np.errstate(...)` | | translated as its body: it only changes which warnings NumPy prints |
 
+**Integer arrays.** `np.arange` of ints, `np.zeros(n, dtype=int)`, `np.full(n, 3)`,
+`np.array([1, 2, 3])`, `rng.integers(low, high, size=n)` and `x.astype(int)` are int64 arrays,
+as in NumPy: `IVec` in annotations (`from qtrans.typing import IVec`), `qt::IVec` in C++
+(`Eigen::Array<long long, Dynamic, 1>`). The bootstrap is the case they are for:
+
+```python
+idx = rng.integers(0, n, size=n)          qt::IVec idx = rng.integers(0, n, n);
+means[k] = x[idx].mean()                  means(k) = qt::mean(qt::take(x, idx));
+```
+
+| Python | qtrans |
+|---|---|
+| `rng.integers(low, high, size=n)`: NumPy's Lemire method, on 32-bit draws when the range fits (the other half of a 64-bit output kept for the next draw) | `Rng::integers`, the same draws; the half word is part of the generator's state everywhere it travels (`qtrans verify`, bindings) |
+| `x[idx]` gathers, a negative index counts from the end, an index out of range raises IndexError with NumPy's words | `qt::take`, `qt::take_rows` for `A[idx]` |
+| int64 `+`, `-`, `*`, `sum`, `cumsum` wrap around at 2⁶⁴ without an error | done in unsigned arithmetic (signed overflow is undefined in C++) |
+| `a // 0` and `a % 0` are 0 for int arrays (NumPy warns); `//` and `%` round toward −∞ | `qt::ifloordiv`, `qt::imod` |
+| `/`, a float operand, `np.exp`, `np.mean`, `np.std`, ... make float64 | the int array is converted first (`idx.cast<double>()`), as NumPy converts it |
+| `print(idx)` shows `[ 0  1 10]`, `repr(idx)` `array([0, 1, 10])`, `idx[0]` is an `np.int64` | NumPy's integer format (right-aligned to the widest, summarised past 1,000 elements) |
+| `np.floor(x).astype(int)` truncates; NaN and huge values give what the CPU's conversion gives | `qt::astype_int`, the same per CPU (x86: the smallest int64; ARM: saturated) |
+| `i ** 2`, `2 ** i`, `i ** k` of ints stay int64 and wrap; a negative exponent raises `ValueError` | `qt::ipow` (squaring: a product mod 2⁶⁴ doesn't depend on its order) |
+| `np.arange(5) * 0.5`, `lam ** np.arange(t)` | float64, as in NumPy |
+
+Checked against NumPy: 4,000 `integers` calls (ranges below and above 2³², the full 64-bit range,
+the state afterwards), 3,000 operations and printings with values near ±2⁶³
+(`tests/test_int_arrays.py`). Not supported yet, with the reason: 2-D int arrays, `x[idx] = ...`,
+masks into int arrays, `np.unique`, `np.argsort`, `np.bincount`.
+
 Every rule above has a compiled test (`tests/test_array_semantics.py`). The three that are
 easiest to get wrong were each mutation-tested by switching the rule off and confirming that
 the tests fail: aliasing `.eval()`, negative-index wrapping, and pairwise summation.
@@ -489,7 +517,7 @@ Cython source:
 
 Checked against NumPy on 5 million draws across seeds up to 2⁶³−1, including the rare
 ziggurat tail branch. A one-bit change in that branch makes the tests fail. Supported methods
-are `random`, `standard_normal`, `normal` and `uniform`, with scalar, `n` or `(r, c)` sizes and
+are `random`, `standard_normal`, `normal`, `uniform` and (0.14) `integers`, with scalar, `n` or `(r, c)` sizes and
 NumPy's argument checks (`scale < 0` raises `ValueError`, and so on).
 
 | Python | Difference a naive translation would hit | qtrans |
@@ -1442,7 +1470,11 @@ Each is listed in the per-module report next to the functions it affects.
 
 ## What is supported
 
-- **Types:** `float`, `int`, `bool`, `str`, `Vec`, `Mat`, `np.random.Generator`, `tuple[...]`
+The full contract, section by section, with the refusals and their reasons, is
+[docs/SPEC.md](docs/SPEC.md); its examples are run by the test suite, so it says what qtrans
+does, not what it once did. In short:
+
+- **Types:** `float`, `int`, `bool`, `str`, `Vec`, `Mat`, `IVec` (int64), `np.random.Generator`, `tuple[...]`
   of those, `X | None` (also `Optional[X]`) for a number or array, `@dataclass`, `NamedTuple`
   and plain classes, with single inheritance and abstract bases, `list[...]` of floats, ints,
   strings or objects of a class hierarchy, `dict[...]` with str or int keys, and `-> None`.
@@ -1482,7 +1514,7 @@ Each is listed in the per-module report next to the functions it affects.
     `np.linalg.solve/inv/cholesky/det/eigh/eigvalsh/pinv`.
   - Attributes: `.shape`, `.size`, `.ndim`, `len()`.
 - **Random numbers:** `np.random.default_rng(seed)`, and `Generator.random`,
-  `standard_normal`, `normal` and `uniform`.
+  `standard_normal`, `normal`, `uniform` and `integers`.
 
 Everything else is **refused with a line number and a hint**, and anything that calls a
 refused function is refused too. [`examples/not_yet_supported.py`](https://github.com/SunnyAlexV/qtrans/blob/main/examples/not_yet_supported.py)
@@ -1538,6 +1570,8 @@ qtrans/
   loops.py           enumerate / zip loops rewritten as index loops, before translation
   origins.py         which values are Python's and which NumPy's (they repr and round differently)
   arrays.py          array expressions: arithmetic, broadcasting, indexing, NumPy functions
+  intarrays.py       int64 arrays: NumPy's int arithmetic, gathers, conversion to float64
+  pyrandom.py        Python's random module, as Lib/random.py computes it
   classes.py         @dataclass / NamedTuple: fields, defaults, methods (stage 5)
   structs.py         object expressions: fields, properties, methods, constructors, ==
   core.py, types.py, library.py, report.py, typing.py (Vec, Mat)
@@ -1552,18 +1586,20 @@ qtrans/
   project.py         several modules: imports followed, import order, one header each
   runtime/qtrans_runtime.hpp   scalar helpers (standard library only)
   runtime/qtrans_arrays.hpp    array helpers on Eigen, NumPy algorithms ported
-  runtime/qtrans_random.hpp    NumPy's Generator (SeedSequence + PCG64 + ziggurat)
+  runtime/qtrans_random.hpp    NumPy's Generator (SeedSequence + PCG64 + ziggurat + integers)
+  runtime/qtrans_pyrandom.hpp  Python's random module (Mersenne Twister, seeded as CPython does)
   runtime/qtrans_print.hpp     Python's repr and format mini-language, NumPy's array printing
   runtime/qtrans_list.hpp      lists (indexes, slices, sum, sorted, ...) and dicts, with Python's rules
   runtime/qtrans_pybind.hpp    the bindings' conversions, write-backs and exceptions
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               536 tests: generated text, refusals, compiled semantics, every example,
+tests/               664 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
                      numpy.linalg checked operation by operation
+docs/SPEC.md         the specification; tests/test_spec.py runs its examples
 ci/                  the reference job's pinned packages
 run_examples.py      press-Run entry point
 ```
@@ -1598,8 +1634,10 @@ run_examples.py      press-Run entry point
    hierarchies ([Class hierarchies](#class-hierarchies)), Python's random module and
    `math.fsum` ([Python's random module](#pythons-random-module)), and `x ** 2` made Python's
    again ([What building this turned up](#what-building-this-turned-up)).
-8. **1.0**: integer arrays (the bootstrap), a written specification of the supported
-   subset. After it: the editor inside VS Code, Python line references in the headers, a
+   **0.14**: integer arrays and the bootstrap ([Integer arrays](#stage-2-arrays)), and the
+   written specification of the supported subset ([docs/SPEC.md](docs/SPEC.md)), checked by
+   the tests.
+8. **1.0**: 0.14 with nothing added, once it has passed on every platform. After it: the editor inside VS Code, Python line references in the headers, a
    reproducible benchmark protocol, bindings for class hierarchies and the random module. (Mapping a Python function to existing C++, QuantLib or in-house, is what
    [your own C++](#your-own-c-for-a-function) does since 0.10, verified.) Not planned: pandas,
    all of Python, GPU backends.

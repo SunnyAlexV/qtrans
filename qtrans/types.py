@@ -77,6 +77,23 @@ class ArrayType:
 
 
 @dataclass(frozen=True)
+class IntArrayType:
+    """A NumPy int64 array, 1-D (0.14): np.arange of ints, rng.integers(..., size=n), index
+    arrays. Not an ArrayType: only the operations written for it accept it, so nothing treats
+    it as a float array by accident."""
+    rank: int = 1
+
+    def cpp(self) -> str:
+        return "qt::IVec"
+
+    def zero(self) -> str:
+        return "{}"
+
+    def __str__(self) -> str:
+        return "IVec"
+
+
+@dataclass(frozen=True)
 class MaskType:
     """The bool array from an elementwise comparison (a > 0): used by np.where, .any(), .all(),
     np.sum / count, & | ~. A comparison always makes a new array, so storing one is safe."""
@@ -241,6 +258,7 @@ class ExcType:
 
 VOID = VoidType()
 VEC = ArrayType(1)
+IVEC = IntArrayType(1)
 MAT = ArrayType(2)
 RNG = RngType()
 NONE = NoneValueType()
@@ -255,6 +273,15 @@ def is_scalar(t) -> bool:
 
 def is_array(t) -> bool:
     return isinstance(t, ArrayType)
+
+
+def is_iarray(t) -> bool:
+    return isinstance(t, IntArrayType)
+
+
+def is_arraylike(t) -> bool:
+    """A NumPy array of either kind: what is shared, not copied, by assignment and calls."""
+    return isinstance(t, (ArrayType, IntArrayType))
 
 
 def join(a, b):

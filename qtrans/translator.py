@@ -32,9 +32,9 @@ from .functions import FunctionTranslator, is_docstring, python_reads, source_ma
 from .origins import Origins
 from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
-                    StructType, TupleType, ListType, DictType, assignable, is_array)
+                    StructType, TupleType, ListType, DictType, IVEC, assignable, is_array, is_arraylike)
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -386,13 +386,14 @@ class ModuleTranslator:
             if c.rejected is not None:
                 raise Unsupported(node, f"class {c.name} could not be translated: {c.rejected.message}")
             return c.type
-        elif isinstance(node, ast.Name) and node.id in ("Vec", "Mat") and (
+        elif isinstance(node, ast.Name) and node.id in ("Vec", "Mat", "IVec") and (
                 self.imports.get(node.id) == f"qtrans.typing.{node.id}" or node.id in self.type_aliases):
-            return VEC if node.id == "Vec" else MAT
+            return {"Vec": VEC, "Mat": MAT, "IVec": IVEC}[node.id]
         elif isinstance(node, ast.Attribute):
             q = _ConstTranslator(self).qualify(node)
             m = {"numpy.float64": FLOAT, "numpy.int64": INT, "numpy.bool_": BOOL,
-                 "qtrans.typing.Vec": VEC, "qtrans.typing.Mat": MAT, "numpy.random.Generator": RNG}
+                 "qtrans.typing.Vec": VEC, "qtrans.typing.Mat": MAT, "qtrans.typing.IVec": IVEC,
+                 "numpy.random.Generator": RNG}
             if q in m:
                 return m[q]
         elif isinstance(node, ast.Subscript):
@@ -428,7 +429,7 @@ class ModuleTranslator:
             raise Unsupported(node, f"type annotation '{text}' doesn't say whether the array is 1-D or 2-D",
                               "annotate with Vec (1-D) or Mat (2-D): `from qtrans.typing import Vec, Mat`")
         raise Unsupported(node, f"type annotation '{text}' is not supported",
-                          "use float, int, bool, Vec, Mat, or tuple[...] of those")
+                          "use float, int, bool, Vec, Mat, IVec, or tuple[...] of those")
 
     # --- classes (stage 5) -------------------------------------------------------------
     def _register_class(self, node):
@@ -1040,6 +1041,7 @@ class ModuleTranslator:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 fn_reads |= _global_reads(node)
         self.main_body, self.main_error = [], None
+        self.async_defs = []
         for i, node in enumerate(body):
             if i == 0 and is_docstring(node):
                 self.doc = inspect.cleandoc(node.value.value)
@@ -1077,8 +1079,8 @@ class ModuleTranslator:
             elif isinstance(node, ast.ClassDef):
                 self._register_class(node)
             elif isinstance(node, ast.AsyncFunctionDef):
-                self.report.module_notes.append(f"line {node.lineno}: async function `{node.name}` skipped")
                 self.skipped_globals[node.name] = "it is an async function (coroutines are not supported)"
+                self.async_defs.append(node)
             else:
                 self.report.module_notes.append(f"line {node.lineno}: module-level "
                                                 f"{type(node).__name__} statement skipped")
@@ -1399,7 +1401,7 @@ class ModuleTranslator:
                         continue
                     if len(types) == 1:
                         (t, _), = types.items()
-                        if isinstance(t, (Scalar, ArrayType, StructType)) or t in (STR, RNG):
+                        if isinstance(t, (Scalar, ArrayType, StructType)) or t in (STR, RNG, IVEC):
                             known[name][pname] = t
                             progress = True
                     elif len(types) > 1:
@@ -1482,7 +1484,7 @@ class ModuleTranslator:
                         t = tr0.expr(defaults[p]).type
                     except Unsupported:
                         t = None
-                if t is None or not (isinstance(t, (Scalar, ArrayType, StructType)) or t in (STR, RNG)):
+                if t is None or not (isinstance(t, (Scalar, ArrayType, StructType)) or t in (STR, RNG, IVEC)):
                     return False  # a call whose types aren't known: no version can be chosen for it
                 row.append(t)
             row = tuple(row)
@@ -1709,7 +1711,7 @@ class ModuleTranslator:
 
     def _shareable(self, t) -> bool:
         """Types Python shares rather than copies on assignment and calls."""
-        return is_array(t) or t in (RNG, STR) or _optional_array(t) or isinstance(t, StructType)
+        return is_arraylike(t) or t in (RNG, STR) or _optional_array(t) or isinstance(t, StructType)
 
     def immutable(self, t) -> bool:
         """A frozen object with no array anywhere inside: nothing about it can change. (Frozen
@@ -1874,9 +1876,9 @@ class ModuleTranslator:
                     # the caller's object, and rebinding the name doesn't, both as in Python)
                     p.mode = "value" if p.name in rebound[name] else "cref"  # can't change: never copied
                     continue
-                if not (is_array(p.type) or isinstance(p.type, StructType)):
+                if not (is_arraylike(p.type) or isinstance(p.type, StructType)):
                     continue
-                what = "array" if is_array(p.type) else "object"
+                what = "array" if is_arraylike(p.type) else "object"
                 if p.name in ip and p.name in rebound[name]:
                     self.rejected[name] = Unsupported(
                         self.fdefs[name], f"{what} parameter '{p.name}' is both modified in place and "
@@ -2004,13 +2006,14 @@ class ModuleTranslator:
                 e.missing_annotation = True
                 raise e
             t = given[arg.arg] if arg.annotation is None else self.parse_annotation(arg.annotation)
-            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType, ListType, DictType)) and t != STR:
+            if not isinstance(t, (Scalar, ArrayType, RngType, OptionalType, StructType, ListType, DictType)) and t != STR \
+                    and t != IVEC:
                 raise Unsupported(arg, f"parameter '{arg.arg}': {t} parameters are not supported; "
-                                       "use float, int, bool, Vec, Mat or np.random.Generator")
+                                       "use float, int, bool, Vec, Mat, IVec or np.random.Generator")
             if d is not None and isinstance(t, RngType):
                 raise Unsupported(d, f"generator parameter '{arg.arg}' can't have a default value")
             code = None
-            if d is not None and isinstance(t, (ArrayType, StructType)):
+            if d is not None and (isinstance(t, (ArrayType, StructType)) or t == IVEC):
                 raise Unsupported(d, f"parameter '{arg.arg}' can't have a default {t}: Python creates it once "
                                      "and shares it between calls")
             if d is not None:
@@ -2208,6 +2211,10 @@ class ModuleTranslator:
             else:
                 e = self.rejected[name]
                 self.report.functions.append(FunctionReport(name, f.lineno, False, e.message, e.lineno, e.hint))
+        for node in self.async_defs:
+            self.report.functions.append(FunctionReport(node.name, node.lineno, False, "async functions are not "
+                                                        "supported: calling one gives a coroutine, which C++ has no "
+                                                        "equal of", node.lineno, None))
 
         if self.is_program:
             first = self.main_body[0].lineno if self.main_body else 1
@@ -2353,7 +2360,7 @@ class ModuleTranslator:
             attr = "[[maybe_unused]] " if used_params is not None and p.name not in used_params else ""
             if isinstance(p.type, (ListType, DictType)):
                 ty = f"const {p.type.cpp()}&"  # a function never changes a list passed to it (check_lists)
-            elif is_array(p.type) or p.type in (RNG, STR) or _optional_array(p.type) or isinstance(p.type, StructType):
+            elif is_arraylike(p.type) or p.type in (RNG, STR) or _optional_array(p.type) or isinstance(p.type, StructType):
                 ty = {"cref": f"const {p.type.cpp()}&", "ref": f"{p.type.cpp()}&"}.get(p.mode, p.type.cpp())
             else:
                 ty = p.type.cpp()
@@ -2379,7 +2386,7 @@ class ModuleTranslator:
             while pname in names:
                 pname += "_"
             ty = f.type.cpp()
-            if is_array(f.type) or isinstance(f.type, StructType) or f.type == STR or _optional_array(f.type):
+            if is_arraylike(f.type) or isinstance(f.type, StructType) or f.type == STR or _optional_array(f.type):
                 ty = f"{ty} "  # by value: the object keeps its own copy (see the sharing analysis)
             d = f" = {f.default_code}" if defaults and f.default_code is not None else ""
             out.append((f, pname, f"{ty.strip()} {pname}{d}"))

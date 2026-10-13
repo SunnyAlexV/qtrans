@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.14.0
+
+- **Integer arrays.** `np.arange` of ints, `np.zeros(n, dtype=int)`, `np.ones(n, dtype=int)`,
+  `np.full(n, 3)`, `np.array([1, 2, 3])`, `x.astype(int)` and `rng.integers(..., size=n)` are
+  int64 arrays, as in NumPy (`IVec`, `qt::IVec`), where they were float arrays: they print as
+  NumPy prints int64 arrays, `//` and `%` keep NumPy's int rules (0 for a zero divisor), and
+  `+`, `-`, `*`, `sum` wrap at 2**64. `/`, float operands and the float functions convert first,
+  as NumPy does. `x[idx]` gathers (the bootstrap), `for i in idx:`, `idx[i]`, `idx[a:b]`,
+  `i ** 2`, `2 ** i` (int64, wrapping; a negative exponent raises `ValueError`, as in NumPy),
+  `len`, `.sum()`, `.max()`, `.min()`, `.cumsum()`, `.argmax()`, `.mean()`, `np.sort`, `np.abs`.
+  `IVec` parameters and returns, in `qtrans verify`, `qtrans bind` (int64 NumPy arrays in and
+  out) and `qtrans export`.
+- **`Generator.integers`**, NumPy's draws exactly (Lemire's method on 32-bit draws when the range
+  fits): the generator's state now includes the half word NumPy keeps for its next 32-bit draw,
+  in `qtrans verify`'s comparisons, in objects handed to C++ and in the bindings.
+- Refused, with the reason: 2-D int arrays, `x[idx] = ...`, masks into int arrays,
+  `np.unique`, `np.argsort`, `np.bincount`.
+- **The specification**, `docs/SPEC.md`: what qtrans translates, what the C++ computes, what it
+  refuses, and the differences kept by design, section by section. Its 32 examples are checked by
+  `tests/test_spec.py` (translated with the quoted C++, refused with the quoted reason, or run as
+  programs that must print what Python prints), so the document can't drift from the code.
+- An `async def` is listed in the report as refused, where it was only a note.
+
 ## 0.13.0
 
 - **Class hierarchies.** A class may derive from one class of the same file, plain or

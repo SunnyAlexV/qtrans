@@ -728,8 +728,8 @@ inline void extend_line(std::string& s, std::string& line, const std::string& wo
 }
 
 // _formatArray for rank 1 and 2. get(i, j) reads an element; cols < 0 means a vector.
-template <class Get>
-std::string format_array(Get get, long rows, long cols, const FloatFormat& fmt, const std::string& sep,
+template <class Get, class Fmt>
+std::string format_array(Get get, long rows, long cols, const Fmt& fmt, const std::string& sep,
                          size_t line_width, const std::string& next_prefix, bool summary) {
     const long edge = 3;
     auto row_text = [&](long r, const std::string& hanging, size_t width, long n) {
@@ -775,13 +775,28 @@ std::vector<double> format_sample(Get get, long rows, long cols, bool summary) {
     return v;
 }
 
-template <class Get>
-std::string array_text(Get get, long rows, long cols, bool as_repr) {
+// IntegerFormat: every element right-aligned to the widest of the largest and smallest
+struct IntFormat {
+    size_t width = 0;
+    explicit IntFormat(const std::vector<long long>& data) {  // (the values the summary keeps)
+        if (data.empty()) return;
+        long long mx = std::numeric_limits<long long>::min(), mn = std::numeric_limits<long long>::max();
+        for (long long v : data) { mx = std::max(mx, v); mn = std::min(mn, v); }
+        width = std::max(std::to_string(mx).size(), std::to_string(mn).size());
+    }
+    std::string operator()(long long x) const {
+        std::string t = std::to_string(x);
+        return t.size() < width ? std::string(width - t.size(), ' ') + t : t;
+    }
+};
+
+template <class Fmt, class Get, class Sample>
+std::string array_text_with(Get get, Sample sample, long rows, long cols, bool as_repr, const char* dtype) {
     const long size = cols < 0 ? rows : rows * cols;
     const bool summary = size > 1000;
     std::string lst = "[]";
     if (size) {
-        FloatFormat fmt(format_sample(get, rows, cols, summary));
+        Fmt fmt(sample(summary));
         lst = as_repr ? format_array(get, rows, cols, fmt, ", ", 74, std::string(7, ' '), summary)
                       : format_array(get, rows, cols, fmt, " ", 75, " ", summary);
     }
@@ -791,7 +806,7 @@ std::string array_text(Get get, long rows, long cols, bool as_repr) {
                                        : "(" + std::to_string(rows) + ", " + std::to_string(cols) + ")";
     std::vector<std::string> extras;
     if ((size == 0 && cols >= 0) || summary) extras.push_back("shape=" + shape);
-    if (size == 0) extras.push_back("dtype=float64");
+    if (size == 0) extras.push_back(std::string("dtype=") + dtype);
     if (extras.empty()) return "array(" + lst + ")";
     const std::string arr = "array(" + lst + ",";
     std::string extra;
@@ -803,11 +818,29 @@ std::string array_text(Get get, long rows, long cols, bool as_repr) {
     return arr + spacer + extra;
 }
 
-// a qt::Vec (an Eigen column) or a qt::Mat, or any Eigen expression of one (evaluated once)
+template <class Get>
+std::string array_text(Get get, long rows, long cols, bool as_repr) {
+    return array_text_with<FloatFormat>(get, [&](bool summary) { return format_sample(get, rows, cols, summary); },
+                                        rows, cols, as_repr, "float64");
+}
+
+// a qt::Vec (an Eigen column) or a qt::Mat, or any Eigen expression of one (evaluated once);
+// a qt::IVec prints as NumPy prints int64 arrays: [ 0  1 10]
 template <class A>
 std::string array_str_or_repr(const A& expr, bool as_repr) {
     const auto a = expr.eval();
-    if constexpr (A::ColsAtCompileTime == 1) {
+    if constexpr (std::is_integral_v<typename A::Scalar> && !std::is_same_v<typename A::Scalar, bool>) {
+        const long n = static_cast<long>(a.size());
+        auto get = [&](long, long i) { return static_cast<long long>(a(i)); };
+        auto sample = [&](bool summary) {
+            std::vector<long long> v;
+            auto add = [&](long i) { v.push_back(static_cast<long long>(a(i))); };
+            if (summary && n > 6) { for (long i = 0; i < 3; ++i) add(i); for (long i = n - 3; i < n; ++i) add(i); }
+            else for (long i = 0; i < n; ++i) add(i);
+            return v;
+        };
+        return array_text_with<IntFormat>(get, sample, n, -1, as_repr, "int64");
+    } else if constexpr (A::ColsAtCompileTime == 1) {
         return array_text([&](long, long i) { return static_cast<double>(a(i)); }, static_cast<long>(a.size()), -1, as_repr);
     } else {
         return array_text([&](long i, long j) { return static_cast<double>(a(i, j)); }, static_cast<long>(a.rows()),

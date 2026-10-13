@@ -183,7 +183,7 @@ def test_rejection_propagates_to_callers():
 def test_ints_surely_beyond_64_bits_and_async_calls_are_refused(src, line, words):
     r = translate_source(src, "m", "m.py")
     bad = [f for f in r.report.functions if not f.translated]
-    assert bad and bad[0].reason_line == line and words in bad[0].reason, r.report.to_text()
+    assert any(b.reason_line == line and words in b.reason for b in bad), r.report.to_text()
 
 
 def test_ints_that_fit_stay_plain():
