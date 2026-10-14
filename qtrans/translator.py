@@ -34,7 +34,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, IVEC, assignable, is_array, is_arraylike)
 
-VERSION = "0.14.0"
+VERSION = "1.0.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -43,7 +43,7 @@ GENERAL_NOTES = {"int64", "div0", "powoverflow"}
 RUNTIME_HEADER = Path(__file__).parent / "runtime" / "qtrans_runtime.hpp"
 ARRAYS_HEADER = Path(__file__).parent / "runtime" / "qtrans_arrays.hpp"
 RANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_random.hpp"
-PYRANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_pyrandom.hpp"  # Python's random module (0.14)
+PYRANDOM_HEADER = Path(__file__).parent / "runtime" / "qtrans_pyrandom.hpp"  # Python's random module (0.13)
 PRINT_HEADER = Path(__file__).parent / "runtime" / "qtrans_print.hpp"
 LIST_HEADER = Path(__file__).parent / "runtime" / "qtrans_list.hpp"
 UNICODE_HEADER = unicode_header_path()  # qtrans_list.hpp includes it: this Python's Unicode tables
@@ -91,7 +91,8 @@ class Signature:
     const: bool = False             # a method that doesn't modify self
     module: str | None = None       # imported from this module of the project (multi-module)
     virtual: str = ""               # "virtual" (a subclass overrides it), "override", or "" (0.13)
-    py_random: bool = False         # uses the random module's generator, itself or through a call (0.14)
+    py_random: bool = False         # uses the random module's generator, itself or through a call (0.13)
+    float_errors: bool = False      # raises Python's float errors exactly, itself and in all it calls (1.0)
     abstract: bool = False          # @abstractmethod: declared `= 0`, no body
 
 
@@ -1174,12 +1175,18 @@ class ModuleTranslator:
         return False
 
     def _find_strict(self):
-        """The functions (and the program) whose code can run inside a `try` with a handler for an
-        error a Python float raises where a C++ double carries on (ZeroDivisionError for 1.0 / 0.0,
-        ValueError for math.sqrt(-1), OverflowError for math.exp(1000), ArithmeticError,
-        Exception): those are translated to raise them as Python does. That's the function holding
-        the try, and everything its try block calls, all the way down."""
-        self.strict, self.strict_blockers = set(), {}
+        """The functions (and the program) translated to raise the errors Python's floats raise
+        where a C++ double carries on (ZeroDivisionError for 1.0 / 0.0, ValueError for
+        math.sqrt(-1), OverflowError for math.exp(1000)): since 1.0, all of them, except a function
+        marked `# qtrans: ieee` (or every function, with that hint at the top of the file), which
+        keeps IEEE-754's inf and NaN and is reported as such.
+
+        strict_try: those whose code can run inside a `try` with a handler for one of those errors
+        (the function holding the try, and everything its try block calls, all the way down). There
+        the hint doesn't apply, since an `except` would otherwise take another branch than in
+        Python, and a value that may be a NumPy number on some runs (no error) and a Python float
+        on others is refused rather than left to IEEE."""
+        self.strict, self.strict_try, self.strict_blockers = set(), set(), {}
         bodies = dict(self.fdefs)
         if self.is_program and self.main_body:
             bodies[PROGRAM] = ast.Module(body=list(self.main_body), type_ignores=[])
@@ -1203,27 +1210,180 @@ class ModuleTranslator:
                         ext.append(name)
                 elif isinstance(n, ast.Attribute):
                     out |= set(methods.get(n.attr, ()))
+                    if any(c.external and n.attr in c.methods for c in self.classes.values()):
+                        ext.append(("method", n.attr))  # obj.m(...) or a property of another module's class
             return out, ext
 
+        self.ieee_module = "ieee" in self.hints.get(0, {})
+        if not self.ieee_module:
+            self.strict = {k for k, f in bodies.items() if "ieee" not in self.hints.get(getattr(f, "lineno", -1), {})}
         work = []
         for key, f in bodies.items():
             for t in (n for n in ast.walk(f) if isinstance(n, ast.Try)):
                 if not self._catches_float_errors(t):
                     continue
                 self.strict.add(key)
+                self.strict_try.add(key)
                 reach, ext = callees(t.body)
+                ext = [x for x in ext if not self._strict_elsewhere(x)]
                 if ext:
                     self.strict_blockers[id(t)] = (
-                        f"the try block calls {ext[0]}() from another module of the project, whose float errors "
-                        "(1.0 / 0.0, math.sqrt(-1)) can't be raised as Python raises them from here")
+                        f"the try block calls {ext[0] if isinstance(ext[0], str) else '.' + ext[0][1]}() from another "
+                        "module of the project, which doesn't raise "
+                        "Python's float errors (1.0 / 0.0, math.sqrt(-1)) exactly: it, or a function it calls, is "
+                        "marked `# qtrans: ieee` or has a value that may be a NumPy number, so the C++ would carry "
+                        "on where Python's except takes over")
                 work += list(reach)
         while work:
             k = work.pop()
-            if k in self.strict:
+            if k in self.strict_try:
                 continue
             self.strict.add(k)
+            self.strict_try.add(k)
             reach, ext = callees([self.fdefs[k]])
             work += list(reach)
+
+    # --- what a piece of C++ calls, and whether it may raise ---------------------------------
+    def _cpp_callables(self):
+        """C++ name -> the keys (functions, methods, constructors) a call by that name may run.
+        By the name the C++ uses: an overload's `r` for the key `r(float,float)`, `delete_` for
+        `delete`, `ratio` for `from dep import ratio as r` (dep::ratio), the class for its
+        constructor (Point(...), std::make_shared<Call>(...)), which runs __init__ and
+        __post_init__, its bases' too."""
+        n = len(self.sigs) + len(self.classes)
+        cache = self.__dict__.get("_callables")
+        if cache is not None and cache[0] == n:
+            return cache[1]
+        idx = {}
+        for k, sig in self.sigs.items():
+            idx.setdefault(sig.cpp.rsplit("::", 1)[-1], set()).add(k)
+        for cname, info in self.classes.items():
+            chain = [info] + list(info.ancestors() if hasattr(info, "ancestors") else [])
+            keys = {f"{c.name}.{m}" for c in chain for m in ("__init__", "__post_init__")}
+            entry = idx.setdefault(getattr(info, "cpp", cname).rsplit("::", 1)[-1], set())
+            entry |= {k for k in keys if k in self.sigs or k in self.fdefs}
+            if getattr(info, "external", False):
+                entry.add(("external class", cname))  # another module's class: its constructor is not seen here
+        self._callables = (n, idx)
+        return idx
+
+    def called(self, code):
+        """The keys the C++ code may call (see _cpp_callables)."""
+        idx = self._cpp_callables()
+        out = set()
+        names = re.findall(r"([A-Za-z_]\w*)\s*[({]", code) + re.findall(r"make_shared<\s*(?:[\w:]*::)?(\w+)\s*>", code)
+        for w in names:
+            out |= idx.get(w, set())
+        return out
+
+    def code_may_raise(self, code) -> bool:
+        """Can this C++ raise an exception? The runtime's helpers may (shapes, indexes, Python's
+        float errors), as may a function of the file whose own C++ may, or that isn't translated
+        yet (so: maybe); the standard library's maths and plain arithmetic never do. For
+        Python's order of evaluation (ExprTranslator.left_first)."""
+        from .expressions import ExprTranslator
+        if ExprTranslator._RAISING.search(code):
+            return True
+        return any(self.function_may_raise(k) for k in self.called(code))
+
+    _EFFECT = re.compile(r"\.(random|standard_normal|normal|uniform|integers)\s*\(")  # a generator's draws
+
+    def code_has_effect(self, code) -> bool:
+        """Does this C++ change something a later part of the statement, or an `except`, could
+        see? A draw from a generator, or a call of a function or method that changes an argument
+        or an object, prints, or draws from the random module. Its order against a part that may
+        raise matters: Python runs it first or never, as written (left_first)."""
+        if self._EFFECT.search(code) or "random_module()" in code:
+            return True
+        for k in self.called(code):
+            if not isinstance(k, str):
+                return True
+            sig = self.sigs.get(k)
+            if sig is None:
+                continue
+            if any(getattr(p, "mode", "") == "ref" or p.type == RNG for p in sig.params) or sig.py_random \
+                    or k in getattr(self, "object_mutators", ()) or k in getattr(self, "printing", ()) \
+                    or (sig.kind == "instance" and not sig.const):
+                return True
+        return False
+
+    def function_may_raise(self, key, seen=frozenset()) -> bool:
+        if not isinstance(key, str) or key in seen:
+            return True  # (another module's class, or recursion: assume so)
+        memo = self.__dict__.setdefault("_may_raise", {})
+        if key in memo:
+            return memo[key]
+        body = getattr(self, "_bodies", {}).get(key)
+        if body is None:
+            owner, oname, kind = self.imported.get(key, (None, None, None))
+            dep = self.deps.get(owner)
+            if kind == "function" and dep is not None and hasattr(dep, "function_may_raise"):
+                return dep.function_may_raise(oname)  # a function of another module of the project
+            return True  # not translated yet: maybe
+        code = "\n".join(body)
+        from .expressions import ExprTranslator
+        out = bool(ExprTranslator._RAISING.search(code)) or \
+            any(self.function_may_raise(k, seen | {key}) for k in self.called(code))
+        memo[key] = out  # (True under an assumption is still True; False never rests on one)
+        return out
+
+    def _exact_float_errors(self, bodies):
+        """The functions that raise Python's float errors exactly, themselves and in everything
+        they call (Signature.float_errors): a fixpoint, starting from every function that raises
+        them itself and has no value that may be a NumPy number or a Python float, and taking
+        out any that calls one outside the set (marked `# qtrans: ieee`, your own C++, another
+        module's that isn't exact, another module's class, ...)."""
+        npmix = getattr(self, "npmix", set())
+        exact = {k for k in bodies if k in self.sigs and not self.sigs[k].module and k in self.strict
+                 and k not in npmix and self._override(k) is None}
+        calls = {k: self.called("\n".join(bodies[k])) for k in exact}
+
+        def ok(c):
+            if not isinstance(c, str):
+                return False
+            if c in exact:
+                return True
+            owner, oname, kind = self.imported.get(c, (None, None, None))
+            dep = self.deps.get(owner)
+            if kind == "function" and dep is not None:
+                sig = dep.sigs.get(oname)
+                return bool(sig is not None and sig.float_errors)
+            return False
+        changed = True
+        while changed:
+            changed = False
+            for k in list(exact):
+                if not all(ok(c) for c in calls[k] if c != k):
+                    exact.discard(k)
+                    changed = True
+        return exact
+
+    def _strict_elsewhere(self, local):
+        """Code of another module of the project, called inside a `try` that may catch a float
+        error, that raises Python's float errors exactly, itself and in all it calls (not marked
+        `# qtrans: ieee`, no value that may be NumPy's): a function, a class's constructor (its
+        __init__ and __post_init__, its bases' too), or ("method", m): every method m of that
+        module's classes (the object may be of any of them)."""
+        def exact(dep, key):
+            sig = dep.sigs.get(key)
+            return sig is None or sig.float_errors  # (no such method, or a refused one: refused where called)
+        if isinstance(local, tuple):
+            _, m = local
+            deps = [d for d in self.deps.values() if hasattr(d, "classes")]
+            return all(exact(d, f"{c.name}.{m}") for d in deps for c in d.classes.values()
+                       if not getattr(c, "external", False) and m in c.methods)
+        owner, oname, kind = self.imported.get(local, (None, None, None))
+        dep = self.deps.get(owner)
+        if dep is None:
+            return False
+        if kind == "function":
+            sig = dep.sigs.get(oname)
+            return bool(sig is not None and sig.float_errors)
+        if kind == "class" and oname in dep.classes:
+            info = dep.classes[oname]
+            chain = [info] + list(info.ancestors())
+            return all(exact(dep, f"{c.name}.{m}") for c in chain for m in ("__init__", "__post_init__"))
+        return False
 
     # --- types of unannotated functions, from how the file calls them ----------------------------
     def _main_fdef(self):
@@ -1272,7 +1432,8 @@ class ModuleTranslator:
                     pairs = [(k.arg, k.value) for k in n.keywords]
                 elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)) and getattr(n, "value", None) is not None:
                     targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                    pairs = [(t.attr, n.value) for t in targets if isinstance(t, ast.Attribute)]
+                    pairs = [(t.attr, n.value) for t in targets if isinstance(t, ast.Attribute)
+                             and not self._self_of_other_class(t, sig, info)]
                 for name, value in pairs:
                     if name in numeric and fo.of(value) != PY:
                         problem = (value, f"field '{name}' of {info.name} gets `{ast.unparse(value)}` on line {value.lineno}, which may be a "
@@ -1282,6 +1443,15 @@ class ModuleTranslator:
                     break
         cache[info.name] = problem
         return problem
+
+    def _self_of_other_class(self, target, sig, info) -> bool:
+        """`self.x = ...` in a method of a class that isn't info, nor derives from it: that
+        stores into the other class's field x, not info's."""
+        owner = getattr(sig, "owner", None)
+        if not (isinstance(target.value, ast.Name) and target.value.id == "self" and owner in self.classes):
+            return False
+        mine = self.classes[owner]
+        return mine is not info and info not in (mine.ancestors() if hasattr(mine, "ancestors") else [])
 
     def _provisional(self, name, f, known):
         """A signature with what is known so far (None for a type not known yet)."""
@@ -2059,6 +2229,7 @@ class ModuleTranslator:
 
     def _translate_functions(self):
         bodies, notes, general = {}, {}, {}
+        self._bodies = bodies  # (what each function's C++ is, once translated: code_may_raise)
         while True:  # a function calling a rejected function is rejected too: iterate
             progress = False
             for name, f in self.fdefs.items():
@@ -2102,6 +2273,8 @@ class ModuleTranslator:
                                              for src, key, text in getattr(tr, "line_notes", [])]
                     notes[name] = list(self.sigs[name].decorator_notes)
                     for key, text in tr.notes:
+                        if key == "npmix":
+                            self.__dict__.setdefault("npmix", set()).add(name)
                         if key in GENERAL_NOTES:
                             general.setdefault(text, []).append(name)
                         else:
@@ -2188,6 +2361,15 @@ class ModuleTranslator:
 
     def _finish(self, bodies, notes, general):
         self._check_overrides()
+        exact = self._exact_float_errors(bodies)
+        for name, sig in self.sigs.items():
+            if name in bodies and not sig.module:
+                sig.float_errors = name in exact
+        for name in self.sigs:
+            if name in bodies and not self.sigs[name].module and name not in self.strict:
+                notes.setdefault(name, []).append(
+                    "marked `# qtrans: ieee`: a float division by zero, an overflow or a math domain error gives "
+                    "inf / NaN (IEEE-754) where Python raises; qtrans verify counts those inputs as known")
         for name in getattr(self, "py_random_users", ()):  # (signatures may have been made again since)
             if name in self.sigs:
                 self.sigs[name].py_random = True
@@ -2695,7 +2877,9 @@ class ModuleTranslator:
         if "std::vector<" in code or re.search(r"qt::py::(" + "|".join(sorted(_list_names())) + r")\b", code):
             inc_lines.append('#include "qtrans_list.hpp"  // lists, dicts, text, and print(), str(), repr(), format() as Python writes them')
         elif "qt::py::" in code:
-            inc_lines.append('#include "qtrans_print.hpp"  // print(), str(), repr(), format() as Python writes them')
+            errors_only = not re.search(r"qt::py::(?!truediv\b|power\b|math_\w+\b|floordiv\b|mod\b)\w+", code)
+            inc_lines.append('#include "qtrans_print.hpp"  // ' + ("Python's float errors (ZeroDivisionError, ...)"
+                             if errors_only else "print(), str(), repr(), format() as Python writes them, and its errors"))
         for d in self.project_deps:  # the modules of the project it imports from
             inc_lines.append(f'#include "{d}.hpp"  // from {d} import ...')
         return inc_lines
@@ -2733,6 +2917,9 @@ class ModuleTranslator:
         if risky:
             # an exception Python wouldn't catch ends the program with its message and exit status 1
             out_main = [head] + console + ["    try {"] + ["    " + l if l.strip() else l for l in body] + [
+                "    } catch (const qt::Exception& e) {  // the last line of Python's traceback",
+                "        std::cerr << e.type_name() << (*e.what() ? \": \" : \"\") << e.what() << '\\n';",
+                "        return 1;",
                 "    } catch (const std::exception& e) {",
                 "        std::cerr << e.what() << '\\n';",
                 "        return 1;",

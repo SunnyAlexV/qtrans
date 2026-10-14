@@ -19,7 +19,7 @@ from . import library as lib
 from .errors import Unsupported
 import collections
 
-from .core import dims_of, int_token, iv_of, same_dim
+from .core import CPP_RESERVED, dims_of, int_token, iv_of, same_dim
 from .core import cpp_string, float_literal
 from .expressions import (P_ATOM, P_REL, P_UNARY, Expr, ExprTranslator, _Unknown, cpp_ident, wrap)
 from .structs import THIS
@@ -350,6 +350,7 @@ class FunctionTranslator(ExprTranslator):
         key = next((k for k, f in mod.fdefs.items() if f is fdef), fdef.name)
         # inside a try whose handler may catch a float error: Python's float errors raised as Python
         self.strict = key in getattr(mod, "strict", ())
+        self.strict_try = key in getattr(mod, "strict_try", ())  # inside a try that may catch a float error
         self.exc_vars: list = []        # (name in Python, C++ name) of the handlers we're inside
         self.finally_stack: list = []   # (C++ name, loop depth) of the try ... finally blocks we're inside
         self._active_finally_bodies: list = []  # their Python statements
@@ -1857,7 +1858,63 @@ class FunctionTranslator(ExprTranslator):
         block(self.body, set())
 
     # --- pass 6: emission ----------------------------------------------------------------------
+    def reserved_names(self):
+        """Every name a temporary must not take: the function's own names, and what its C++ can
+        see unqualified (the class's fields and methods, its bases', the module's constants,
+        functions and classes), which a local of that name would hide."""
+        cache = self.__dict__.get("_reserved")
+        if cache is not None:
+            return cache
+        out = set(self.all_names) | set(CPP_RESERVED)
+        mod = self.mod
+        owner = getattr(self.sig, "owner", None)
+        if owner and owner in mod.classes:
+            info = mod.classes[owner]
+            for c in [info] + list(info.ancestors()):
+                out |= {f.name for f in c.fields} | {getattr(f, "cpp", f.name) for f in c.fields}
+                out |= set(c.methods) | {getattr(m, "cpp", m.name) for m in c.methods.values()}
+        for name, c in mod.constants.items():
+            out |= {name, c.cpp.rsplit("::", 1)[-1]}
+        for k, sig in mod.sigs.items():
+            out |= {k.rsplit(".", 1)[-1], sig.cpp.rsplit("::", 1)[-1]}
+        out |= set(mod.classes) | set(getattr(mod, "imported", {}))
+        self._reserved = out
+        return out
+
     def emit(self, line):
+        aug = _AUG_STORE.match(line)
+        if aug is not None and hasattr(self.mod, "code_may_raise") and self.mod.code_may_raise(aug.group(1)) \
+                and (self.mod.code_may_raise(aug.group(3)) or self.mod.code_has_effect(aug.group(3))) \
+                and not _CHANGES_A_CONTAINER.search(aug.group(3)):
+            # (the reference must stay valid: nothing on the right may add to or take from a list or
+            # dict; a function can't change one passed to it, qtrans refuses that)
+            # xs[k] += v: Python loads xs[k] (IndexError, KeyError) before working out v, where C++17
+            # works out the right side of += first: the element is found first, by reference
+            used = self.__dict__.setdefault("_left_names", set())
+            name, k = "target", 1
+            while name in used or name in self.reserved_names() or re.search(rf"\b{name}\b", line):
+                k += 1
+                name = f"target{k}"
+            used.add(name)
+            tail, self._tail = self._tail, None
+            self.emit(f"auto& {name} = {aug.group(1)};")
+            self._tail = tail
+            line = f"{name} {aug.group(2)} {aug.group(3)};"
+        split = _split_left_first(line)
+        while split is not None:  # `return [&] { const double lhs = X; return Y; }();` as two statements
+            ctype, old, x, head, y = split
+            tail, self._tail = self._tail, None
+            self.emit(f"const {ctype} \x00 = {x};")  # (the temporaries x needs come first)
+            self._tail = tail
+            used = self.__dict__.setdefault("_left_names", set())
+            name, k = "left", 1
+            while name in used or name in self.reserved_names() or re.search(rf"\b{name}\b", line):
+                k += 1
+                name = f"left{k}"
+            used.add(name)
+            self.lines[-1] = self.lines[-1].replace("\x00", name, 1)
+            line = head + re.sub(rf"\b{old}\b", name, y)  # (only the value: never the statement's target)
+            split = _split_left_first(line)
         if self._tail:
             line += self._tail
             self._tail = None
@@ -2105,7 +2162,12 @@ class FunctionTranslator(ExprTranslator):
             return self.store_list_item(t, value_node, s, sym, lt)
         if isinstance(lt, DictType):
             return self.store_dict_item(t, value_node, s, sym, lt)
-        if isinstance(self.var_type(root) if root else None, OptionalType):
+        if lt is None and not isinstance(subscript_base(t), ast.Name):  # self.xs[k] = v: a field's list or dict
+            held = self.expr_raw(subscript_base(t)).type
+            if isinstance(held, (ListType, DictType)):
+                raise Unsupported(s, f"storing into a {'list' if isinstance(held, ListType) else 'dict'} held in a "
+                                     "field is not supported yet")
+        if isinstance(lt, OptionalType):
             raise Unsupported(s, f"'{root}' may be None, and storing into it is not supported",
                               f"after the None check, work on a new name: {root}_ = {root}.copy()")
         code, kind = self.array_subscript(t, target=True)
@@ -2802,3 +2864,51 @@ class FunctionTranslator(ExprTranslator):
         msg = '""' if s.msg is None else self._message_of(s.msg, "AssertionError")
         self.note("assert", "assert statements always run in C++; `python -O` strips them")
         self.emit(f"if (!{wrap(cond, P_ATOM)}) throw qt::AssertionError({msg});")
+
+
+_CHANGES_A_CONTAINER = re.compile(r"\b(pop|popitem|insert|append|extend|remove|clear|setdefault|update|erase|"
+                                  r"push_back|emplace_back|resize|sort|reverse)\b")
+_AUG_STORE = re.compile(r"^((?:qt::py::item|qt::py::at)\(.+?\)|\w+\(qt::idx\(.+?\)\)|\w+\.at\(.+?\)) ([-+*/]=) (.+);$")
+_SEQ_HEAD = re.compile(r"^(return |(?:const )?[\w:<>, ]+? [\w\x00]+ = |[\w.\[\]()>-]+ [-+*/]?= )\[&\] \{ const (double|long long|bool) (\w+) = ")
+
+
+def _split_left_first(line):
+    """A statement that is all one left-first temporary (ExprTranslator.left_first) as two:
+    (`const double lhs = X;`, `return Y;`), or None."""
+    m = _SEQ_HEAD.match(line)
+    if m is None or not line.endswith("; }();"):
+        return None
+    i, depth = m.end(), 0
+    for j in range(i, len(line)):  # X ends at the first ';' outside brackets
+        c = line[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif c == ";" and depth == 0:
+            break
+    else:
+        return None
+    x = line[i:j]
+    rest = line[j + 1:]
+    if not rest.startswith(" return ") or not rest.endswith("; }();"):
+        return None
+    y = rest[len(" return "):-len("; }();")]
+    d = 0
+    for c in y:  # Y must be one balanced expression (the lambda ends right after it)
+        d += c in "([{"
+        d -= c in ")]}"
+        if d < 0:
+            return None
+    if d != 0:
+        return None
+    return m.group(2), m.group(3), x, m.group(1), f"{y};"
+
+
+def subscript_base(t):
+    """xs in xs[i][j]: the expression the outermost subscripts index."""
+    while isinstance(t, ast.Subscript):
+        t = t.value
+    return t

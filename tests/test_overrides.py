@@ -72,7 +72,7 @@ def test_your_cpp_is_used_and_reported(module):
     h = r.header
     assert "inline double annuity(long long count, double s) {" in h and "total * s;" in h
     assert "double annuity(long long n, double scale = 1.0);" in h  # the default, once, in the declaration
-    assert h.index("#include <cmath>\n\n// from pricing_overrides.hpp") < h.index("namespace pricing {")
+    assert h.index("#include <cmath>") < h.index("\n\n// from pricing_overrides.hpp") < h.index("namespace pricing {")
     assert "// the same sum, written my way" in h
     status = {f.name: f.override for f in r.report.functions}
     assert status == {"discount": None, "annuity": "up to date", "doubled_sum": "not yet accepted", "uses": None}

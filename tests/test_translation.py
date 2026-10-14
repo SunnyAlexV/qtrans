@@ -22,18 +22,20 @@ def test_power_two_keeps_the_rounding_of_python():
     h = cpp("def f(a: float, s: float) -> float:\n    return a * s ** 2\n")
     # Python's s ** 2 is the C library's pow(s, 2.0), which for about 1 value in 1,000 is not
     # s * s; and a C++ compiler turns std::pow(s, 2.0) into s * s, so qt::pow keeps the call
-    assert "return a * qt::pow(s, 2.0);" in h
+    # (qt::py::power: qt::pow and Python's OverflowError)
+    assert "return a * qt::py::power(s, 2.0);" in h
 
 
 def test_true_division_of_ints_is_float():
     h = cpp("def f(a: int, b: int) -> float:\n    return a / b\n")
-    assert "static_cast<double>(a) / static_cast<double>(b)" in h
+    assert "qt::py::truediv(a, b)" in h  # (ZeroDivisionError: division by zero, as Python's)
 
 
 def test_floor_division_and_mod_use_python_semantics():
     h = cpp("def f(a: int, b: int) -> int:\n    return a // b + a % b\n")
-    # the sum of two unknown ints could leave 64 bits: checked
-    assert "qt::iadd(qt::floordiv(a, b), qt::mod(a, b))" in h
+    # the sum of two unknown ints could leave 64 bits: checked; both sides may raise
+    # ZeroDivisionError, so the left one is worked out first, as in Python
+    assert "const long long left = qt::floordiv(a, b);\n    return qt::iadd(left, qt::mod(a, b));" in h
 
 
 def test_int_literals_promoted_where_overflow_possible():

@@ -170,7 +170,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (664 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (685 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -858,13 +858,30 @@ inline double safe_price(double s, double k) {
   out (the end, `return`, `break`, `continue`, an exception), once, and an error it raises
   replaces the one on its way, as in Python. A `return` value is computed before the `finally`
   runs.
-- **Python's float errors, where a handler may catch them.** A C++ double carries on where a
-  Python float raises: `1.0 / 0.0` is inf, `math.sqrt(-1)` NaN, `math.exp(1000)` inf, `10.0 ** 400`
-  inf. In a function holding a `try` whose handler takes one of those errors (`ZeroDivisionError`,
-  `ArithmeticError`, `OverflowError`, `ValueError`, `Exception`), and in every function its `try`
-  block calls, the translation raises them as CPython does: `qt::py::truediv`, `qt::py::power`,
-  `qt::py::math_sqrt`, ... (CPython's own rules, `math_1` and `float_pow`). NumPy's numbers
-  don't raise, so their arithmetic stays plain; everywhere else the C++ stays plain too.
+- **Python's float errors, everywhere (since 1.0).** A C++ double carries on where a Python
+  float raises: `1.0 / 0.0` is inf, `math.sqrt(-1)` NaN, `math.exp(1000)` inf, `10.0 ** 400`
+  inf. The translation raises them as CPython does: `qt::py::truediv`, `qt::py::power`,
+  `qt::py::math_sqrt`, ... (CPython's own rules, `math_1` and `float_pow`). Until 0.14 that held
+  only in code a `try` could catch them in, and the examples had 1,623 cases of 17,921 where
+  Python raised and the C++ returned inf or NaN, counted as known differences; in 1.0 they have
+  40, all of one other kind (a float that goes complex). NumPy's numbers don't raise, so their
+  arithmetic stays plain. A value that is NumPy's on some runs and Python's on others
+  (`max(np.exp(x), 0.0) / y`) gets NumPy's result, said in the report. `# qtrans: ieee` on a
+  `def` (or at the top of a file) keeps IEEE-754's inf and NaN for speed, reported too.
+  The cost, measured by [`tools/float_error_cost.py`](tools/float_error_cost.py) (the same
+  example modules translated as they are and with `# qtrans: ieee`, nine scalar pricing
+  functions on the same inputs, the two builds taking turns, best of 7): 3% to 18% per call
+  with GCC 13, 1% to 11% with Clang 18 (`bs_price` +3% / +1%, `implied_vol` +4% / +1%, the bond
+  functions +6% to +11%, `d1` +18% / +9%; a point or two moves between runs). Each check is a
+  compare marked unlikely, the throw a
+  separate cold function; an int divisor known not to be zero (`1.0 / (k + 1)` for `k` in
+  `range(n)`) has none.
+- **Python's order, where it shows.** When both operands of an operator on numbers, or several
+  arguments of a call of the file's own functions, methods or classes (and the object a method
+  is called on), can raise or change something, the left one is worked out first, into a
+  temporary (and `xs[k] += v` finds the element before working out `v`): `math.log(S / K) / (sigma * math.sqrt(T))` raises `ZeroDivisionError` for
+  `S = K = 0.0`, `T < 0`, as Python does, not the `ValueError` of `math.sqrt` that a right-to-left
+  compiler would meet first. A function that can't raise (`a + b + c`) needs no temporary.
 - **Python's own words.** Error messages change between versions: `1.0 / 0.0` says "float division
   by zero" up to 3.13 and "division by zero" in 3.14, `math.sqrt(-1)` "math domain error" up to
   3.13 and "expected a nonnegative input, got -1.0" in 3.14, `math.pow(0.0, -inf)` raises up to
@@ -973,6 +990,11 @@ nothing). Hints that could change a result are refused with the reason, at their
 `fast-math`, `simd` / `vectorize` and `parallel` (sums in another order), `ivdep`, `restrict`;
 so are unknown ones, since a typo shouldn't be ignored quietly.
 
+One hint changes what the C++ does, and says so: `# qtrans: ieee` on a def (or on its own line
+at the top of a file, for every function) gives up Python's float errors there for IEEE-754's
+inf and NaN, one compare fewer per division, `exp` or `log`. The report names each function it
+applies to, and `qtrans verify` counts the inputs where it shows as `known`, never as a match.
+
 ## Export: a C++ package with its own tests
 
 `qtrans export pricing.py -o pricing_cpp` (or a folder, for a project) writes what a C++ team
@@ -1042,8 +1064,9 @@ imports, so a function knows exactly how every imported function treats its argu
 takes it by reference, and so does a function two modules up that calls `core.weights`. The same
 holds for methods of an imported class, a generator passed on to an imported function that
 draws from it, an argument an imported function may hand back, and a `try` whose handler takes a
-float error (`except ValueError`, `ZeroDivisionError`, ...) around an imported function: refused,
-since that function was translated without raising them. Calling an imported
+float error (`except ValueError`, `ZeroDivisionError`, ...) around an imported function (since
+1.0 every module raises Python's float errors itself; refused only around a function marked
+`# qtrans: ieee`). Calling an imported
 function that could not be translated is refused with its own reason ("calls bad(): bad (in
 rates) could not be translated: module variable 'TABLE' was not translated: sets are not
 supported").
@@ -1209,8 +1232,10 @@ an array field to an array *equal* to the old one, the compiled side keeps the o
      except at elements that are inf, -inf or NaN on both sides (a value that is zero up to
      rounding, `1e-16` from LAPACK and exactly `0` from Eigen, divided by zero: its sign, so
      rounding, decides between `-inf` and NaN). These cases are listed separately, never hidden.
-   - **known**: Python raised a float error that IEEE-754 arithmetic doesn't raise
-     (`ZeroDivisionError`, `OverflowError`, math domain error), or a Python float went complex
+   - **known**: in a function marked `# qtrans: ieee` (or using a value that may be a NumPy
+     number), Python raised a float error that IEEE-754 arithmetic doesn't raise
+     (`ZeroDivisionError`, `OverflowError`, math domain error); in any other function that is a
+     **mismatch** since 1.0, since the C++ raises those itself. Or a Python float went complex
      (`(-8.0) ** (1/3)`), where C, like `np.float64`, gives NaN: in the result, in an array
      (or added into one in place, where NumPy raises a `TypeError`), or anywhere earlier in the
      call (`v > x ** 0.5` compares by the real part in NumPy and with NaN in C++; on a
@@ -1437,9 +1462,14 @@ What the first runs found, all fixed:
 
 Each is listed in the per-module report next to the functions it affects.
 
-- **Float errors.** Python raises on `x / 0.0`, on overflow in `**` and `math.exp`, and on
-  `math.log(-1)`. C++ follows IEEE-754 and returns ±inf/NaN. Integer `//` and `%` by zero
-  *do* throw, as in Python.
+- **Float errors, where you asked for IEEE-754.** Since 1.0 the C++ raises Python's float
+  errors (`x / 0.0`, overflow in `**` and `math.exp`, `math.log(-1)`) everywhere, except in a
+  function marked `# qtrans: ieee`, and where a value may be a NumPy number on some runs and a
+  Python float on others (NumPy's inf / NaN then, as on those runs in Python).
+- **A float that goes complex.** `(-8.0) ** (1/3)` is a complex number in Python and NaN in C++,
+  so what follows differs (`round()` of it: `TypeError` against `ValueError`). These are the
+  40 known cases left in the examples (`default_block_length`, `newey_west_lag`, on negative
+  sample sizes).
 - **64-bit integers.** Past ±9.2e18, C++ raises `OverflowError` instead of returning a big int.
   Until 0.8.1 that held only for float-to-int conversion: int `+ - *` and `**` wrapped around
   silently (and signed overflow is undefined behaviour in C++), which the stress profile
@@ -1450,12 +1480,12 @@ Each is listed in the per-module report next to the functions it affects.
   (`n_steps + 1`, `2 * n`); loop and index
   arithmetic stays plain C++. `LLONG_MIN % -1` (undefined in C++) gives 0, as in Python.
 - **Last-bit differences** where NumPy or SciPy use their own `exp`, `pow`, `erf` or BLAS/LAPACK.
-- **Which of two errors is raised.** When one expression breaks two checks at once (shapes that
-  don't broadcast, and an index out of range: `np.ones(3) / np.zeros(2) * A[64]`), Python
-  raises the first, left to right. C++ leaves the order in which a call's arguments are
-  evaluated unspecified (GCC and MSVC usually go right to left, Clang left to right), so it may
-  raise the other. Both reject the input; matching Python's order would mean splitting every
-  expression that can raise into its own statement. The verifier counts these as `known` only
+- **Which of two errors is raised, in a few places.** Since 1.0 operators and calls of the
+  file's own functions follow Python's left-to-right order where both sides can raise. Not yet
+  the arguments of library functions (`max(a / b, c / d)`), a number and an array that both
+  raise (`math.log(c) * (A @ x)`), nor array expressions that break two checks at once (shapes that don't broadcast, and an index out of range:
+  `np.ones(3) / np.zeros(2) * A[64]`): there C++ may raise the other error (GCC and MSVC usually
+  go right to left, Clang left to right). Both reject the input. The verifier counts these as `known` only
   when both sides raise an error that rejects the input (`ValueError`, `IndexError`, a division
   by zero), never when one side returns a value.
 - **`assert`** always runs in C++; `python -O` strips it.
@@ -1594,9 +1624,10 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               664 tests: generated text, refusals, compiled semantics, every example,
+tests/               685 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
-tools/               scripts that back the numbers in this README; fuzz/: the program fuzzer
+tools/               scripts that back the numbers in this README (float_error_cost.py: what
+                     Python's float errors cost in the C++); fuzz/: the program fuzzer
                      (generator, checker, shrinker: `python -m tools.fuzz`); linalg_check/:
                      numpy.linalg checked operation by operation
 docs/SPEC.md         the specification; tests/test_spec.py runs its examples
@@ -1637,7 +1668,11 @@ run_examples.py      press-Run entry point
    **0.14**: integer arrays and the bootstrap ([Integer arrays](#stage-2-arrays)), and the
    written specification of the supported subset ([docs/SPEC.md](docs/SPEC.md)), checked by
    the tests.
-8. **1.0**: 0.14 with nothing added, once it has passed on every platform. After it: the editor inside VS Code, Python line references in the headers, a
+8. ~~**1.0**~~: the promise and the default agree. Python's float errors everywhere, unless a
+   function asks for IEEE-754 (`# qtrans: ieee`); Python's evaluation order where two parts of
+   an expression can raise; `qtrans verify` counting a missing Python error as a mismatch. The
+   specification ([docs/SPEC.md](docs/SPEC.md)) is the contract from here: a 1.x may translate
+   what an earlier one refused, but not change what a translation computes. After it: the editor inside VS Code, Python line references in the headers, a
    reproducible benchmark protocol, bindings for class hierarchies and the random module. (Mapping a Python function to existing C++, QuantLib or in-house, is what
    [your own C++](#your-own-c-for-a-function) does since 0.10, verified.) Not planned: pandas,
    all of Python, GPU backends.

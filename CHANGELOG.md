@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.0.0
+
+- **Python's float errors by default, everywhere.** A float division by zero, an overflowing
+  `**`, `math.exp` or `math.cosh`, and a math domain error (`math.sqrt(-1)`, `math.log(0.0)`)
+  raise `ZeroDivisionError`, `OverflowError` and `ValueError` in the C++ as in Python, with the
+  running Python's message, in every function (until 0.14: only in code a `try` could catch them
+  in). The examples' known differences fall from 1,623 of 17,921 cases (in 43 functions) to 40
+  (in 2, all a float going complex), with 0 mismatches.
+- **`# qtrans: ieee`** on a `def`, or at the top of a file for every function of the module,
+  keeps IEEE-754's inf and NaN instead (fewer checks); the report says so at each function, and
+  `qtrans verify` counts those inputs as known. Inside a `try` that may catch the error it has no
+  effect.
+- **The cost**, measured by `tools/float_error_cost.py` (the same modules with and without
+  `# qtrans: ieee`, nine scalar pricing functions, same inputs, best of 7 alternating runs): 3%
+  to 18% per call with GCC 13, 1% to 11% with Clang 18. Each check is one compare marked
+  unlikely; the throw is a separate cold function. An int divisor known not to be zero
+  (`1.0 / (k + 1)` for `k` in `range(n)`) has no check. NumPy arrays are unchanged.
+- **A value that may be a NumPy number or a Python float** depending on the run
+  (`max(np.exp(x), 0.0) / y`) gets NumPy's inf or NaN, and the report says so (Python raises on
+  some runs and not on others); inside a `try` that may catch the error it is refused, as before.
+- **Python's order of evaluation where it shows**: when both operands of an operator, or
+  several arguments of a call of the file's own functions, methods or classes, can raise, the
+  left one is worked out first, into a temporary (`const double left = ...;`), so the same error
+  comes out as in Python (`math.log(S / K) / (sigma * math.sqrt(T))` with `S = K = 0`, `T < 0`:
+  `ZeroDivisionError`, not `ValueError`). A call can raise only if the function's own C++ can.
+  The object a method is called on comes before the arguments, an argument that changes
+  something (modifies an argument or an object, prints, draws) is ordered against one that
+  raises, and `xs[k] += v` finds `xs[k]` (IndexError, KeyError) before working out `v`. A library
+  call whose arguments mix a change and an error (`max(bump(p), a / b)`) is refused, with a hint.
+- **Checked by an independent review** before release (a separate agent, not the one writing the
+  code): its 9 + 3 confirmed problems are fixed, each kept as a test
+  (`tests/test_float_errors_default.py`, `tests/data/review10/`). Among them: a temporary named
+  like a field of the class, a `try` around another module's `# qtrans: ieee` function, method
+  or constructor (refused again), and calls found by their C++ names (overload versions, renamed
+  keywords, imports under another name, `std::make_shared<Sub>`).
+- `self.x` inside a method is that class's field when qtrans works out whether a value is
+  NumPy's: a field of the same name in another class no longer turns it into "may be NumPy's".
+  A comprehension's variable over a `list[float]` is a Python float.
+- Storing into a list or dict held in a field (`self.xs[k] += 1.0`) is refused with the reason;
+  it crashed the translator (also in 0.14).
+- **`qtrans verify` is stricter**: in a function that raises Python's float errors itself,
+  Python raising where the C++ doesn't is a mismatch, no longer a known difference.
+- An uncaught exception in a program prints Python's last traceback line
+  (`ZeroDivisionError: float division by zero`) on stderr.
+- A catch around a function of another module of the project that may raise a float error is
+  translated (that module raises it itself now).
+- `docs/SPEC.md` describes 1.0: the guarantee as a design rule checked by differential testing,
+  not a proof; ints as Python's within 64 bits; the differences kept by design, updated. From
+  1.0 on, a change to what it says is a change of major version, except for additions.
+
 ## 0.14.0
 
 - **Integer arrays.** `np.arange` of ints, `np.zeros(n, dtype=int)`, `np.ones(n, dtype=int)`,

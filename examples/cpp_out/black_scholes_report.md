@@ -5,35 +5,16 @@
 ## Translated
 
 - `d1` (line 11)
-  - math.log raises ValueError outside its domain in Python; C++ returns NaN
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `d2` (line 16)
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `bs_price` (line 20)
 - `delta` (line 37)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `gamma` (line 45)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `vega` (line 50)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `theta_per_day` (line 56)
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `rho` (line 68)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `delta_gamma` (line 76)
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `parity_gap` (line 83)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
-
-## Differences on overflow and error paths
-
-These only matter on inputs where Python would raise an exception or overflow.
-
-- division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: d1, gamma, theta_per_day, delta_gamma, parity_gap)
-- float ** raises OverflowError in Python when the result overflows; C++ returns inf (applies to: d1)
+  - `(c - p - (S * math.exp(-q * T) - K * math.exp(-r * T))) / (S + K)` may hold a NumPy number or a Python float, depending on the run: Python then gives inf / NaN (NumPy) or raises (ZeroDivisionError, OverflowError); the C++ gives inf / NaN
 
 ## Module constants
 

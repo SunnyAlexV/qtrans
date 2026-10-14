@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import math
+import re
 from dataclasses import dataclass
 
 from . import library as lib
@@ -387,7 +388,67 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
     def e_BinOp(self, node):
         if isinstance(node.op, ast.Mod) and isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
             return self.text_value(node)  # "%.2f" % x: printf-style formatting
-        return self.binop(node, node.op, self.expr(node.left), self.expr(node.right))
+        L, R = self.expr(node.left), self.expr(node.right)
+        return self.left_first(L, R, lambda a: self.binop(node, node.op, a, R))
+
+    # --- Python's order of evaluation, where it can show -------------------------------------
+    # Python works out the left operand first; C++ leaves the order of an operator's operands
+    # unspecified (and of a call's arguments: qt::py::truediv(a, b) may run b first). It shows
+    # when both sides can raise: `math.log(S / K) / (sigma * math.sqrt(T))` raises
+    # ZeroDivisionError for S = K = 0.0 and T < 0 in Python, ValueError if the right side runs
+    # first. Then the left side is worked out first, into a temporary.
+    # Anything of the runtime may raise (a shape, an index, a float error), but for a few helpers
+    # that never do; the standard library's maths (std::exp, ...) never does.
+    _RAISING = re.compile(r"\bqt::(?!(?:pow|inf|nan|Vec|Mat|IVec|lvalue|none|norm_cdf|norm_sf|norm_pdf|norm_ppf)\b)"
+                          r"[\w:]+\s*\(|\bthrow\b|\.at\(")
+
+    def may_raise(self, e: Expr) -> bool:
+        mod = getattr(self, "mod", None)
+        if mod is None or not hasattr(mod, "code_may_raise"):
+            return bool(self._RAISING.search(e.code))
+        return mod.code_may_raise(e.code)
+
+    def ordered(self, e: Expr) -> bool:
+        """Must this part run in Python's order against another such part? It may raise, or it
+        changes something (a call that modifies an argument, prints, draws a random number)."""
+        mod = getattr(self, "mod", None)
+        return self.may_raise(e) or bool(mod is not None and hasattr(mod, "code_has_effect")
+                                         and mod.code_has_effect(e.code))
+
+    def _is_method_of_file(self, f) -> bool:
+        """obj.m(...) where some class of the file has a method m (in_python_order orders those)."""
+        return any(f.attr in getattr(c, "methods", {}) for c in getattr(self.mod, "classes", {}).values())
+
+    def with_receiver(self, node, base: Expr, params, codes, make):
+        """obj.method(args): Python works out obj, then the arguments. Where obj may raise or
+        change something, and so may an argument, obj is worked out first, into a temporary
+        (auto&&: the object itself, or the temporary one Python would make)."""
+        if not (self.ordered(base) and any(self.ordered(Expr(c, P_ATOM, FLOAT)) for c in codes)):
+            return self.in_python_order(node, params, codes, make(base))
+        taken = self.reserved_names() if hasattr(self, "reserved_names") else set()
+        name, k = "obj", 1
+        while name in taken or re.search(rf"\b{name}\b", base.code + " " + " ".join(codes)):
+            k += 1
+            name = f"obj{k}"
+        inner = self.in_python_order(node, params, codes, make(Expr(name, P_ATOM, base.type, simple=True)))
+        return Expr(f"[&] {{ auto&& {name} = {base.code}; return {inner.code}; }}()", P_ATOM, inner.type)
+
+    def left_first(self, L: Expr, R: Expr, build, known=False):
+        """build(L) (an Expr using R too), with L worked out before R where both may raise
+        (known: the caller has checked that)."""
+        if L.type not in (FLOAT, INT, BOOL) or not known and (R.type not in (FLOAT, INT, BOOL) or
+                                                               not (self.ordered(L) and self.ordered(R))):
+            return build(L)  # (an array expression is lazy in Eigen: it must never end up inside a lambda)
+        taken = self.reserved_names() if hasattr(self, "reserved_names") else getattr(self, "all_names", set())
+        name, k = "lhs", 1
+        while name in taken or re.search(rf"\b{name}\b", L.code + " " + R.code):
+            k += 1
+            name = f"lhs{k}"
+        ctype = {FLOAT: "double", INT: "long long", BOOL: "bool"}[L.type]
+        out = build(Expr(name, P_ATOM, L.type, simple=True, iv=L.iv, dims=L.dims, dimtok=L.dimtok))
+        if not known and (is_array(out.type) or is_iarray(out.type)):
+            return build(L)  # (a call of a function of the file returns a whole qt::Vec: that one is fine)
+        return Expr(f"[&] {{ const {ctype} {name} = {L.code}; return {out.code}; }}()", P_ATOM, out.type, iv=out.iv)
 
     def binop(self, node, op, L: Expr, R: Expr) -> Expr:
         if list_of(L.type) or list_of(R.type):
@@ -435,7 +496,7 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                 return Expr(f"qt::py::truediv({a.code}, {b.code})", P_ATOM, FLOAT)
             L = self.as_double(L) if both_int else self.promote(L, FLOAT)
             R = self.promote(R, FLOAT)
-            if R.value is None or R.value == 0:
+            if (R.value is None or R.value == 0) and not getattr(self, "strict", False):
                 self.note("div0", "division by zero gives ±inf or NaN in C++ where Python "
                                   "raises ZeroDivisionError")
             return Expr(f"{wrap(L, P_MUL)} / {wrap(R, P_MUL - 1)}", P_MUL, FLOAT)
@@ -469,9 +530,18 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
             return False
         if R is not None and isinstance(R.value, (int, float)) and R.value != 0:
             return False
+        if R is not None and R.type == INT and R.iv is not None and not R.iv[0] <= 0 <= R.iv[1]:
+            return False  # an int divisor known not to be 0 (k + 1 for k in range(n))
         from .origins import NP, PY
         kinds = [self.origin(node.left), self.origin(node.right)]
         if NP in kinds:
+            return False
+        if None in kinds and not getattr(self, "strict_try", False):
+            # Python itself raises on some runs and gives inf / NaN (NumPy's) on others: NumPy's
+            # result, said in the report (no except can tell the two apart here)
+            self.note("npmix", f"`{ast.unparse(node)}` may hold a NumPy number or a Python float, depending on the "
+                               "run: Python then gives inf / NaN (NumPy) or raises (ZeroDivisionError, OverflowError); "
+                               "the C++ gives inf / NaN")
             return False
         if None in kinds:
             raise Unsupported(node, f"`{ast.unparse(node)}` inside code an `except` may stop: an operand may be a "
@@ -554,8 +624,9 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                 return Expr(f"std::sqrt({L.code})", P_ATOM, FLOAT)
             if v == -1.0:
                 return Expr(f"1.0 / {wrap(L, P_MUL)}", P_MUL, FLOAT)
-        self.note("powoverflow", "float ** raises OverflowError in Python when the result "
-                                 "overflows; C++ returns inf")
+        if not getattr(self, "strict", False):
+            self.note("powoverflow", "float ** raises OverflowError in Python when the result "
+                                     "overflows; C++ returns inf")
         integral = R.type != FLOAT or (R.value is not None and float(R.value) == int(float(R.value)))
         if not integral:
             self.note("complexpow", "x ** y with a negative x and non-integer y gives a complex "
@@ -654,6 +725,13 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                 if not e.simple:
                     raise Unsupported(v, "chained comparison with a computed middle term",
                                       "store the middle value in a variable first")
+        if len(node.ops) == 1 and self.ordered(exprs[0]) and self.ordered(exprs[1]):
+            op = node.ops[0]
+            if type(op) not in _CMP:
+                raise Unsupported(node, f"the `{type(op).__name__}` comparison is not supported (no `is`, `in`)")
+            sym, p = _CMP[type(op)]
+            return self.left_first(exprs[0], exprs[1],
+                                   lambda a: Expr(f"{wrap(a, p)} {sym} {wrap(exprs[1], p - 1)}", p, BOOL))
         parts = []
         for op, a, b in zip(node.ops, exprs, exprs[1:]):
             if type(op) not in _CMP:
@@ -787,10 +865,53 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                     TupleType(tuple(p.type for p in parts)))
 
     # --- calls -----------------------------------------------------------------------------
+    _DRAWS = {"random", "standard_normal", "normal", "uniform", "integers", "gauss", "randint", "shuffle", "choice",
+              "sample", "choices", "randrange", "getrandbits", "expovariate", "lognormvariate", "normalvariate",
+              "triangular"}
+
+    def _arg_changes_something(self, a) -> bool:
+        """Does this argument (Python) call something that changes state: a function or method of
+        the file that modifies an argument or an object, prints or draws, or a random draw?"""
+        mod = self.mod
+        for n in ast.walk(a):
+            if not isinstance(n, ast.Call):
+                continue
+            if isinstance(n.func, ast.Attribute) and n.func.attr in self._DRAWS:
+                return True
+            name = n.func.id if isinstance(n.func, ast.Name) else n.func.attr if isinstance(n.func, ast.Attribute) else None
+            if name and hasattr(mod, "code_has_effect"):
+                keys = [k for k in mod.sigs if k == name or k.rsplit(".", 1)[-1] == name or k.startswith(name + "(")]
+                if any(mod.code_has_effect(mod.sigs[k].cpp.rsplit("::", 1)[-1] + "(") for k in keys):
+                    return True
+        return False
+
+    def _check_library_order(self, node):
+        """A call of a library function (max, min, math.*, np.*) whose arguments C++ may work out
+        in any order: where one changes something and another may raise or change something, the
+        state after an error would differ from Python's, which works them out left to right."""
+        args = list(node.args) + [k.value for k in node.keywords]
+        if len(args) < 2:
+            return
+        changing = [a for a in args if self._arg_changes_something(a)]
+        if not changing:
+            return
+        risky = lambda a: any(isinstance(n, (ast.Call, ast.Subscript)) or isinstance(n, ast.BinOp) and isinstance(
+            n.op, (ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)) for n in ast.walk(a))
+        others = [a for a in args if a is not changing[0] and risky(a)]
+        if others:
+            raise Unsupported(node, f"`{ast.unparse(changing[0])}` changes something and another argument of "
+                                    f"`{ast.unparse(node.func)}(...)` may raise: Python works them out left to "
+                                    "right, C++ in either order, so the state after an error could differ",
+                              f"work out `{ast.unparse(changing[0])}` on a line of its own first")
+
     def e_Call(self, node):
         if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
             raise Unsupported(node, "*args / **kwargs in calls are not supported")
         f = node.func
+        user = isinstance(f, ast.Name) and (f.id in self.mod.sigs or f.id in getattr(self.mod, "variants", {})
+                                             or f.id in getattr(self.mod, "classes", {}))
+        if not user and not (isinstance(f, ast.Attribute) and self._is_method_of_file(f)):
+            self._check_library_order(node)
         made = self.struct_call(node)
         if made is not None:
             return made
@@ -880,7 +1001,42 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                 raise Unsupported(node, f"calls {name}(): {self.mod.rejected[name].message}")
             raise Unsupported(node, f"calls {name}(), which could not be translated")
         sig = self.mod.sigs[name]
-        return Expr(f"{sig.cpp}({', '.join(self.bind_args(node, sig, name))})", P_ATOM, sig.ret)
+        codes = self.bind_args(node, sig, name)
+        return self.in_python_order(node, sig.params, codes, lambda cs: Expr(f"{sig.cpp}({', '.join(cs)})", P_ATOM, sig.ret))
+
+    def in_python_order(self, node, params, codes, build):
+        """A call whose arguments may raise: Python works them out in the order they are written
+        (positional ones, then keywords), C++ in any order. Each argument that may raise but the
+        last one is worked out first, in that order (left_first); only numbers, which are cheap
+        to hold in a temporary."""
+        written = list(node.args) + [k.value for k in node.keywords]
+        where = {}
+        for p, a in zip(params, node.args):
+            where[p.name] = a
+        for k in node.keywords:
+            where[k.arg] = k.value
+        order = {id(a): i for i, a in enumerate(written)}
+        items = [(order[id(where[p.name])], i, p) for i, p in enumerate(params[:len(codes)]) if p.name in where]
+        raising = sorted((pos, i, p) for pos, i, p in items if self.ordered(Expr(codes[i], P_ATOM, p.type)))
+        if len(raising) < 2:
+            return build(codes)
+        first = [(i, p) for _, i, p in raising[:-1]]
+        if not all(p.type in (FLOAT, INT, BOOL) for _, p in first):
+            mod = self.mod
+            if any(hasattr(mod, "code_has_effect") and mod.code_has_effect(codes[i]) for _, i, _ in raising):
+                raise Unsupported(node, "an argument of this call changes something and another may raise, and one of "
+                                        "them is an array or object: Python works them out left to right, C++ in "
+                                        "either order", "work out the one that changes something on a line of its own first")
+            return build(codes)  # (an array or object argument that may raise: which error comes out, section 15)
+
+        def nest(k, cs):
+            if k == len(first):
+                return build(cs)
+            i, p = first[k]
+            rest = Expr(" ".join(c for j, c in enumerate(cs) if j != i), P_ATOM, p.type)  # (for the names in use)
+            return self.left_first(Expr(cs[i], P_ATOM, p.type), rest,
+                                   lambda a: nest(k + 1, [a.code if j == i else c for j, c in enumerate(cs)]), known=True)
+        return nest(0, list(codes))
 
     def call_version(self, node, name):
         """A call of a function with one C++ version per kind of call: the version whose
@@ -1199,10 +1355,10 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
         for a, n in zip(args, node.args):
             self.need_scalar(a, n, f"{src}()")
 
-        if qual in lib.MATH_DOMAIN:
+        if qual in lib.MATH_DOMAIN and not getattr(self, "strict", False):
             self.note("domain:" + qual, f"{qual} raises ValueError outside its domain in Python; "
                                         "C++ returns NaN")
-        if qual in lib.MATH_RANGE:
+        if qual in lib.MATH_RANGE and not getattr(self, "strict", False):
             self.note("range:" + qual, f"{qual} raises OverflowError on overflow in Python; "
                                        "C++ returns inf")
 

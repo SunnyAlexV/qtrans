@@ -36,11 +36,12 @@ def test_headers_include_and_qualify(toy):
     assert "return x * static_cast<double>(rates::DAYS);" in core          # star-imported constant
     assert "double pv(double cf, double t, double rf = rates::DEFAULT_RF);" in core  # default from rates
     assert "cf * rates::discount(rates::DEFAULT_RF, t)" in core              # import rates as R; R.discount
-    assert "rates::Option(S, K, T).forward() - rates::Option(S, K, T, 0.0).forward()" in core
+    # (forward() may overflow in math.exp on both sides: the left one is worked out first, as in Python)
+    assert "const double left = rates::Option(S, K, T).forward();\n    return left - rates::Option(S, K, T, 0.0).forward();" in core
     assert "rates::Option make(double S)" in core
     assert "double strike_of(const rates::Option& o)" in book                # a class two modules away
     assert "rates::Portfolio fresh(long long n)" in book
-    assert "core::fwd(o.S, o.K, o.T) + core::weights(w)" in book
+    assert "const double left = core::fwd(o.S, o.K, o.T);\n    return left + core::weights(w);" in book  # (both may raise)
 
 
 def test_in_place_changes_cross_modules(toy):
@@ -59,8 +60,9 @@ def test_rejections_say_why_across_modules(toy):
     assert "bad (in rates) could not be translated" in why["uses_bad"]
     assert "sets are not supported" in why["uses_bad"]
     assert "R.TABLE" in why["uses_table"] and "(in rates)" in why["uses_table"]
-    # rates.safe_log may raise a math domain error: catching ValueError around it is refused
-    assert "except ValueError" in why["guarded"]
+    # rates.safe_log raises Python's math domain error itself (since 1.0, everywhere), so
+    # catching ValueError around it from another module is translated
+    assert "guarded" not in why
 
 
 def test_star_import_skips_private_names_and_respects_all(tmp_path):
@@ -201,7 +203,8 @@ def test_relative_imports_in_a_package(tmp_path):
               return c * disc(r, t) + 0.0 * maths.disc(r, t)
           ''')
     p = translate_project([pkg / "pricer.py"])
-    assert "c * maths::disc(r, t) + 0.0 * maths::disc(r, t)" in p.modules["pricer"].header
+    # (math.exp may raise OverflowError in both calls: the first is worked out first, as in Python)
+    assert "const double left = c * maths::disc(r, t);\n    return left + 0.0 * maths::disc(r, t);" in p.modules["pricer"].header
 
 
 def test_translate_file_pulls_in_its_imports(tmp_path):

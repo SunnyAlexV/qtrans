@@ -8,7 +8,10 @@ prints. So this document can't silently drift from what qtrans does.
 
 ## 1. The guarantee
 
-For a function or program qtrans translates, the C++ does what the Python does, on every input:
+For a function or program qtrans translates, the C++ is meant to do what the Python does, on
+every input. That is a design rule, applied construct by construct below, and checked by
+differential testing (`qtrans verify` runs both on the same inputs and compares them, section
+14) and by the test suite; it is not a formal proof. What it covers:
 
 1. **The same result.** Bit for bit wherever the operations are exact in IEEE-754 double
    arithmetic (`+ - * /`, `sqrt`, comparisons, conversions) or where qtrans ports the exact
@@ -20,7 +23,8 @@ For a function or program qtrans translates, the C++ does what the Python does, 
    LAPACK against Eigen, agree to rounding, and `qtrans verify` measures by how much.
 2. **The same errors.** The same exception class (`ValueError`, `IndexError`, `KeyError`,
    `ZeroDivisionError`, `OverflowError`, `numpy.linalg.LinAlgError`, your own classes) with the
-   same message, where Python raises one.
+   same message, where Python raises one; the float errors of Python's numbers included
+   (section 4.2), unless a function is marked `# qtrans: ieee`.
 3. **The same output.** What a program prints, character for character, and its exit status.
 4. **The same sharing.** Where Python shares an object (an array passed to a function, an object
    of a class hierarchy, a generator), a change made through one name is seen through the
@@ -31,8 +35,10 @@ the line and the reason, usually with a hint. A function calling a refused funct
 too. There are no silent approximations.
 
 The exceptions to 1 and 2 are listed in section 15 ("Differences kept by design"), each with
-its reason, and `qtrans verify` classifies every case it sees as `match`, `ill-cond`, `known`,
-`edge` or `mismatch` (section 14).
+its reason, and the report names them next to the functions they affect. `qtrans verify`
+classifies every case it sees as `match`, `ill-cond`, `known` (one of those differences),
+`edge` or `mismatch` (section 14), and counts each group separately, so a `known` case is
+never counted as a match.
 
 **What the C++ needs:** C++17; IEEE-754 doubles; 64-bit `long long`; no fast-math (every
 generated header refuses to compile under `-ffast-math` or `/fp:fast`); floating-point
@@ -139,9 +145,11 @@ def f(x: float) -> float:
 
 ### 4.1 int
 
-Python's ints never overflow; `long long` does. Arithmetic that could leave 64 bits is checked
-(`qt::iadd`, `qt::imul`, ...) and raises `OverflowError` where Python would go on with a bigger
-int; arithmetic qtrans can show stays inside 64 bits is plain C++. `//` and `%` round toward −∞,
+An int is a `long long`: Python's int rules hold within 64 bits (about ±9.2 × 10¹⁸), and there
+is no arbitrary-precision int. Arithmetic that could leave that range is checked (`qt::iadd`,
+`qt::imul`, ...) and raises `OverflowError` where Python's unlimited int would go on, rather
+than wrap silently; arithmetic qtrans can show stays inside 64 bits is plain C++. An int that is
+surely beyond 64 bits whatever the input (`2 ** 100`) is refused. `//` and `%` round toward −∞,
 as Python's do, and raise `ZeroDivisionError` for a zero divisor; `/` of two ints is a float;
 `**` with a constant exponent is exact (a negative exponent gives a float).
 
@@ -150,7 +158,7 @@ def f(a: int, b: int) -> int:
     return a // b + a % b
 ```
 
-```python spec translated "static_cast<double>(a) / static_cast<double>(b)"
+```python spec translated "qt::py::truediv(a, b)"
 def f(a: int, b: int) -> float:
     return a / b
 ```
@@ -171,9 +179,10 @@ for NaN and `OverflowError` for infinities and values past 64 bits.
 
 `x ** y` and `math.pow` are the C library's `pow`, as CPython calls it. A C++ compiler turns
 `std::pow(x, 2.0)` into `x * x` and `std::pow(x, -1.0)` into `1.0 / x`, which round differently
-for about 1 value in 1,000 (glibc), so qtrans writes `qt::pow`, which keeps the call:
+for about 1 value in 1,000 (glibc), so qtrans calls `qt::pow`, which keeps the call
+(`qt::py::power` is `qt::pow` plus Python's errors, below):
 
-```python spec translated "qt::pow(s, 2.0)"
+```python spec translated "qt::py::power(s, 2.0)"
 def f(s: float) -> float:
     return s ** 2
 ```
@@ -187,18 +196,34 @@ def f(x: float) -> float:
     return np.power(x, 2)
 ```
 
-Python raises on a float division by zero, an overflowing `**` or `math.exp`, and a math domain
-error (`math.sqrt(-1)`, `math.log(0.0)`), where C++ gives inf or NaN. Inside a `try` whose
-handler may catch such an error (and in everything that `try` calls), qtrans raises exactly as
-Python does, with the running Python's message; elsewhere the IEEE result stands, and `qtrans
-verify` reports those inputs as `known` (section 15).
+**Float errors.** Python raises on a float division by zero (`ZeroDivisionError`), an
+overflowing `**`, `math.exp` or `math.cosh` (`OverflowError`) and a math domain error
+(`math.sqrt(-1)`, `math.log(0.0)`: `ValueError`), where a C++ double gives inf or NaN. Since
+1.0 the C++ raises them as Python does, with the running Python's message, everywhere: each
+check is a compare that is almost never taken (1% to 18% per call on scalar pricing functions,
+`tools/float_error_cost.py`; nothing for NumPy arrays, which don't raise).
 
-```python spec translated "qt::py::truediv(a, b)"
-def f(a: float, b: float) -> float:
-    try:
-        return a / b
-    except ZeroDivisionError:
-        return 0.0
+```python spec translated "qt::py::truediv(a, b)" "qt::py::math_log(x)"
+import math
+
+def f(a: float, b: float, x: float) -> float:
+    return a / b + math.log(x)
+```
+
+NumPy's numbers don't raise: `np.float64(1.0) / 0.0` is inf, with a warning, in Python too, so
+there the C++ keeps IEEE-754's result. A value that is a NumPy number on some runs and a Python
+float on others (`max(np.exp(x), 0.0)`) makes Python raise on some runs and not on others; the
+C++ then gives NumPy's inf or NaN, and the report says so next to the function (inside a `try`
+that may catch the error, where the two would take different branches, it is refused).
+
+`# qtrans: ieee` on a `def` (or on a line of its own at the top of the file, for every
+function of the module) gives the checks up: the function keeps IEEE-754's inf and NaN, and
+`qtrans verify` reports the inputs where that shows as `known`, never as a match. Inside a `try`
+that may catch one of these errors the hint has no effect.
+
+```python spec translated "return a / b;"
+def f(a: float, b: float) -> float:  # qtrans: ieee
+    return a / b
 ```
 
 ### 4.3 Evaluation order
@@ -217,6 +242,30 @@ def f(rng: np.random.Generator) -> float:
 
 A `print()` line is the exception: its values are worked out in order (a braced list, which
 C++ does evaluate left to right).
+
+Where two parts of an expression can raise, the order decides which error Python raises:
+`math.log(S / K) / (sigma * math.sqrt(T))` raises `ZeroDivisionError` for `S = K = 0.0` and
+`T < 0`, and the C++ would raise `ValueError` if it worked out the right side first. So when
+both operands of an operator on numbers, or several arguments of a call to a function, method
+or class of the file (and the object a method is called on), can raise or change something (a
+call that modifies an argument, prints or draws a random number), the earlier ones are worked out
+first, into temporaries; and in `xs[k] += v` the element is found (IndexError, KeyError) before
+`v` is worked out, as Python does:
+
+```python spec translated "const double left = qt::py::math_log(qt::py::truediv(S, K));"
+import math
+
+def d1(S: float, K: float, sigma: float, T: float) -> float:
+    return math.log(S / K) / (sigma * math.sqrt(T))
+```
+
+A library function's arguments (`max(...)`, `math.*`, `np.*`) are not reordered: where one of
+them changes something and another may raise, it is refused (the state after the error would
+differ), with a hint to work the first out on its own line. Which error comes out is not yet
+kept for the arguments of library functions (`max(a / b, c / d)`), for array or object
+arguments, nor between a number and an array (`math.log(c) * (A @ x)`, where a temporary would
+outlive Eigen's lazy array expression): there, when two parts raise at once, which of the two
+errors comes out may differ (section 15).
 
 ## 5. Text
 
@@ -585,14 +634,22 @@ For a program, its output and exit status must be identical.
 
 Each is named in the per-module report next to the functions it affects.
 
-- **Float errors outside a guarding `try`**: `x / 0.0`, overflow in `**` and `math.exp`,
-  `math.log(-1.0)` give inf or NaN in C++ (IEEE-754), where Python raises. Inside a `try` whose
-  handler may catch them they raise as in Python (section 4.2).
+- **Functions marked `# qtrans: ieee`**: `x / 0.0`, overflow in `**` and `math.exp`,
+  `math.log(-1.0)` give inf or NaN, where Python raises (you asked for it, section 4.2).
+- **A value that may be a NumPy number or a Python float, depending on the run**: Python raises
+  on some runs and gives inf / NaN on others; the C++ gives NumPy's inf or NaN (section 4.2).
+- **A float that goes complex**: `(-8.0) ** (1/3)` is a complex number in Python and NaN in C++,
+  so what follows differs (`round()` of it raises `TypeError` in Python, `ValueError` in C++; and
+  `(-1e308) ** 2.5`, too big even as a complex number, raises `OverflowError` in Python).
 - **ints past 64 bits** raise `OverflowError` in C++; Python's int grows. (NumPy's int64 arrays
   wrap, in both.)
 - **The last bits** where NumPy or SciPy use their own `exp`, `pow`, `erf` or BLAS / LAPACK.
-- **Which of two errors is raised** when one expression breaks two checks at once: C++ evaluates
-  arguments in an unspecified order. Both reject the input.
+- **Which of two errors is raised** when two arguments of a library function (`max(a / b, c / d)`),
+  two array or object arguments, or a number and an array operand (`math.log(c) * (A @ x)`)
+  raise at once: C++ evaluates those in an unspecified order. Both reject the input; `qtrans
+  verify` counts such a case as `known` (order) whenever both sides raise an error that rejects
+  the input. (Operators on numbers and calls of the file's own functions follow Python's order,
+  section 4.3.)
 - **`assert`** always runs in C++; `python -O` strips it.
 - **Objects whose fields are the same NaN**: Python's dataclass `==` treats one float object as
   equal to itself even when it is NaN; C++ compares values.
@@ -604,6 +661,7 @@ Each is named in the per-module report next to the functions it affects.
 
 ## 16. Versions
 
-This document describes qtrans 0.14. It is checked on Python 3.10 to 3.14, NumPy 2, and Eigen 3.4
+This document describes qtrans 1.0. From 1.0 on, a change to what it says is a change of major
+version (2.0), except for additions: what 1.x refuses, a later 1.x may translate. It is checked on Python 3.10 to 3.14, NumPy 2, and Eigen 3.4
 and 5.0, on Linux (GCC, Clang), macOS (Apple Clang) and Windows (MinGW g++, MSVC for the
 bindings).

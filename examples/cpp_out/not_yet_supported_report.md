@@ -5,14 +5,7 @@
 ## Translated
 
 - `discount` (line 8)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `forward` (line 51)
-
-## Differences on overflow and error paths
-
-These only matter on inputs where Python would raise an exception or overflow.
-
-- division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: forward)
 
 ## Not translated
 

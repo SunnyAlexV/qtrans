@@ -60,7 +60,8 @@ def test_power_and_np_power_keep_their_own_rules():
     h = translate_source("import numpy as np\n\ndef f(x: float) -> float:\n    return x ** 2 + x ** -1\n\n"
                          "def g(x: float) -> float:\n    return np.power(x, 2) + np.power(x, 0.5) + np.power(x, -1)\n",
                          "m").header
-    assert "qt::pow(x, 2.0) + qt::pow(x, -1.0)" in h
+    # (qt::py::power is qt::pow plus Python's errors; both terms may raise, so the left one first)
+    assert "const double left = qt::py::power(x, 2.0);\n    return left + qt::py::power(x, -1.0);" in h
     assert "x * x + std::sqrt(x) + 1.0 / x" in h
     x = np.float64(1.431322935583394)
     assert np.power(x, 2) == x * x  # NumPy's square

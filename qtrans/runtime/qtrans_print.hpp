@@ -861,11 +861,43 @@ inline std::string concat_text(std::initializer_list<std::string> parts) {
 
 // --- Python's float errors, where Python raises them ----------------------------------------------
 // A C++ double carries on where a Python float raises: 1.0 / 0.0 is inf, math.sqrt(-1) NaN,
-// math.exp(1000) inf. Inside code whose errors a Python `except` may catch (ZeroDivisionError,
-// ArithmeticError, OverflowError, ValueError, Exception), the translation uses these instead:
-// they raise what CPython raises, with this Python's message (qtrans_python.hpp), and otherwise
-// return the very same double. (NumPy's numbers don't raise, so they are never used for those.)
+// math.exp(1000) inf. Since 1.0 the translation uses these for Python's floats (not in a function
+// marked `# qtrans: ieee`): they raise what CPython raises, with this Python's message
+// (qtrans_python.hpp), and otherwise return the very same double. (NumPy's numbers don't raise,
+// so they are never used for those.) Each check is one or two compares marked unlikely, and the
+// throw itself is a separate cold function, so the code around it stays as fast as it can.
+#if defined(__GNUC__) || defined(__clang__)
+#define QT_PY_COLD __attribute__((noinline, cold))
+#define QT_PY_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#elif defined(_MSC_VER)
+#define QT_PY_COLD __declspec(noinline)
+#define QT_PY_UNLIKELY(x) (x)
+#else
+#define QT_PY_COLD
+#define QT_PY_UNLIKELY(x) (x)
+#endif
 namespace pyerr {
+inline std::string domain_text(const msg::DomainText* t, double x, bool from_int);
+[[noreturn]] QT_PY_COLD inline void raise_domain(const msg::DomainText* t, double x, bool from_int) {
+    throw ValueError(domain_text(t, x, from_int));
+}
+[[noreturn]] QT_PY_COLD inline void raise_range() { throw OverflowError(msg::math_range); }
+[[noreturn]] QT_PY_COLD inline void raise_zero_division(const char* text) { throw ZeroDivisionError(text); }
+[[noreturn]] QT_PY_COLD inline void raise_overflow(const char* text) { throw OverflowError(text); }
+// a math function gave inf or NaN: Python's error, if it raises one here (NaN in, NaN out doesn't)
+QT_PY_COLD inline void math1_check(double r, double x, const msg::DomainText* text, bool can_overflow, bool from_int) {
+    if (std::isnan(r) && !std::isnan(x)) raise_domain(text, x, from_int);
+    if (std::isinf(r) && std::isfinite(x)) {
+        if (can_overflow) raise_range();
+        raise_domain(text, x, from_int);
+    }
+}
+// x ** y gave inf: 0.0 ** negative is ZeroDivisionError, a finite x and y overflowing OverflowError
+QT_PY_COLD inline void power_check(double x, double y, bool ints) {
+    if (std::isfinite(y) && x == 0.0 && y < 0.0)
+        raise_zero_division(ints ? msg::int_zero_negative_power : msg::zero_negative_power);
+    if (std::isfinite(x) && std::isfinite(y)) raise_overflow(msg::float_pow_overflow);
+}
 inline std::string domain_text(const msg::DomainText* t, double x, bool from_int) {
     const int cls = x == 0 ? 1 : x == -qt::inf ? 2 : x == qt::inf ? 3 : 0;
     const msg::DomainText& d = t[cls];
@@ -878,11 +910,7 @@ inline std::string domain_text(const msg::DomainText* t, double x, bool from_int
 template <class F>
 double math1(F f, double x, const msg::DomainText* text, bool can_overflow, bool from_int) {
     const double r = f(x);
-    if (std::isnan(r) && !std::isnan(x)) throw ValueError(domain_text(text, x, from_int));
-    if (std::isinf(r) && std::isfinite(x)) {
-        if (can_overflow) throw OverflowError(msg::math_range);
-        throw ValueError(domain_text(text, x, from_int));
-    }
+    if (QT_PY_UNLIKELY(!std::isfinite(r))) math1_check(r, x, text, can_overflow, from_int);  // one compare when all is well
     return r;
 }
 // gamma and lgamma are CPython's own (Modules/mathmodule.c: Lanczos' approximation, with the
@@ -1070,21 +1098,19 @@ inline double math_fmod(double x, double y) {
 }
 // a / b of two Python numbers: ZeroDivisionError for b == 0 (ints and floats have their own words)
 inline double truediv(double a, double b) {
-    if (b == 0.0) throw ZeroDivisionError(msg::float_truediv_zero);
+    if (QT_PY_UNLIKELY(b == 0.0)) pyerr::raise_zero_division(msg::float_truediv_zero);
     return a / b;
 }
 inline double truediv(long long a, long long b) {
-    if (b == 0) throw ZeroDivisionError(msg::int_truediv_zero);
+    if (QT_PY_UNLIKELY(b == 0)) pyerr::raise_zero_division(msg::int_truediv_zero);
     return static_cast<double>(a) / static_cast<double>(b);
 }
 // x ** y of Python floats (CPython's float_pow): 0.0 ** negative raises ZeroDivisionError, an
 // overflow OverflowError; a negative x to a fractional power is complex in Python (NaN here)
 inline double power(double x, double y, bool ints = false) {
-    if (y == 0.0) return 1.0;
-    if (std::isfinite(y) && x == 0.0 && y < 0.0)
-        throw ZeroDivisionError(ints ? msg::int_zero_negative_power : msg::zero_negative_power);
+    // (pow(x, 0.0) is 1.0 for every x, as in Python; pow(0.0, y < 0) is inf, so both errors show as inf)
     const double r = qt::pow(x, y);
-    if (std::isinf(r) && std::isfinite(x) && std::isfinite(y)) throw OverflowError(msg::float_pow_overflow);
+    if (QT_PY_UNLIKELY(std::isinf(r))) pyerr::power_check(x, y, ints);
     return r;
 }
 

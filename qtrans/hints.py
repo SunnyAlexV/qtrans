@@ -5,8 +5,18 @@
                         # qtrans: noinline / hot / cold
     if x > barrier:     # qtrans: unlikely        ->  if (QT_UNLIKELY(x > barrier))
 
-A hint goes on the line it is about, or on a comment line of its own just above it. None of these
-can change a number: unrolling repeats the loop body without reordering its floating-point
+One hint is not about speed:
+
+    def payoff(...):    # qtrans: ieee            ->  inf and NaN (IEEE-754) where Python's floats raise
+    # qtrans: ieee      (at the top of the file, before any code: every function of the module)
+
+Since 1.0 the C++ raises ZeroDivisionError, OverflowError and math's ValueError where Python's
+floats do. `ieee` gives that up for a function (a check fewer per division, exp, log, ...), and
+qtrans verify reports the inputs where it shows as `known`, never as a match; inside a `try` that
+may catch those errors it has no effect.
+
+A hint goes on the line it is about, or on a comment line of its own just above it. None of the
+speed hints can change a number: unrolling repeats the loop body without reordering its floating-point
 operations (no -ffast-math), and the others only steer inlining and code layout. Hints that
 could change a result -- fast-math, simd / vectorize, parallel, ivdep, restrict -- are refused
 with the reason, as is anything unknown (a typo shouldn't be silently ignored). The macros are
@@ -21,7 +31,7 @@ import re
 HINT = re.compile(r"^qtrans:\s*(.*)$")
 
 ON_LOOP = {"unroll"}
-ON_DEF = {"inline", "noinline", "hot", "cold"}
+ON_DEF = {"inline", "noinline", "hot", "cold", "ieee"}
 ON_IF = {"likely", "unlikely"}
 
 REFUSED = {
@@ -87,7 +97,7 @@ def _parse(text):
         if len(words) != 1:
             return word, f"`{word}` takes nothing after it"
         return word, None
-    known = "unroll N, inline, noinline, hot, cold, likely, unlikely"
+    known = "unroll N, inline, noinline, hot, cold, likely, unlikely, ieee"
     return word, f"unknown qtrans hint (known: {known})"
 
 
@@ -103,6 +113,9 @@ def collect(tree, full_comments, inline_comments):
         elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             owners[n.lineno] = ("def", n)
     hints, problems = {}, []
+    body = getattr(tree, "body", [])
+    first = next((n.lineno for n in body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                                                 and isinstance(n.value.value, str))), 10 ** 9)
     comments = [(ln, t, True) for ln, t in inline_comments.items()] + [(ln, t, False) for ln, t in full_comments.items()]
     for ln, text, inline in sorted(comments):
         m = HINT.match(text.strip())
@@ -118,6 +131,9 @@ def collect(tree, full_comments, inline_comments):
             problems.append(f"line {ln}: `# qtrans: {m.group(1).strip()}`: {value}")
             continue
         owner = owners.get(target)
+        if owner is None and word == "ieee" and not inline and ln < first:
+            hints.setdefault(0, {})["ieee"] = None  # at the top of the file: every function of the module
+            continue
         if owner is None:
             problems.append(f"line {ln}: `# qtrans: {m.group(1).strip()}` isn't on a loop, an if or a def: not used")
             continue
@@ -126,7 +142,7 @@ def collect(tree, full_comments, inline_comments):
         if not fits:
             where = {"loop": "a loop", "def": "a def", "if": "an if"}[kind]
             problems.append(f"line {ln}: `# qtrans: {word}` doesn't apply to {where} "
-                            f"(unroll: loops; inline / noinline / hot / cold: defs; likely / unlikely: ifs)")
+                            f"(unroll: loops; inline / noinline / hot / cold / ieee: defs, or ieee at the top of the file; likely / unlikely: ifs)")
             continue
         h = hints.setdefault(target, {})
         if word in ("inline", "noinline") and ({"inline", "noinline"} - {word}) & set(h):

@@ -154,7 +154,7 @@ class _FunctionOrigins:
                 recs.append((n.target, lambda v=n.value: self.of(v), n.value))
             elif isinstance(n, ast.AugAssign):
                 recs.append((n.target, lambda n=n: binop(self.of(n.target), self.of(n.value)), None))
-            elif isinstance(n, ast.For):
+            elif isinstance(n, (ast.For, ast.comprehension)):  # (a comprehension's variable: an element too)
                 recs.append((n.target, lambda it=n.iter: self._element(it), None))
             elif isinstance(n, ast.NamedExpr):
                 recs.append((n.target, lambda v=n.value: self.of(v), n.value))
@@ -324,6 +324,10 @@ class _FunctionOrigins:
             if node.attr in ("size", "ndim"):
                 return PY
             owners = [c for c in self.mod.classes.values() if c.field(node.attr) is not None and not c.external]
+            if isinstance(node.value, ast.Name) and node.value.id == "self" and self.cls in self.mod.classes:
+                mine = self.mod.classes[self.cls]  # self.x in a method: that class's field (and its subclasses')
+                owners = [c for c in owners if c is mine or (hasattr(c, "derives_from") and c.derives_from(mine))
+                          or (hasattr(c, "ancestors") and mine in c.ancestors())]
             if owners and hasattr(self.mod, "struct_repr_problem") and isinstance(node.value, (ast.Name, ast.Attribute)):
                 f = owners[0].field(node.attr)
                 if isinstance(f.type, Scalar) and all(self.mod.struct_repr_problem(c) is None for c in owners):

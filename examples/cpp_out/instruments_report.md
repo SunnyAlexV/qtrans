@@ -16,6 +16,7 @@
 - `weight_bounds` (line 198)
 - `book_value` (line 209)
 - `bumped_delta` (line 213)
+  - `(up.price() - dn.price()) / (2.0 * h)` may hold a NumPy number or a Python float, depending on the run: Python then gives inf / NaN (NumPy) or raises (ZeroDivisionError, OverflowError); the C++ gives inf / NaN
 - `straddle` (line 220)
 - `quote_stats` (line 226)
 - `bond_price` (line 231)
@@ -26,22 +27,17 @@
 - `leveraged_nav` (line 256)
 - `Option.__post_init__` (line 31)
 - `Option.forward` (line 36)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `Option.d1` (line 39)
-  - math.log raises ValueError outside its domain in Python; C++ returns NaN
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
+  - `self.forward / self.K` may hold a NumPy number or a Python float, depending on the run: Python then gives inf / NaN (NumPy) or raises (ZeroDivisionError, OverflowError); the C++ gives inf / NaN
 - `Option.price` (line 42)
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `Option.delta` (line 50)
 - `Option.atm` (line 55)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `Quote.mid` (line 64)
 - `Quote.spread_bps` (line 67)
 - `Curve.__post_init__` (line 77)
 - `Curve.zero` (line 83)
+  - `(t - ts[i - 1]) / (ts[i] - ts[i - 1])` may hold a NumPy number or a Python float, depending on the run: Python then gives inf / NaN (NumPy) or raises (ZeroDivisionError, OverflowError); the C++ gives inf / NaN
 - `Curve.df` (line 96)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 - `Bond.__post_init__` (line 108)
   - float -> int beyond ±9.2e18 raises OverflowError in C++; Python returns a big integer
 - `Bond.price` (line 113)
@@ -51,15 +47,12 @@
 - `Account.nav` (line 149)
 - `GBMEngine.__init__` (line 156)
 - `GBMEngine.terminal` (line 166)
+  - `years / self.dt` may hold a NumPy number or a Python float, depending on the run: Python then gives inf / NaN (NumPy) or raises (ZeroDivisionError, OverflowError); the C++ gives inf / NaN
   - float -> int beyond ±9.2e18 raises OverflowError in C++; Python returns a big integer
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `GBMEngine.call` (line 180)
-  - math.exp raises OverflowError on overflow in Python; C++ returns inf
 
 ## Differences on overflow and error paths
 
 These only matter on inputs where Python would raise an exception or overflow.
 
-- division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: bumped_delta, Option.d1, Quote.spread_bps, Curve.zero, Bond.price, GBMEngine.__init__, GBMEngine.terminal)
-- float ** raises OverflowError in Python when the result overflows; C++ returns inf (applies to: Option.d1, GBMEngine.terminal)
 - int arithmetic that could leave 64 bits is checked: where Python's unbounded int would exceed ±9.2e18, C++ raises OverflowError (applies to: Curve.zero, Bond.price, Portfolio.rebalance, GBMEngine.terminal)

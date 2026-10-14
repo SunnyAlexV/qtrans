@@ -5,15 +5,8 @@
 ## Translated
 
 - `vol_target_scale` (line 53)
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `buy_and_hold_returns` (line 84)
   - np.errstate(...) blocks are translated as their contents: they only change which floating-point warnings NumPy prints, never the values
-
-## Differences on overflow and error paths
-
-These only matter on inputs where Python would raise an exception or overflow.
-
-- division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: vol_target_scale)
 
 ## Not translated
 

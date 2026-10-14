@@ -121,7 +121,8 @@ class StructOps:
                     raise Unsupported(node, f"{name}.{f.attr}(...) must be a @staticmethod or @classmethod")
                 sig = self._method_sig(m, node)
                 args = self.bind_args(node, sig, f"{name}.{f.attr}")
-                return Expr(f"{info.cpp}::{sig.cpp}({', '.join(args)})", P_ATOM, sig.ret)
+                return self.in_python_order(node, sig.params, args,
+                                            lambda cs: Expr(f"{info.cpp}::{sig.cpp}({', '.join(cs)})", P_ATOM, sig.ret))
         if self.qualify(f) == "dataclasses.replace":
             return self.replace_call(node)
         if self._is_module_path(f.value):
@@ -141,8 +142,10 @@ class StructOps:
         sig = self._method_sig(m, node)
         args = self.bind_args(node, sig, f"{info.name}.{f.attr}")
         if m.kind in ("static", "class"):
-            return Expr(f"{info.cpp}::{sig.cpp}({', '.join(args)})", P_ATOM, sig.ret)
-        return Expr(f"{self._member(base, sig.cpp)}({', '.join(args)})", P_ATOM, sig.ret)
+            return self.in_python_order(node, sig.params, args,
+                                        lambda cs: Expr(f"{info.cpp}::{sig.cpp}({', '.join(cs)})", P_ATOM, sig.ret))
+        return self.with_receiver(node, base, sig.params, args,
+                                  lambda b: lambda cs: Expr(f"{self._member(b, sig.cpp)}({', '.join(cs)})", P_ATOM, sig.ret))
 
     def super_call(self, node, owner) -> Expr:
         """super().method(...): the base class's version, called directly (Payoff::value(spot));
@@ -175,7 +178,8 @@ class StructOps:
         sig = self._method_sig(m, node)
         args = self.bind_args(node, sig, f"{base.name}.{f.attr}")
         holder = base.method_owner(f.attr)
-        return Expr(f"{holder.cpp}::{sig.cpp}({', '.join(args)})", P_ATOM, sig.ret)
+        return self.in_python_order(node, sig.params, args,
+                                    lambda cs: Expr(f"{holder.cpp}::{sig.cpp}({', '.join(cs)})", P_ATOM, sig.ret))
 
     def construct(self, node, info) -> Expr:
         """Option(S=100.0, K=95.0, ...): the arguments in field order, defaults spelled out where
@@ -198,7 +202,8 @@ class StructOps:
                     raise Unsupported(node, f"{info.name}() takes no arguments")
                 return Expr(self.make_object(info, []), P_ATOM, info.type)
             sig = self._method_sig(init, node)
-            return Expr(self.make_object(info, self.bind_args(node, sig, info.name)), P_ATOM, info.type)
+            return self.in_python_order(node, sig.params, self.bind_args(node, sig, info.name),
+                                        lambda cs: Expr(self.make_object(info, cs), P_ATOM, info.type))
         fields = info.init_fields
         if len(node.args) > len(fields):
             raise Unsupported(node, f"{info.name}() takes {len(fields)} arguments but {len(node.args)} were given")
@@ -221,7 +226,7 @@ class StructOps:
             a = bound[f.name]
             e = self.expr_raw(a) if isinstance(f.type, OptionalType) else self.expr(a)
             codes.append(self.convert_to(e, f.type, a, f"field '{f.name}' of {info.name}").code)
-        return Expr(self.make_object(info, codes), P_ATOM, info.type)
+        return self.in_python_order(node, fields, codes, lambda cs: Expr(self.make_object(info, cs), P_ATOM, info.type))
 
     def replace_call(self, node) -> Expr:
         """dataclasses.replace(o, K=100.0): a new object through the constructor (so

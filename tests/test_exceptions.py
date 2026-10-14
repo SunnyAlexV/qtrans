@@ -135,6 +135,10 @@ def safe(s: float, k: float) -> float:
 
 def plain(a: float, b: float) -> float:
     return a / b
+
+
+def fast(a: float, b: float) -> float:  # qtrans: ieee
+    return a / b
 '''
 
 
@@ -144,9 +148,11 @@ def test_the_cpp_reads_as_written_by_hand():
     assert 'const char* type_name() const noexcept override { return "PricingError"; }' in h
     assert 'throw PricingError("bad strike " + qt::py::str(k));' in h
     assert "} catch (const qt::ValueError& e) {  // except ValueError as e" in h
-    # price runs inside safe's try: its division and log raise as Python's do; plain's don't
+    # since 1.0 a division and a log raise as Python's do everywhere (price runs inside safe's
+    # try, plain doesn't), but not in a function marked `# qtrans: ieee`
     assert "return qt::py::math_log(qt::py::truediv(s, k));" in h
-    assert "return a / b;" in h
+    assert "inline double plain(double a, double b) {\n    return qt::py::truediv(a, b);" in h
+    assert "inline double fast(double a, double b) {\n    return a / b;" in h
 
 
 @pytest.mark.parametrize("src, words", [

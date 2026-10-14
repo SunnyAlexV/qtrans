@@ -1972,7 +1972,10 @@ def _compare_values_loose(a, b, rtol, atol) -> bool:
     return pa.shape == ca.shape and _compare_arrays(pa.reshape(-1), ca.reshape(-1), rtol, atol)[0]
 
 
-def classify(case: Case, ret, rtol, atol):
+def classify(case: Case, ret, rtol, atol, exact_floats=False):
+    """exact_floats: the function raises Python's float errors itself (Signature.float_errors,
+    since 1.0), so where Python raises one the C++ must raise it too: that's a match, and
+    anything else a mismatch, not a known difference."""
     if case.unstable:
         case.outcome = "mismatch"
         return
@@ -1989,8 +1992,10 @@ def classify(case: Case, ret, rtol, atol):
         # OverflowError: the documented 64-bit int difference, never a silently wrong number
         case.outcome = "known"
     elif py[0] == "exc" and (
-            py[1] in ("ZeroDivisionError", "OverflowError")
-            or (py[1] == "ValueError" and _float_error_message(py[2]))
+            (not exact_floats and py[1] in ("ZeroDivisionError", "OverflowError"))
+            # (-1e308) ** 2.5: complex, and too big for one: OverflowError in Python, NaN in C (as above)
+            or (py[1] == "OverflowError" and "complex" in py[2])
+            or (not exact_floats and py[1] == "ValueError" and _float_error_message(py[2]))
             # x ** y with x < 0 and fractional y: a Python float goes complex (and the next
             # real-only operation raises TypeError); C, like np.float64, gives NaN
             or (py[1] == "TypeError" and "complex" in py[2])):
@@ -2494,7 +2499,7 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         c.cpp = _parse_cpp_line(outline, output_type(sig))
         c.audit = audit
         c.cpp_out = out_text
-        classify(c, output_type(sig), fc.rtol, fc.atol)
+        classify(c, output_type(sig), fc.rtol, fc.atol, exact_floats=getattr(sig, "float_errors", False))
         if c.outcome == "match" and c.py_out != c.cpp_out and not printed_agrees(c.py_out, c.cpp_out, fc.rtol):
             c.outcome = "mismatch"  # same result, but it printed something else
             c.printed_differs = True

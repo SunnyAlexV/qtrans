@@ -1054,7 +1054,7 @@ def _same_trace(a, b, rtol, atol) -> bool:
     return True
 
 
-def _outcome(py, cpp, t, rtol, atol, sens_fn=None, flip_fn=None):
+def _outcome(py, cpp, t, rtol, atol, sens_fn=None, flip_fn=None, exact_floats=False):
     """Compare ("ok", value) / ("exc", e) pairs the way verify does."""
     if py[0] == "exc" and cpp[0] == "exc" and _related(py[1], cpp[1]):
         return "match"
@@ -1088,7 +1088,7 @@ def _outcome(py, cpp, t, rtol, atol, sens_fn=None, flip_fn=None):
         return "known"  # Python's int grew past 64 bits; C++ raises OverflowError (documented)
     if py[0] == "exc" and cpp[0] == "exc":
         case.cpp = ("exc", "unrelated", str(cpp[1]))  # so classify only accepts a known float error
-    V.classify(case, t, rtol, atol)
+    V.classify(case, t, rtol, atol, exact_floats=exact_floats)
     return case.outcome
 
 
@@ -1205,7 +1205,8 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
             for k, bargs in enumerate(variants):
                 bsnap = _snapshot(bargs, obj_refs) if k == 0 else []
                 cpp, _ = _result(bfn, bargs, sig.params, sig.ret, ref_idx)
-                o = _outcome(py, cpp, out_t or sig.ret, f_rtol, f_atol, sens, flips)
+                o = _outcome(py, cpp, out_t or sig.ret, f_rtol, f_atol, sens, flips,
+                             exact_floats=getattr(sig, "float_errors", False))
                 if k == 0 and o != "mismatch" and not _same_trace(ptrace, _trace(bargs, bsnap), f_rtol, f_atol):
                     o = "mismatch"  # changed in place where Python re-points, or the other way round
                     cpp = ("ok", ("arrays held by the objects passed in:", _trace(bargs, bsnap), "Python:", ptrace))
@@ -1277,7 +1278,7 @@ def _check_module(result, pymod, mod, binder, compiled_classes, prefix, n_random
                 if out_t is None and py[0] == "ok":
                     mc.add("known")
                     continue
-                o = _outcome(py, cpp, out_t, f_rtol, f_atol)
+                o = _outcome(py, cpp, out_t, f_rtol, f_atol, exact_floats=getattr(msig, "float_errors", False))
                 if o in ("match", "known") and m.kind not in ("static", "class", "property"):
                     # and the object itself ends up the same (a method may change it)
                     eq = V._compare_values(po2, bo2, info.type, f_rtol, f_atol)[0]

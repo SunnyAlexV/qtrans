@@ -9,7 +9,6 @@
 - `ledoit_wolf_identity` (line 34)
   - np.einsum is computed by direct summation; NumPy's kernels add in a different order, so results agree to rounding rather than bit for bit
 - `_ewma_weights` (line 67)
-  - x ** y with a negative x and non-integer y gives a complex number for a Python float but NaN in C++ (and for np.float64)
 - `horizon_returns` (line 73)
 - `variance_ratio` (line 88)
   - np.errstate(...) blocks are translated as their contents: they only change which floating-point warnings NumPy prints, never the values
@@ -24,18 +23,14 @@
 - `posterior_sigma` (line 702)
   - np.linalg.pinv agrees with NumPy to rounding; singular values within rounding of the rcond cutoff can be kept by one and dropped by the other
 - `portfolio_stats` (line 766)
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `_downside_dev` (line 774)
-  - math.sqrt raises ValueError outside its domain in Python; C++ returns NaN
 - `_cvar` (line 781)
 
 ## Differences on overflow and error paths
 
 These only matter on inputs where Python would raise an exception or overflow.
 
-- division by zero gives ±inf or NaN in C++ where Python raises ZeroDivisionError (applies to: ledoit_wolf_identity, _ewma_weights, variance_ratio, portfolio_stats)
 - int arithmetic that could leave 64 bits is checked: where Python's unbounded int would exceed ±9.2e18, C++ raises OverflowError (applies to: ledoit_wolf_identity, _ewma_weights, variance_ratio)
-- float ** raises OverflowError in Python when the result overflows; C++ returns inf (applies to: _ewma_weights)
 
 ## Not translated
 
