@@ -192,7 +192,10 @@ def test_python_errors_come_out_of_the_cpp(tmp_path):
     assert d1_cases and d1_cases[0].py[1] == "ZeroDivisionError" and d1_cases[0].outcome == "match"
     assert rep.program is not None and rep.program.identical, rep.to_text()
     assert rep.program.py_code == rep.program.cpp_code == 1
-    assert "ZeroDivisionError: float division by zero" in rep.program.cpp_err
+    # the last line of Python's traceback, in the running Python's words ("float division by zero"
+    # up to 3.13, "division by zero" in 3.14)
+    assert rep.program.cpp_err.strip() == rep.program.py_err.strip().splitlines()[-1]
+    assert rep.program.cpp_err.startswith("ZeroDivisionError: ")
 
 
 # --- what an independent review of 1.0 found, each kept as a test ------------------------------
@@ -325,3 +328,14 @@ def test_storing_into_a_list_field_is_refused_not_a_crash():
                 self.xs[k] += 1.0
         """), "m")
     assert any("held in a field is not supported yet" in f.reason for f in r.report.rejected)
+
+
+def test_a_cached_python_header_missing_a_message_is_written_again():
+    """qtrans_python.hpp is written once per Python version into the user's cache. One written by
+    an earlier qtrans may lack a message the runtime now uses (fsum's, say): it is not accepted,
+    so it is written again, whatever its FACTS number says."""
+    from qtrans import pyfacts
+    text = pyfacts.SHIPPED.read_text(encoding="utf-8")
+    assert pyfacts._version_of(text) is not None
+    stale = "\n".join(l for l in text.splitlines() if "fsum_overflow" not in l)
+    assert pyfacts._version_of(stale) is None

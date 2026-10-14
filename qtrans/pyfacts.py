@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import functools
 import sys
 import tempfile
 from pathlib import Path
@@ -216,13 +218,26 @@ def generate() -> str:
 
 
 SHIPPED = Path(__file__).parent / "runtime" / "qtrans_python.hpp"  # for the Python qtrans was built with
-FACTS = 2  # what the header holds: 2 added the random module's messages (0.14); a cached one of another is rewritten
+FACTS = 2  # what the header holds: 2 added the random module's messages (0.13); a cached one of another is rewritten
+
+
+@functools.lru_cache(maxsize=None)
+def _names_used() -> frozenset:
+    """Every msg:: name the runtime headers use: a header that lacks one is out of date (written
+    by an earlier qtrans), whatever its FACTS number says, and is written again."""
+    used = set()
+    for h in SHIPPED.parent.glob("*.hpp"):
+        if h.name != SHIPPED.name:
+            used |= set(re.findall(r"\bmsg::(\w+)(?!\w|\s*##)", h.read_text(encoding="utf-8")))  # (not macro pastes)
+    return frozenset(used)
 
 
 def _version_of(text: str):
     """The Python version a header was written by, if it holds this qtrans's facts."""
     lines = text.splitlines()[:14]
     if f"#define QTRANS_PYTHON_FACTS {FACTS}" not in lines:
+        return None
+    if not _names_used() <= set(re.findall(r"\b(\w+)\b", text)):
         return None
     for line in lines:
         if line.startswith("#define QTRANS_PYTHON_VERSION"):

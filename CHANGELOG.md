@@ -40,6 +40,8 @@
   A comprehension's variable over a `list[float]` is a Python float.
 - Storing into a list or dict held in a field (`self.xs[k] += 1.0`) is refused with the reason;
   it crashed the translator (also in 0.14).
+- A `qtrans_python.hpp` cached by an earlier qtrans is accepted only if it holds every message
+  the runtime uses; otherwise it is written again (a stale one failed to compile).
 - **`qtrans verify` is stricter**: in a function that raises Python's float errors itself,
   Python raising where the C++ doesn't is a mismatch, no longer a known difference.
 - An uncaught exception in a program prints Python's last traceback line
