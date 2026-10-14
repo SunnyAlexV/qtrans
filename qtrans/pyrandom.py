@@ -1,4 +1,4 @@
-"""Python's random module (0.14), and math.fsum.
+"""Python's random module (0.13), and math.fsum.
 
     random.seed(42)                 qt::py::random_module().seed(42LL)
     random.gauss(0.0, 0.2)          qt::py::random_module().gauss(0.0, 0.2)

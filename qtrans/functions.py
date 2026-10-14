@@ -1,13 +1,19 @@
 """Function translation: one Python `def` -> one C++ function.
 
-The work happens in passes over the function body:
+The work happens in passes over the function body, in this order (translate()):
 
-  1. scan       reject unsupported statements; collect every assignment ("event")
-  2. loops      check for-loop variables are only used inside their loop
-  3. infer      give every local variable a single C++ type (fixpoint over events)
-  4. plan       decide where each variable is declared in C++
-  5. refuse     definite assignment: a read that may find a local unset (UnboundLocalError)
-  6. emit       write the C++ statements, carrying comments across
+  1. scan         reject unsupported statements; collect every assignment ("event")
+  2. loops        check for-loop variables are only used inside their loop
+  3. infer        one C++ type per local variable (fixpoint over events); then array sizes
+  4. aliasing     two names for one array, list or object where one is changed: refused
+  5. checks       lists passed in and changed; two random draws in one statement;
+                  variables Python shows as int on some runs and float on others
+  6. plan         decide where each variable is declared in C++
+  7. definite     a read that may find a local unset gets a flag (UnboundLocalError)
+  8. returns      every path of a value-returning function ends in return or raise
+  9. emit         write the C++ statements, carrying comments across
+
+docs/ARCHITECTURE.md describes how this fits in the whole translator.
 """
 from __future__ import annotations
 

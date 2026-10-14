@@ -1,7 +1,7 @@
 """Command line:
 
     python -m qtrans translate FILE.py [FILE.py ...| FOLDER] [-o OUT_DIR]
-    python -m qtrans verify FILE.py [...] [--cases N] [--seed S] [--bench] [--rtol X] [--atol X] [--all]
+    python -m qtrans verify FILE.py [...] [--cases N] [--seed S] [--bench [--rounds N]] [--rtol X] [--atol X] [--all]
                                         [--profile strict|stress]
     python -m qtrans bind FILE.py [...] [-o OUT_DIR] [--check] [--cases N] [--bench] [--all]
     python -m qtrans explain FILE.py[:FUNCTION] [--html OUT.html] [--json]
@@ -62,6 +62,8 @@ def main(argv=None) -> int:
     v.add_argument("--rtol", type=float, default=1e-10)
     v.add_argument("--atol", type=float, default=1e-13)
     v.add_argument("--bench", action="store_true", help="also time Python vs C++ per call")
+    v.add_argument("--rounds", type=int, default=1, metavar="N",
+                   help="with --bench: N rounds, Python and C++ taking turns; the medians are reported")
     v.add_argument("--all", action="store_true", help="also check the modules the files import")
     v.add_argument("--profile", choices=["strict", "stress"], default="strict",
                    help="stress: also inf, NaN, subnormals, the largest doubles and longer arrays")
@@ -194,7 +196,7 @@ def main(argv=None) -> int:
                 print("  " + build_hint(out / (m + ".cpp"), m, out, r.uses_arrays))
         return 0 if not any(project.modules[m].report.rejected for m in project.requested) else 1
     report = verify_project(inputs, n_random=args.cases, seed=args.seed, rtol=args.rtol, atol=args.atol,
-                            bench=args.bench, compiler=args.cxx, build_dir=args.build, all_modules=args.all,
+                            bench=max(1, args.rounds) if args.bench else 0, compiler=args.cxx, build_dir=args.build, all_modules=args.all,
                             profile=args.profile, strict=args.strict)
     print(report.to_text())
     return 0 if report.ok else 1

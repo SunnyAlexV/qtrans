@@ -37,6 +37,7 @@ import platform
 import re
 import shlex
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -296,6 +297,9 @@ class FunctionCheck:
     py_name: str = ""  # the Python function (a version, "half(float)", names its function "half")
     shape_plans: list = field(default_factory=list)  # the non-square shapes it was tried on
     timeouts: int = 0  # cases left out because Python didn't finish one in time
+    py_rounds: list = field(default_factory=list)   # bench=N: ns per call, each round (py_ns: their median)
+    cpp_rounds: list = field(default_factory=list)
+    bench_case: object = None  # the case timed
     override: object = None    # your own C++ is checked here: its overrides.Override
     reference: object = None   # qtrans's own translation, on the very same inputs (a FunctionCheck)
     vs_reference: tuple = ()   # (cases where both returned, bit-identical among them, max ULP apart)
@@ -1317,7 +1321,10 @@ static void out(const std::tuple<T...>& t) {
     std::apply([](const auto&... v) { (out(v), ...); }, t);
 }
 template <class... T>
-static double num(const std::tuple<T...>& t) { return num(std::get<0>(t)); }
+static double num(const std::tuple<T...>& t) {
+    // every element, so none of them can be left uncomputed when timed
+    return std::apply([](const auto&... v) { return (0.0 + ... + num(v)); }, t);
+}
 
 // Make the compiler assume x may have changed, so a call on unchanged arguments can't be
 // computed once and reused across benchmark repetitions (the usual DoNotOptimize technique).
@@ -1590,8 +1597,8 @@ def _struct_io(classes) -> str:
         outs = " ".join(f"{{ qt::Rng g = o.{f.cpp}; out(g); }}" if f.type == RNG else f"out(o.{f.cpp});"
                         for f in info.fields)
         lines.append(f"static void out(const {c}& o) {{ {outs} }}")
-        first = f"num(o.{info.fields[0].cpp})" if info.fields else "0.0"
-        lines.append(f"static double num(const {c}& o) {{ return {first}; }}")
+        every = " + ".join(f"num(o.{f.cpp})" for f in info.fields if f.type != RNG) or "0.0"
+        lines.append(f"static double num(const {c}& o) {{ return {every}; }}")  # every field: none left uncomputed
     return "\n".join(lines) + "\n"
 
 
@@ -1628,8 +1635,8 @@ def _hierarchy_io(info, ns) -> list:
         lines.append(f"    if (typeid(*o) == typeid({kc})) {{ const auto& q = static_cast<const {kc}&>(*o); "
                      f'std::printf(" @{k.name}"); {outs} return; }}')
     lines += ['    throw std::runtime_error("driver: an object of a class it doesn\'t know");', "}"]
-    first = f"num(o->{info.fields[0].cpp})" if info.fields else "0.0"
-    lines.append(f"static double num(const std::shared_ptr<{c}>& o) {{ return {first}; }}")
+    every = " + ".join(f"num(o->{f.cpp})" for f in info.fields if f.type != RNG) or "0.0"
+    lines.append(f"static double num(const std::shared_ptr<{c}>& o) {{ return {every}; }}")
     return lines
 
 
@@ -2549,11 +2556,14 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
                 if case is None:
                     continue
                 fn = getattr(pymods[module], fc.py_name or fc.name)
-                fc.py_ns = _bench_python(fn, _call_args(case.args, sigs[fc.name]))
                 enc = encode_call(case.args, sigs[fc.name])
-                r = subprocess.run([str(exe)], input=f"BENCH {fc.key} {enc}\n", capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace")
-                fc.cpp_ns = float(r.stdout.split()[1])
+                fc.bench_case = case
+                for _ in range(max(1, int(bench))):  # bench=N: N rounds, Python and C++ taking turns
+                    fc.py_rounds.append(_bench_python(fn, _call_args(case.args, sigs[fc.name])))
+                    r = subprocess.run([str(exe)], input=f"BENCH {fc.key} {enc}\n", capture_output=True, text=True,
+                                       encoding="utf-8", errors="replace")
+                    fc.cpp_rounds.append(float(r.stdout.split()[1]))
+                fc.py_ns, fc.cpp_ns = statistics.median(fc.py_rounds), statistics.median(fc.cpp_rounds)
 
     reports = {}
     env = environment(cxx)
