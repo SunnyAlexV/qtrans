@@ -170,7 +170,7 @@ print(report.to_text())
 **From a terminal:** `python -m qtrans translate my_model.py -o cpp_out` (several files, or a
 folder, for a project),
 `python -m qtrans verify my_model.py --bench`, `python -m qtrans bind my_model.py --check`,
-`python -m pytest` (685 tests). `python -m qtrans live my_model.py` opens an editor with the C++
+`python -m pytest` (690 tests). `python -m qtrans live my_model.py` opens an editor with the C++
 updating next to your Python as you type; for that, a page to keep, a look before translating
 and a check of a new machine, see [Python and C++ side by side](#python-and-c-side-by-side).
 
@@ -1624,7 +1624,7 @@ qtrans/
 examples/            11 quant modules (one from a real app, one of classes), their C++
                      output, RESULTS.md, BINDINGS.md, three C++ consumers; bl_app/: the
                      app's own four modules, as a project
-tests/               685 tests: generated text, refusals, compiled semantics, every example,
+tests/               690 tests: generated text, refusals, compiled semantics, every example,
                      projects, the Python bindings, printing against Python and NumPy, programs
 tools/               scripts that back the numbers in this README (float_error_cost.py: what
                      Python's float errors cost in the C++); fuzz/: the program fuzzer

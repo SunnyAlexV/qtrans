@@ -42,6 +42,13 @@ inline constexpr const char* list_index_prefix = "";
 inline constexpr const char* list_index_suffix = " is not in list";
 inline constexpr bool list_index_has_value = true;
 
+// a read of a local no assignment has set (UnboundLocalError), or of a name at a program's top
+// level (NameError): prefix, the name, suffix
+inline constexpr const char* unbound_local_prefix = "cannot access local variable '";
+inline constexpr const char* unbound_local_suffix = "' where it is not associated with a value";
+inline constexpr const char* name_error_prefix = "name '";
+inline constexpr const char* name_error_suffix = "' is not defined";
+
 // math.<f>(x) outside its domain: prefix, repr(x) (when has_value), suffix; by the class of x
 struct DomainText { const char* prefix; const char* suffix; bool has_value; bool as_int; };
 inline constexpr DomainText sqrt_float[] = {{"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}, {"math domain error", "", false, false}};

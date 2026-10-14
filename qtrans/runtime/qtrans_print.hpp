@@ -884,6 +884,10 @@ inline std::string domain_text(const msg::DomainText* t, double x, bool from_int
 [[noreturn]] QT_PY_COLD inline void raise_range() { throw OverflowError(msg::math_range); }
 [[noreturn]] QT_PY_COLD inline void raise_zero_division(const char* text) { throw ZeroDivisionError(text); }
 [[noreturn]] QT_PY_COLD inline void raise_overflow(const char* text) { throw OverflowError(text); }
+[[noreturn]] QT_PY_COLD inline void raise_unbound(const char* name, bool top_level) {
+    if (top_level) throw NameError(std::string(msg::name_error_prefix) + name + msg::name_error_suffix);
+    throw UnboundLocalError(std::string(msg::unbound_local_prefix) + name + msg::unbound_local_suffix);
+}
 // a math function gave inf or NaN: Python's error, if it raises one here (NaN in, NaN out doesn't)
 QT_PY_COLD inline void math1_check(double r, double x, const msg::DomainText* text, bool can_overflow, bool from_int) {
     if (std::isnan(r) && !std::isnan(x)) raise_domain(text, x, from_int);
@@ -1095,6 +1099,16 @@ inline double math_fmod(double x, double y) {
     const double r = std::fmod(x, y);
     if (std::isnan(r) && !std::isnan(x) && !std::isnan(y)) throw ValueError(msg::math_domain_fmod);
     return r;
+}
+// a variable Python may read before it is set (where qtrans can't show it always is): its value,
+// or UnboundLocalError (NameError at a program's top level) when no assignment has set it yet
+template <class T>
+const T& bound(const T& value, bool set, const char* name, bool top_level = false) {
+    if (QT_PY_UNLIKELY(!set)) pyerr::raise_unbound(name, top_level);
+    return value;
+}
+inline void check_bound(bool set, const char* name, bool top_level = false) {
+    if (QT_PY_UNLIKELY(!set)) pyerr::raise_unbound(name, top_level);
 }
 // a / b of two Python numbers: ZeroDivisionError for b == 0 (ints and floats have their own words)
 inline double truediv(double a, double b) {

@@ -40,6 +40,15 @@
   A comprehension's variable over a `list[float]` is a Python float.
 - Storing into a list or dict held in a field (`self.xs[k] += 1.0`) is refused with the reason;
   it crashed the translator (also in 0.14).
+- **Found by the program fuzzer before release**, each kept as a test:
+  - `x /= y` on a Python float (a variable, a list element, a dict value, a field) raised
+    nothing (C++'s `/=`); it raises ZeroDivisionError now, as `x / y` does. NumPy elements keep inf.
+  - **A variable read where some path may not have set it** (`if c: n = 1.0` then `return n`):
+    Python raises UnboundLocalError there, and the C++ read the value it started with (0),
+    which the report only noted (since 0.1). Now such a variable carries a flag and the read
+    raises Python's error, in its words (NameError at a program's top level); a variable always
+    set first carries none. The paths are worked out as Python runs them (`qtrans/unbound.py`).
+    Only a number, a bool or a str can carry a flag; another type read that way is refused.
 - A `qtrans_python.hpp` cached by an earlier qtrans is accepted only if it holds every message
   the runtime uses; otherwise it is written again (a stale one failed to compile).
 - **`qtrans verify` is stricter**: in a function that raises Python's float errors itself,

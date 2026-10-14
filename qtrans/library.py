@@ -70,7 +70,7 @@ DROPPABLE_DECORATORS = {
 EXCEPTIONS = {  # the classes of qtrans_runtime.hpp, shaped as Python's
     n: f"qt::{n}" for n in ("Exception", "ArithmeticError", "ZeroDivisionError", "OverflowError", "FloatingPointError",
                             "AssertionError", "LookupError", "IndexError", "KeyError", "RuntimeError",
-                            "NotImplementedError", "TypeError", "ValueError")
+                            "NotImplementedError", "TypeError", "ValueError", "NameError", "UnboundLocalError")
 }
 # the ones a float can raise in Python where a C++ double carries on (1.0 / 0.0, math.sqrt(-1),
 # math.exp(1000)): code a handler for one of these may catch raises them as Python does

@@ -133,6 +133,20 @@ async def f(x: float) -> float:
     return x
 ```
 
+A variable read where some path may not have set it (Python raises UnboundLocalError there,
+NameError at a program's top level) carries a flag in the C++, and that read raises Python's
+error, in its words; a variable always set before it is read carries none. Only a number, a
+bool or a str can carry one: another type read that way is refused.
+
+```python spec translated "bool n_set = false;" "return qt::py::bound(n, n_set, \"n\");"
+def f(x: float) -> float:
+    if x > 2.0:
+        pass
+    else:
+        n = 3.0
+    return n
+```
+
 A function must return on every path if it returns a value (Python would return `None`):
 
 ```python spec refused "can reach its end without returning"

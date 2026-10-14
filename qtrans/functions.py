@@ -6,12 +6,13 @@ The work happens in passes over the function body:
   2. loops      check for-loop variables are only used inside their loop
   3. infer      give every local variable a single C++ type (fixpoint over events)
   4. plan       decide where each variable is declared in C++
-  5. warn       definite-assignment check (Python's UnboundLocalError paths)
+  5. refuse     definite assignment: a read that may find a local unset (UnboundLocalError)
   6. emit       write the C++ statements, carrying comments across
 """
 from __future__ import annotations
 
 import ast
+import copy
 import re
 import inspect
 
@@ -625,6 +626,8 @@ class FunctionTranslator(ExprTranslator):
         if self.sig.ret != VOID and not always_returns(self.body):
             raise Unsupported(self.fdef, f"{self.fdef.name}() can reach its end without returning "
                                          "(Python would return None)", "add a final return or raise")
+        for name, flag in getattr(self, "unbound", {}).items():
+            self.emit(f"bool {flag} = false;  // has Python set {name} yet?")
         self.emit_block(self.body)
         self.flush_comments(self.fdef.end_lineno + 1)
         self._mark_unread_locals()
@@ -1794,70 +1797,53 @@ class FunctionTranslator(ExprTranslator):
 
     # --- pass 5: definite assignment ------------------------------------------------------------
     def definite_assignment(self):
-        def check(node, A):
-            for n in ast.walk(node):
-                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.locals_set \
-                        and n.id not in A:
-                    self.note(f"unbound:{n.id}", f"'{n.id}' may be read before it is assigned on some "
-                                                 "path (Python raises UnboundLocalError; C++ reads the "
-                                                 "initial value 0)")
+        """A read of a local that some path reaches unassigned: Python raises UnboundLocalError
+        there (NameError at a program's top level), where the C++ would read the value it starts
+        with (0). Refused, at the read (qtrans/unbound.py works it out as Python runs the code)."""
+        from .unbound import possibly_unbound
+        a = self.fdef.args
+        params = [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs]
+        known = set(self.params) | ({"self"} if getattr(self, "has_self", False) else set())
+        bad = possibly_unbound(self.body, params, known)
+        self.unbound, self.unbound_reads = {}, set()
+        for node, name in bad:
+            why = self._unbound_refusal(name)
+            if why:
+                raise Unsupported(node, f"'{name}' may be read here before it is assigned: on some path no assignment "
+                                        f"sets it, and Python then raises UnboundLocalError ({why})",
+                                  f"give '{name}' a value on every path before this line")
+            if name not in self.unbound:
+                flag, k = f"{self.ident(name)}_set", 1
+                while flag in self.reserved_names() or flag in self.unbound.values():
+                    k += 1
+                    flag = f"{self.ident(name)}_set{k}"
+                self.unbound[name] = flag
+            self.unbound_reads.add(id(node))
+        if self.unbound:
+            self.note("unbound", "a variable Python may read before it is set (where qtrans can't show it always is) "
+                                 "carries a flag: the read raises UnboundLocalError where Python's does")
 
-        def block(stmts, A):
-            for s in stmts:
-                A = stmt(s, A)
-                if A is None:
-                    return None
-            return A
-
-        def stmt(s, A):
-            if isinstance(s, ast.If):
-                check(s.test, A)
-                a, b = block(s.body, set(A)), block(s.orelse, set(A))
-                if a is None:
-                    return b
-                if b is None:
-                    return a
-                return a & b
-            if isinstance(s, ast.Try):
-                return _try_state(s, A, block)
-            if isinstance(s, ast.While):
-                check(s.test, A)
-                block(s.body, set(A))
-                block(s.orelse, set(A))
-                return A
-            if isinstance(s, ast.For):
-                check(s.iter, A)
-                block(s.body, set(A))
-                block(s.orelse, set(A))
-                return A
-            if isinstance(s, (ast.Return, ast.Raise)):
-                check(s, A)
-                return None
-            if isinstance(s, (ast.Break, ast.Continue)):
-                return None
-            if isinstance(s, ast.AugAssign):
-                check(s.value, A)
-                if isinstance(s.target, (ast.Subscript, ast.Attribute)):
-                    check(s.target, A)
-                    return A
-                check(ast.Name(id=s.target.id, ctx=ast.Load()), A)
-                return A | {s.target.id}
-            if isinstance(s, (ast.Assign, ast.AnnAssign)):
-                if s.value is not None:
-                    check(s.value, A)
-                targets = s.targets if isinstance(s, ast.Assign) else [s.target]
-                leaves = [x for t in targets for x in target_leaves(t)]
-                for x in leaves:
-                    if isinstance(x, ast.Subscript):
-                        check(x, A)
-                names = {x.id for x in leaves if isinstance(x, ast.Name)}
-                return A | names if s.value is not None else A
-            check(s, A)
-            return A
-
-        block(self.body, set())
+    def _unbound_refusal(self, name):
+        """Why a variable that may be read unset can't carry a flag (it must be a number, a bool or
+        a str, set by plain assignments), or None."""
+        t = self.local_types.get(name)
+        if not (isinstance(t, Scalar) or t == STR):
+            return "for a number, a bool or a str the C++ checks that, not for this type"
+        for n in ast.walk(ast.Module(body=self.body, type_ignores=[])):
+            if isinstance(n, (ast.For, ast.comprehension)) and name in {x.id for x in ast.walk(n.target)
+                                                                        if isinstance(x, ast.Name)}:
+                return "it is also a loop variable"
+            if isinstance(n, (ast.With, ast.NamedExpr, ast.ExceptHandler)) and name in {
+                    x.id for x in ast.walk(n) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)} | (
+                    {n.name} if isinstance(n, ast.ExceptHandler) and n.name else set()):
+                return "it is set in a way the C++ can't follow"
+        return None
 
     # --- pass 6: emission ----------------------------------------------------------------------
+    def _top_level_arg(self):
+        """`, true` for a program's top level (NameError there, UnboundLocalError in a function)."""
+        return ", true" if self.fdef.name == PROGRAM_NAME else ""
+
     def reserved_names(self):
         """Every name a temporary must not take: the function's own names, and what its C++ can
         see unqualified (the class's fields and methods, its bases', the module's constants,
@@ -1971,7 +1957,16 @@ class FunctionTranslator(ExprTranslator):
         texts = [self.mod.inline_comments[ln] for ln in range(s.lineno, last + 1) if ln in self.mod.inline_comments]
         self._tail = ("  // " + "; ".join(texts)) if texts else None
         self.comment_floor = last
+        unbound = getattr(self, "unbound", {})
+        if isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name) and id(s.target) in self.unbound_reads:
+            self.emit(f"qt::py::check_bound({unbound[s.target.id]}, \"{s.target.id}\"{self._top_level_arg()});")
         getattr(self, "s_" + type(s).__name__)(s)
+        if unbound and isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and getattr(s, "value", None) is not None:
+            targets = s.targets if isinstance(s, ast.Assign) else [s.target]
+            for name in sorted({x.id for t in targets for x in ast.walk(t) if isinstance(x, ast.Name)
+                                and isinstance(x.ctx, ast.Store)} & set(unbound)):
+                self._tail = None
+                self.emit(f"{unbound[name]} = true;")
         self.cur_src = prev
         self._tail = None
 
@@ -2247,7 +2242,36 @@ class FunctionTranslator(ExprTranslator):
         if dt.val == STR and sym != "+=":
             raise Unsupported(s, f"{sym} on a str value is not supported")
         code = self.as_double(v).code if dt.val == FLOAT else v.code
+        if sym == "/=" and self._aug_div_raises(s, v):
+            return self._emit_raising_div(item, code)
         self.emit(f"{item} {sym} {code};")
+
+    def _aug_div_raises(self, s, v) -> bool:
+        """target /= v: does Python raise ZeroDivisionError here, as `target / v` would (Python
+        floats on both sides, a divisor that may be 0)? Not for a NumPy element (inf, as NumPy)."""
+        if not isinstance(s, ast.AugAssign) or not isinstance(s.op, ast.Div):
+            return False
+        left = copy.deepcopy(s.target)
+        for n in ast.walk(left):
+            if hasattr(n, "ctx"):
+                n.ctx = ast.Load()
+        b = ast.copy_location(ast.BinOp(left=left, op=ast.Div(), right=s.value), s)
+        return self._python_raises(b, v)
+
+    def _emit_raising_div(self, target, code):
+        """target = qt::py::truediv(target, v), the element found first (IndexError, KeyError),
+        then v worked out, as Python does."""
+        if re.fullmatch(r"[\w.]+", target):
+            self.emit(f"{target} = qt::py::truediv({target}, {code});")
+            return
+        used = self.__dict__.setdefault("_left_names", set())
+        name, k = "target", 1
+        while name in used or name in self.reserved_names() or re.search(rf"\b{name}\b", target + code):
+            k += 1
+            name = f"target{k}"
+        used.add(name)
+        self.emit(f"auto& {name} = {target};")
+        self.emit(f"{name} = qt::py::truediv({name}, {code});")
 
     def s_Delete(self, s):
         for t in s.targets:
@@ -2278,6 +2302,8 @@ class FunctionTranslator(ExprTranslator):
             self.emit(f"{target.code} = {op}({target.code}, {self.as_type(v, INT).code});")
             return
         code = self.as_double(v).code if lt.elem == FLOAT else v.code
+        if sym == "/=" and self._aug_div_raises(s, v):
+            return self._emit_raising_div(target.code, code)
         self.emit(f"{target.code} {sym} {code};")
 
     def _field_target(self, t, s):
@@ -2353,6 +2379,8 @@ class FunctionTranslator(ExprTranslator):
         self.check_assignable(vt, result, s, f"'{name}'")
         if result.type == INT and result.code.startswith("qt::i"):
             self.emit(f"{self.ident(name)} = {result.code};")  # checked: may leave 64 bits
+        elif isinstance(s.op, ast.Div) and "qt::py::truediv" in result.code:
+            self.emit(f"{self.ident(name)} = {result.code};")  # x /= y raises ZeroDivisionError, as Python's floats
         elif isinstance(s.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)) and result.type == vt:
             rhs = self.promote(self.expr(s.value), vt)
             sym = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}[type(s.op)]
@@ -2414,6 +2442,8 @@ class FunctionTranslator(ExprTranslator):
         self.check_assignable(f.type, result, s, f"field '{f.name}'")
         if result.type == INT and result.code.startswith("qt::i"):
             self.emit(f"{code} = {result.code};")  # checked: may leave 64 bits
+        elif isinstance(s.op, ast.Div) and f.type == FLOAT and self._aug_div_raises(s, rhs):
+            self._emit_raising_div(code, self.promote(rhs, f.type).code)
         elif result.type == f.type and isinstance(s.op, (ast.Add, ast.Sub, ast.Mult)) or \
                 (isinstance(s.op, ast.Div) and f.type == FLOAT):
             self.emit(f"{code} {syms[type(s.op)]} {self.promote(rhs, f.type).code};")
@@ -2866,6 +2896,7 @@ class FunctionTranslator(ExprTranslator):
         self.emit(f"if (!{wrap(cond, P_ATOM)}) throw qt::AssertionError({msg});")
 
 
+PROGRAM_NAME = "(program)"  # translator.PROGRAM: a program's top-level code, as a function
 _CHANGES_A_CONTAINER = re.compile(r"\b(pop|popitem|insert|append|extend|remove|clear|setdefault|update|erase|"
                                   r"push_back|emplace_back|resize|sort|reverse)\b")
 _AUG_STORE = re.compile(r"^((?:qt::py::item|qt::py::at)\(.+?\)|\w+\(qt::idx\(.+?\)\)|\w+\.at\(.+?\)) ([-+*/]=) (.+);$")

@@ -323,7 +323,12 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                     break
                 return Expr(cpp, P_ATOM, ExcType(py), simple=True)
         if self.is_variable(node.id):
-            return self.variable(node)
+            e = self.variable(node)
+            if id(node) in getattr(self, "unbound_reads", ()):  # may be unset here: Python's error if so
+                top = self._top_level_arg() if hasattr(self, "_top_level_arg") else ""
+                e = Expr(f"qt::py::bound({e.code}, {self.unbound[node.id]}, \"{node.id}\"{top})", P_ATOM, e.type,
+                         iv=e.iv, dims=e.dims, dimtok=e.dimtok)
+            return e
         return self.mod.global_name(node, self)
 
     def _is_module_path(self, node) -> bool:

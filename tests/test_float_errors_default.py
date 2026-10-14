@@ -339,3 +339,86 @@ def test_a_cached_python_header_missing_a_message_is_written_again():
     assert pyfacts._version_of(text) is not None
     stale = "\n".join(l for l in text.splitlines() if "fsum_overflow" not in l)
     assert pyfacts._version_of(stale) is None
+
+
+def test_a_read_that_may_find_a_variable_unset_raises_as_pythons():
+    """Found by the fuzzer: `n` set only in the else branch, read after; Python raises
+    UnboundLocalError when x > 2.0, the C++ returned 0. Now such a variable carries a flag, and
+    the read raises Python's error, with its words; a variable always set first carries none.
+    Paths as Python runs them: a loop may run zero times, `while True` leaves only through
+    break, a for-else's break skips the else, a handler may run before the try's assignment."""
+    flagged = {
+        "if_one_side": "def f(x: float) -> float:\n    if x > 2.0:\n        pass\n    else:\n        n = 3.0\n    return n\n",
+        "loop_may_not_run": "def f(xs: list[float]) -> float:\n    for x in xs:\n        y = x\n    return y\n",
+        "break_skips_else": "def f(xs: list[float]) -> float:\n    for x in xs:\n        if x > 0.0:\n            break\n"
+                            "    else:\n        r = 1.0\n    return r\n",
+        "handler_leaves_it": "def f(p: float) -> float:\n    try:\n        y = 1.0 / p\n    except ZeroDivisionError:\n"
+                             "        pass\n    return y\n",
+    }
+    plain = {
+        "both_sides": "def f(x: float) -> float:\n    if x > 2.0:\n        n = 1.0\n    else:\n        n = 3.0\n    return n\n",
+        "while_true": "def f(p: float) -> float:\n    while True:\n        n = p\n        if n > 1.0:\n            break\n"
+                      "        p += 1.0\n    return n\n",
+        "raise_path": "def f(x: float) -> float:\n    if x > 2.0:\n        n = 1.0\n    else:\n"
+                      "        raise ValueError('x')\n    return n\n",
+        "handler_sets_it": "def f(p: float) -> float:\n    try:\n        y = 1.0 / p\n    except ZeroDivisionError:\n"
+                           "        y = 0.0\n    return y\n",
+    }
+    for name, src in flagged.items():
+        r = translate_source(src, "m")
+        assert not r.report.rejected and "qt::py::bound(" in r.header, name
+    for name, src in plain.items():
+        r = translate_source(src, "m")
+        assert not r.report.rejected and "qt::py::bound(" not in r.header and "_set = false" not in r.header, name
+    r = translate_source("def f(v: Vec) -> float:\n    for i in range(2):\n        w = v\n    return float(w[0])\n"
+                         .replace("def f", "from qtrans.typing import Vec\n\ndef f"), "m")
+    assert any("may be read here before it is assigned" in f.reason for f in r.report.rejected)  # an array: refused
+
+
+@compiled
+def test_unbound_reads_agree_with_python(tmp_path):
+    """Values and errors: UnboundLocalError with Python's words (caught and printed, too), and a
+    program's top level ending in NameError, exit status 1."""
+    f = tmp_path / "unbound_cases.py"
+    shutil.copy(REVIEW / "unbound_cases.py", f)
+    rep = verify_file(f, n_random=30, build_dir=tmp_path / "build")
+    assert not rep.translation.report.rejected
+    assert all(fc.count("mismatch") == 0 and fc.count("known") == 0 for fc in rep.functions), rep.to_text()
+    assert rep.program.identical and rep.program.py_code == rep.program.cpp_code == 1
+    assert rep.program.cpp_err.strip() == rep.program.py_err.strip().splitlines()[-1]
+
+
+def test_aug_division_raises_for_python_floats_everywhere():
+    """Found by the fuzzer: `p0 /= 0.0` was C++'s /= (inf); for a Python float it raises, in a
+    variable, a list element, a dict value and a field alike. NumPy elements keep inf."""
+    h = cpp("""
+        from dataclasses import dataclass
+        import numpy as np
+        from qtrans.typing import Vec
+
+        @dataclass
+        class P:
+            x: float
+
+        def a(p0: float, d: float) -> float:
+            p0 /= d
+            return p0
+
+        def b(xs: list[float], k: int, d: float) -> float:
+            ys = list(xs)
+            ys[k] /= d
+            return ys[0]
+
+        def c(p: P, d: float) -> float:
+            p.x /= d
+            return p.x
+
+        def g(v: Vec, d: float) -> float:
+            w = v.copy()
+            w[0] /= d
+            return float(w[0])
+        """).header
+    assert "p0 = qt::py::truediv(p0, d);" in h
+    assert "auto& target = qt::py::item(ys, k);\n    target = qt::py::truediv(target, d);" in h
+    assert "p.x = qt::py::truediv(p.x, d);" in h
+    assert "w(0) /= d;" in h or "/= d;" in h.split("inline double g")[1]

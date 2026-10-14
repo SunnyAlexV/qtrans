@@ -59,6 +59,8 @@ QT_PY_EXCEPTION(RuntimeError, Exception)
 QT_PY_EXCEPTION(NotImplementedError, RuntimeError)
 QT_PY_EXCEPTION(TypeError, Exception)
 QT_PY_EXCEPTION(ValueError, Exception)
+QT_PY_EXCEPTION(NameError, Exception)
+QT_PY_EXCEPTION(UnboundLocalError, NameError)  // a local read where no assignment set it (1.0)
 #undef QT_PY_EXCEPTION
 
 // your own exception class (class PricingError(ValueError): pass) is one line of the same kind

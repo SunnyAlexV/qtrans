@@ -181,6 +181,20 @@ def _cstr(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _name_templates() -> dict:
+    """The words Python puts around a variable's name in UnboundLocalError and NameError."""
+    def unbound():
+        if False:  # noqa: SIM108 - never runs: the variable is never set
+            qtrans_name = 1
+        return qtrans_name  # noqa: F821
+    out = {}
+    for key, f in (("unbound_local", unbound), ("name_error", lambda: eval("qtrans_name", {}, {}))):
+        _, m = _message(f)
+        pre, _, suf = m.partition("qtrans_name")
+        out[key] = (pre, suf)
+    return out
+
+
 def generate() -> str:
     version = ".".join(map(str, sys.version_info[:3]))
     lines = [f"// qtrans_python.hpp: the error messages of Python {version}, and when its math functions raise.",
@@ -201,6 +215,12 @@ def generate() -> str:
               f"inline constexpr const char* list_index_prefix = {_cstr(pre)};",
               f"inline constexpr const char* list_index_suffix = {_cstr(suf)};",
               f"inline constexpr bool list_index_has_value = {'true' if has else 'false'};", ""]
+    lines += ["// a read of a local no assignment has set (UnboundLocalError), or of a name at a program's top",
+              "// level (NameError): prefix, the name, suffix"]
+    for key, (pre, suf) in _name_templates().items():
+        lines += [f"inline constexpr const char* {key}_prefix = {_cstr(pre)};",
+                  f"inline constexpr const char* {key}_suffix = {_cstr(suf)};"]
+    lines += [""]
     lines += ["// math.<f>(x) outside its domain: prefix, repr(x) (when has_value), suffix; by the class of x"]
     lines.append("struct DomainText { const char* prefix; const char* suffix; bool has_value; bool as_int; };")
     for name in UNARY:  # (one this Python lacks, cbrt and exp2 before 3.11, gets the old wording)
