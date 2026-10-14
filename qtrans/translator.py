@@ -34,7 +34,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, IVEC, assignable, is_array, is_arraylike)
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric

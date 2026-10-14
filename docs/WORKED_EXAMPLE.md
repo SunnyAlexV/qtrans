@@ -166,10 +166,10 @@ The same functions on the inputs above, 7 rounds, Python and C++ taking turns, m
 
 | Function | Python (µs) | C++ (µs) | Speed-up |
 |---|---:|---:|---:|
-| `bs_call` | 1.10 | 0.051 | 22× |
-| `vega` | 0.50 | 0.033 | 15× |
-| `implied_vol` | 14.82 | 0.443 | 33× |
-| `book` | 1,928.70 | 64.687 | 30× |
+| `bs_call` | 0.77 | 0.046 | 17× |
+| `vega` | 0.38 | 0.021 | 18× |
+| `implied_vol` | 10.09 | 0.354 | 28× |
+| `book` | 1,008.79 | 37.257 | 27× |
 
 ## 5. Hand it over
 

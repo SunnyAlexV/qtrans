@@ -1,4 +1,5 @@
-"""verify's bench=N (1.0.1): N rounds, Python and C++ taking turns, medians reported."""
+"""verify's bench=N (1.0.1): N rounds, Python and C++ taking turns, medians reported; the calls
+timed in each round recorded (1.0.2)."""
 import statistics
 import textwrap
 
@@ -22,6 +23,9 @@ def test_rounds_and_medians(tmp_path):
     assert fc.py_ns == statistics.median(fc.py_rounds)
     assert fc.cpp_ns == statistics.median(fc.cpp_rounds)
     assert fc.bench_case is not None
+    # the calls timed in each round are recorded (1.0.2): runs of 1, 4, 16, ... calls
+    assert len(fc.py_reps) == 3 and len(fc.cpp_reps) == 3
+    assert all(n >= 1 and (n & (n - 1)) == 0 and n.bit_length() % 2 == 1 for n in fc.py_reps + fc.cpp_reps)
 
 
 def test_cli_bench_optional_rounds(tmp_path, monkeypatch):
