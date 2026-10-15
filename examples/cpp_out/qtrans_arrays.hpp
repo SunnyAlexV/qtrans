@@ -633,6 +633,18 @@ inline double pairwise(const double* a, Index n, Index stride) {
     return pairwise(a, n2, stride) + pairwise(a + n2 * stride, n - n2, stride);
 }
 
+// What np.sum does with the pairwise sum. Before NumPy 2.3, a reduction went through NumPy's
+// iterator buffer of 8192 elements: each 8192 values are summed pairwise and the chunk sums are
+// added one after another, starting from 0.0 (contiguous, strided and per-row alike). From 2.3,
+// one pairwise sum over all of them. Measured on NumPy 1.21 to 2.5 (tests/test_npmath.py).
+inline double reduce_sum(const double* a, Index n, Index stride) {
+    constexpr Index chunk = 8192;
+    if (npm::numpy_version >= 20300 || n <= chunk) return pairwise(a, n, stride);
+    double acc = 0.0;
+    for (Index i = 0; i < n; i += chunk) acc = acc + pairwise(a + i * stride, std::min(chunk, n - i), stride);
+    return acc;
+}
+
 // A stored Vec / Mat is read where it is; an expression is evaluated once, in row-major order.
 template <class D>
 decltype(auto) evaluated(const Eigen::ArrayBase<D>& a) {
@@ -644,7 +656,7 @@ decltype(auto) evaluated(const Eigen::ArrayBase<D>& a) {
 template <class D>
 double sum(const Eigen::ArrayBase<D>& a) {
     const auto& p = evaluated(a);
-    return pairwise(p.data(), p.size(), 1);
+    return reduce_sum(p.data(), p.size(), 1);
 }
 
 // np.sum(A, axis=0): NumPy adds rows one after another (column-wise sequential), except for
@@ -656,7 +668,7 @@ Vec sum(const Eigen::ArrayBase<D>& a, int axis) {
     if (axis == 0 || axis == -2) {
         Vec out(m.cols());
         if (m.cols() == 1) {
-            out(0) = pairwise(m.data(), m.rows(), 1);
+            out(0) = reduce_sum(m.data(), m.rows(), 1);
         } else {
             out = Vec::Zero(m.cols());
             for (Index i = 0; i < m.rows(); ++i) out += m.row(i).transpose();
@@ -665,7 +677,7 @@ Vec sum(const Eigen::ArrayBase<D>& a, int axis) {
     }
     if (axis == 1 || axis == -1) {
         Vec out(m.rows());
-        for (Index i = 0; i < m.rows(); ++i) out(i) = pairwise(m.data() + i * m.cols(), m.cols(), 1);
+        for (Index i = 0; i < m.rows(); ++i) out(i) = reduce_sum(m.data() + i * m.cols(), m.cols(), 1);
         return out;
     }
     throw shape_error("axis out of bounds for a 2-D array");
@@ -938,7 +950,7 @@ Vec diagonal(const Eigen::ArrayBase<D>& m) {  // np.diag(matrix)
 template <class D>
 double trace(const Eigen::ArrayBase<D>& a) {
     const Mat m = a;
-    return pairwise(m.data(), std::min(m.rows(), m.cols()), m.cols() + 1);
+    return reduce_sum(m.data(), std::min(m.rows(), m.cols()), m.cols() + 1);
 }
 
 // =====================================================================================

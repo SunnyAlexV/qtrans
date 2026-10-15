@@ -34,6 +34,11 @@ agreed to rounding. They now run the code NumPy runs, so they agree to the bit.
   `tests/test_npmath.py` runs it on every CI platform; `qtrans doctor` on yours.
 - **`np.sum` faster, the same bits:** its eight partial sums are one AVX-512 register where the
   CPU has it (not on Windows: GCC bug 54412), added in NumPy's order; checked on every length.
+- **`np.sum` of more than 8192 values follows the NumPy release.** Before NumPy 2.3 a reduction
+  goes through NumPy's 8192-element buffer: each chunk is summed pairwise and the chunk sums are
+  added in turn. With NumPy 2.2 or older, 1.0 used 2.3's single pairwise sum, so long sums
+  (and `mean`, `var`, `std`, sums along a row) could differ in the last bits; they now match,
+  checked on every release from 1.21 to 2.5.
 - **Results:** in the examples, 45 of the 87 functions are bit-identical to Python (32 in 1.0),
   5 of the 8 Monte Carlo pricers among them; vectorised `np.exp` is 1.2× NumPy's speed (it was
   3.6× slower). `qtrans doctor` reports which code NumPy's maths runs on your machine.

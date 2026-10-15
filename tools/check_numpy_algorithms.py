@@ -35,6 +35,20 @@ def pairwise(a, lo, n):
     return pairwise(a, lo, n2) + pairwise(a, lo + n2, n - n2)
 
 
+NUMPY = tuple(int(x) for x in np.__version__.split(".")[:2])
+
+
+def reduce_sum(a, n):
+    """What np.sum does with pairwise_sum: before NumPy 2.3, through the iterator's 8192-element
+    buffer (each chunk pairwise, the chunk sums added in turn from 0.0); from 2.3, one pairwise sum."""
+    if NUMPY >= (2, 3) or n <= 8192:
+        return pairwise(a, 0, n)
+    acc = 0.0
+    for lo in range(0, n, 8192):
+        acc = acc + pairwise(a, lo, min(8192, n - lo))
+    return acc
+
+
 def quantile(x, q):
     """numpy.quantile, method='linear': index (n - 1) * q, then _lerp."""
     s = sorted(x)
@@ -55,19 +69,19 @@ def report(name, ok):
 def main():
     results = []
     ok = []
-    for n in list(range(0, 300)) + [1000, 4097, 10000]:
+    for n in list(range(0, 300)) + [1000, 4097, 10000, 20001]:
         x = rng.normal(size=n) * 10 ** rng.uniform(-3, 3, size=n)
-        ok.append(pairwise(list(x), 0, n) == float(np.sum(x)))
+        ok.append(reduce_sum(list(x), n) == float(np.sum(x)))
     results.append(report("np.sum, 1-D (pairwise)", ok))
 
     full, ax1, ax0 = [], [], []
     for _ in range(500):
         r, c = (int(v) for v in rng.integers(1, 40, size=2))
         A = rng.normal(size=(r, c)) * 10 ** rng.uniform(-3, 3, size=(r, c))
-        full.append(pairwise(list(A.ravel()), 0, r * c) == float(A.sum()))
-        ax1.append(all(pairwise(list(A[i]), 0, c) == A.sum(axis=1)[i] for i in range(r)))
+        full.append(reduce_sum(list(A.ravel()), r * c) == float(A.sum()))
+        ax1.append(all(reduce_sum(list(A[i]), c) == A.sum(axis=1)[i] for i in range(r)))
         if c == 1:
-            col = np.array([pairwise(list(A[:, 0]), 0, r)])   # one column: contiguous, so pairwise
+            col = np.array([reduce_sum(list(A[:, 0]), r)])   # one column: contiguous, so pairwise
         else:
             col = A[0].copy()
             for i in range(1, r):
@@ -81,11 +95,11 @@ def main():
     for _ in range(300):
         n = int(rng.integers(2, 500))
         x = rng.normal(size=n) * 10 ** rng.uniform(-3, 3)
-        m = pairwise(list(x), 0, n) / n
+        m = reduce_sum(list(x), n) / n
         m_ok.append(m == float(np.mean(x)))
         dev = [(v - m) * (v - m) for v in x]
         for ddof in (0, 1):
-            var = pairwise(dev, 0, n) / (n - ddof)
+            var = reduce_sum(dev, n) / (n - ddof)
             v_ok.append(var == float(np.var(x, ddof=ddof)) and math.sqrt(var) == float(np.std(x, ddof=ddof)))
     results.append(report("np.mean = pairwise sum / n", m_ok))
     results.append(report("np.var / np.std (ddof 0 and 1)", v_ok))

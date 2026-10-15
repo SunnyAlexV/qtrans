@@ -63,11 +63,14 @@ def _levels() -> dict | None:
         return None
     names = {"arcsin", "arccos", "arctan", "arcsinh", "arccosh", "arctanh", "power", "arctan2"} | set(UNARY)
     info = opt_func_info(func_name="^(" + "|".join(sorted(names)) + ")$", signature="float64")
+    # on 64-bit ARM the baseline itself is NEON (ASIMD) with native FMA, which NumPy's own tanh
+    # kernel is built for: there "baseline" runs that kernel (macOS ARM, Linux aarch64)
+    arm64 = platform.machine().lower() in ("arm64", "aarch64")
     out = {}
     for fn, sigs in info.items():
         cur = next(iter(sigs.values()))["current"].upper()
         if cur.startswith("BASELINE"):
-            out[fn] = "base"
+            out[fn] = "arm" if arm64 else "base"
         elif cur in ("X86_V4",) or cur.startswith("AVX512_") and cur not in ("AVX512_KNL", "AVX512_KNM"):
             out[fn] = "v4"
         elif cur in ("AVX512F", "AVX512_KNL", "AVX512_KNM"):

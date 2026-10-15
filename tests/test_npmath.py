@@ -76,27 +76,69 @@ def test_svml_headers_are_numpy_s():
         assert text.count("__asm__(R\"QTSVML(") == (19 if v == "ha" else 22)
 
 
+PROBE_SUM = r"""#include "qtrans_arrays.hpp"
+#include <cstdio>
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
+// each case: kind, rows, cols, then rows * cols doubles; kind 0 np.sum(v), 1 np.mean(v),
+// 2 np.sum(A, axis=1), 3 np.sum(A, axis=0) for one column, 4 np.var(v)
+int main() {
+#if defined(_WIN32)
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    long long h[3];
+    while (std::fread(h, 8, 3, stdin) == 3) {
+        qt::Mat m(h[1], h[2]);
+        const size_t n = (size_t)(h[1] * h[2]);
+        if (n && std::fread(m.data(), 8, n, stdin) != n) return 1;
+        qt::Vec out;
+        if (h[0] == 2) out = qt::sum(m, 1);
+        else if (h[0] == 3) out = qt::sum(m, 0);
+        else {
+            const qt::Vec v = Eigen::Map<qt::Vec>(m.data(), (Eigen::Index)n);
+            out = qt::Vec::Constant(1, h[0] == 0 ? qt::sum(v) : h[0] == 1 ? qt::mean(v) : qt::var(v));
+        }
+        std::fwrite(out.data(), 8, (size_t)out.size(), stdout);
+    }
+}
+"""
+
+
 def test_pairwise_sum_is_numpys_to_the_bit(tmp_path):
-    """np.sum's pairwise summation: the vectorised form (eight partial sums in one register, 1.1)
-    adds in NumPy's order, so every length gives NumPy's bits."""
+    """np.sum's pairwise summation, as the running NumPy does it: the vectorised form (eight
+    partial sums in one register, 1.1) adds in NumPy's order, and long reductions follow the
+    release (before NumPy 2.3, pairwise sums of 8192-element chunks, added in turn)."""
     import struct
     import subprocess
     from qtrans.translator import NPMATH_HEADERS, ARRAYS_HEADER, RUNTIME_HEADER, PYTHON_HEADER
     from qtrans.verify import find_compiler, find_eigen
-    if sys.platform == "win32":
-        pytest.skip("the probe reads binary stdin; covered on Linux and macOS")
     for h in (ARRAYS_HEADER, RUNTIME_HEADER, PYTHON_HEADER, *NPMATH_HEADERS):
         (tmp_path / h.name).write_bytes(h.read_bytes())
-    (tmp_path / "s.cpp").write_text('#include "qtrans_arrays.hpp"\n#include <cstdio>\n'
-                                    "int main() { long n; while (std::fread(&n, 8, 1, stdin) == 1) { qt::Vec v(n);\n"
-                                    "  if (n && std::fread(v.data(), 8, (size_t)n, stdin) != (size_t)n) return 1;\n"
-                                    "  double s = qt::sum(v); std::fwrite(&s, 8, 1, stdout); } }\n")
-    exe = tmp_path / "s"
-    subprocess.run(find_compiler().command(tmp_path / "s.cpp", exe, tmp_path, [find_eigen()]), check=True, capture_output=True)
+    (tmp_path / "s.cpp").write_text(PROBE_SUM)
+    exe = tmp_path / ("s.exe" if sys.platform == "win32" else "s")
+    b = subprocess.run(find_compiler().command(tmp_path / "s.cpp", exe, tmp_path, [find_eigen()]),
+                       capture_output=True, text=True, cwd=tmp_path)
+    assert b.returncode == 0, b.stderr + b.stdout
     rng = np.random.default_rng(9)
-    arrs = [rng.standard_normal(n) * 10 ** rng.uniform(-5, 5, n) for n in range(0, 600)]
-    arrs += [rng.standard_normal(n) for n in (4096, 100_000, 123_457)]
-    data = b"".join(struct.pack("<q", len(a)) + a.tobytes() for a in arrs)
-    got = np.frombuffer(subprocess.run([str(exe)], input=data, capture_output=True).stdout, dtype=np.float64)
-    ref = np.array([np.sum(a) for a in arrs])
-    assert (got.view(np.uint64) == ref.view(np.uint64)).all()
+    cases, ref = [], []
+    vecs = [rng.standard_normal(n) * 10 ** rng.uniform(-5, 5, n) for n in range(0, 600)]
+    vecs += [rng.standard_normal(n) for n in (4096, 8192, 8193, 16384, 20000, 100_000, 123_457)]
+    for v in vecs:
+        cases.append((0, 1, len(v), v)); ref.append([np.sum(v)])
+    for v in vecs[-5:]:
+        cases.append((1, 1, len(v), v)); ref.append([np.mean(v)])
+        cases.append((4, 1, len(v), v)); ref.append([np.var(v)])
+        cases.append((3, len(v), 1, v)); ref.append(np.sum(v.reshape(-1, 1), axis=0))
+    for r, c in ((3, 8193), (2, 30001), (4, 700)):
+        a = rng.standard_normal((r, c))
+        cases.append((2, r, c, a.ravel())); ref.append(np.sum(a, axis=1))
+    data = b"".join(struct.pack("<3q", k, r, c) + np.ascontiguousarray(v).tobytes() for k, r, c, v in cases)
+    p = subprocess.run([str(exe)], input=data, capture_output=True)
+    assert p.returncode == 0, p.stderr
+    got = np.frombuffer(p.stdout, dtype=np.float64)
+    want = np.concatenate([np.asarray(x, dtype=np.float64) for x in ref])
+    assert got.shape == want.shape
+    assert (got.view(np.uint64) == want.view(np.uint64)).all(), np.flatnonzero(got.view(np.uint64) != want.view(np.uint64))[:10]

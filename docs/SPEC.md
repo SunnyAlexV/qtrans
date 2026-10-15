@@ -519,7 +519,10 @@ functions with NumPy's broadcasting, reductions (`sum`, `mean`, `std`, `var`, `m
 (`x[mask]`, `x[mask] = c`), shapes (`v[:, None]`, `ravel`, `stack`s), linear algebra (`@`, `dot`,
 `outer`, `.T`, `einsum`, `np.linalg.solve / inv / cholesky / det / eigh / eigvalsh / pinv`).
 NumPy's algorithms are ported where the result depends on them (pairwise summation, `var`,
-`quantile`, `linspace`, `arange`, `cumsum`): bit-identical.
+`quantile`, `linspace`, `arange`, `cumsum`): bit-identical. Where the algorithm changed between
+NumPy releases, the C++ follows the release qtrans ran with (`qtrans_numpy.hpp`): a sum of more
+than 8192 values is, before NumPy 2.3, the pairwise sums of 8192-value chunks added in turn, and
+from 2.3 one pairwise sum.
 
 Arrays are shared in Python (`b = a`, slices, `.T`, function arguments). The analysis that
 decides how parameters are passed (section 6) also refuses any two names for one array where one
