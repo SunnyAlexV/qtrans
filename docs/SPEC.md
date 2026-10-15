@@ -19,8 +19,10 @@ differential testing (`qtrans verify` runs both on the same inputs and compares 
    `math.gamma`, `np.sum`'s pairwise summation, `np.mean`, `np.var`, `np.quantile`, `np.cumsum`,
    NumPy's and Python's random generators, text formatting). Where both sides call a C library
    function (`exp`, `log`, `sin`, `pow`, ...), they call the same one, so on one machine the
-   result is the same; NumPy's and SciPy's own vectorised `exp`, `pow` and `erf`, and BLAS /
-   LAPACK against Eigen, agree to rounding, and `qtrans verify` measures by how much.
+   result is the same. NumPy's own float64 maths (`np.exp`, `np.log`, `np.power` and 17 more)
+   is computed by the code NumPy runs on that machine for that NumPy release (section 12.1), so
+   it is the same to the bit too. SciPy's own `erf` / `ndtr`, and BLAS / LAPACK against Eigen,
+   agree to rounding, and `qtrans verify` measures by how much.
 2. **The same errors.** The same exception class (`ValueError`, `IndexError`, `KeyError`,
    `ZeroDivisionError`, `OverflowError`, `numpy.linalg.LinAlgError`, your own classes) with the
    same message, where Python raises one; the float errors of Python's numbers included
@@ -201,9 +203,11 @@ def f(s: float) -> float:
     return s ** 2
 ```
 
-`np.power(x, 2)` is NumPy's square (its fast path), so there it is `x * x`:
+`np.power(x, 2)` is NumPy's power loop, whose shortcuts depend on the release (from 2.1 the
+exponent 2 is `x * x`; from 2.3 also -1, 0, 0.5 and 1; before 2.1 none), and whose kernel is
+NumPy's own (section 12.1), so it is `qt::npm::power`, which follows the NumPy qtrans ran with:
 
-```python spec translated "x * x"
+```python spec translated "qt::npm::power(x, 2.0)"
 import numpy as np
 
 def f(x: float) -> float:
@@ -612,6 +616,46 @@ def f(xs: list[float]) -> float:
 Refused: `map`, `filter` (write a comprehension), `divmod`, `complex`, `eval`, `open` and files,
 pandas.
 
+### 12.1 NumPy's own maths
+
+NumPy does not compute `np.exp` with the C library everywhere. On Linux x86-64 with AVX-512 it
+calls Intel's SVML routines, which NumPy ships as assembly; on other AVX-512 machines it has its
+own `exp` and `log`; its `tanh` is its own wherever the CPU has fused multiply-add SIMD; and
+which of these it uses has changed between releases. qtrans reproduces each: the runtime carries
+NumPy's SVML assembly unchanged (`qtrans_svml_ha.hpp`, `qtrans_svml_la.hpp`), NumPy's own C
+kernels (`qtrans_npy_own.hpp`), and a port of its `tanh`, and `qtrans_npmath.hpp` chooses among
+them, and the C library, at the first call, as NumPy does: from the platform, the CPU, NumPy's
+`NPY_DISABLE_CPU_FEATURES` / `NPY_ENABLE_CPU_FEATURES`, and the NumPy release qtrans ran with
+(`qtrans_numpy.hpp`). On Linux it also binds the glibc symbol versions NumPy's wheels call (an
+old `log` gives +NaN for `log(-1.0)`, today's -NaN).
+
+| float64 functions | Linux x86-64, AVX-512 | Other AVX-512 (macOS) | Elsewhere |
+|---|---|---|---|
+| `exp`, `log` | SVML (NumPy 1.23+); NumPy's own (1.21-1.22) | NumPy's own | C library |
+| `exp2`, `log2`, `log10`, `expm1`, `log1p`, `cbrt`, `tan`, `arcsin`, `arccos`, `arctan`, `sinh`, `cosh`, `arcsinh`, `arccosh`, `arctanh` | SVML (1.22+) | C library | C library |
+| `power`, `arctan2` | SVML (1.24+) | C library | C library |
+| `sin`, `cos` | SVML (1.22-1.24) | C library | C library |
+| `tanh` | NumPy's own (1.23+; SVML in 1.22) | NumPy's own | NumPy's own with AVX2+FMA or on ARM64, else the C library |
+
+SVML's high-accuracy routines from NumPy 2.0, its low-accuracy ones before. NumPy's own
+`exp` / `log` are only built before NumPy 2.4 for AVX512F alone. `docs/NUMPY_MATHS.md` (written by
+`tools/npmath_versions.py`) has the check on each release from 1.21 to 2.5, and `qtrans doctor`
+runs it on your machine. On a number, `np.exp(x)` runs the same loop on one value:
+
+```python spec translated "qt::npm::exp(x) + qt::py::math_exp(x)"
+import math
+import numpy as np
+
+def f(x: float) -> float:
+    return np.exp(x) + math.exp(x)
+```
+
+`math.exp` is the C library's, as Python's. Powers follow NumPy's rules: `a ** s` takes NumPy's
+shortcuts for -1, 0, 0.5, 1 and 2 (the same in every release; `a ** 2` is `a.square()`), and
+`np.power(a, s)` those of its power loop, which depend on the release (section 4.2); where an
+array exponent is the same along the loop (a length-1 array, a column), it is a scalar to NumPy's
+loop, and so here.
+
 ## 13. Modules, projects and programs
 
 A module becomes a header (`m.hpp`) with its functions in `namespace m`. Several modules that
@@ -657,7 +701,10 @@ Each is named in the per-module report next to the functions it affects.
   `(-1e308) ** 2.5`, too big even as a complex number, raises `OverflowError` in Python).
 - **ints past 64 bits** raise `OverflowError` in C++; Python's int grows. (NumPy's int64 arrays
   wrap, in both.)
-- **The last bits** where NumPy or SciPy use their own `exp`, `pow`, `erf` or BLAS / LAPACK.
+- **The last bits** where SciPy uses its own `erf` / `ndtr`, or NumPy BLAS / LAPACK (against
+  Eigen); and NumPy's maths on Windows where the C++ is built with a different C library from
+  NumPy's (MinGW against NumPy's MSVC runtime; MSVC builds call the same one). The sign of a NaN
+  that NumPy's C-library path returns is also the C library's.
 - **Which of two errors is raised** when two arguments of a library function (`max(a / b, c / d)`),
   two array or object arguments, or a number and an array operand (`math.log(c) * (A @ x)`)
   raise at once: C++ evaluates those in an unspecified order. Both reject the input; `qtrans
@@ -675,7 +722,9 @@ Each is named in the per-module report next to the functions it affects.
 
 ## 16. Versions
 
-This document describes qtrans 1.0. From 1.0 on, a change to what it says is a change of major
-version (2.0), except for additions: what 1.x refuses, a later 1.x may translate. It is checked on Python 3.10 to 3.14, NumPy 2, and Eigen 3.4
+This document describes qtrans 1.1. From 1.0 on, a change to what it says is a change of major
+version (2.0), except for additions: what 1.x refuses, a later 1.x may translate, and where 1.x
+agrees with Python to rounding, a later 1.x may agree to the bit (1.1: NumPy's own maths), never
+the other way. It is checked on Python 3.10 to 3.14, NumPy 2, and Eigen 3.4
 and 5.0, on Linux (GCC, Clang), macOS (Apple Clang) and Windows (MinGW g++, MSVC for the
 bindings).

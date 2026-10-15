@@ -51,7 +51,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
+from .translator import (NPMATH_HEADERS, ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, TranslationResult,
                          library_tree, translate_file)
 from .types import BOOL, FLOAT, INT, IVEC, MAT, RNG, STR, VEC, VOID, ArrayType, DictType, IntArrayType, ListType, OptionalType, StructType, TupleType
 
@@ -2458,6 +2458,8 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
     shutil.copy(PRINT_HEADER, build / "qtrans_print.hpp")
     shutil.copy(LIST_HEADER, build / "qtrans_list.hpp")
     shutil.copy(UNICODE_HEADER, build / "qtrans_unicode.hpp")
+    for h in NPMATH_HEADERS:  # np.exp and friends, as NumPy computes them (scalar code uses them too)
+        shutil.copy(h, build / h.name)
     for m, r in project.modules.items():  # the driver includes each module's header, programs' too
         if not (build / f"{m}.hpp").exists():
             (build / f"{m}.hpp").write_text(r.header, encoding="utf-8")
@@ -2581,12 +2583,15 @@ def _verify_loaded(project, pymods, targets, build, n_random, seed, rtol, atol, 
         if result.program is not None:  # a program: run it both ways and compare what it prints
             src = build / f"{module}.cpp"
             src.write_text(result.program, encoding="utf-8")
-            for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+            for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER,
+                      *NPMATH_HEADERS):
                 shutil.copy(h, build / h.name)
             prog_system = list(system)
             if "qtrans_arrays.hpp" in result.program or "qtrans_random.hpp" in result.program:
                 shutil.copy(ARRAYS_HEADER, build / "qtrans_arrays.hpp")
                 shutil.copy(RANDOM_HEADER, build / "qtrans_random.hpp")
+                for h in NPMATH_HEADERS:
+                    shutil.copy(h, build / h.name)
                 if not prog_system:
                     prog_system.append(find_eigen(eigen))
             prog = build / (f"{module}_program.exe" if os.name == "nt" else f"{module}_program")

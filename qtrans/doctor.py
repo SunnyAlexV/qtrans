@@ -138,6 +138,8 @@ def run(bind: bool = False) -> list:
         checks.append(_cxx17(cxx))
     if cxx is not None and eigen is not None:
         checks.append(_end_to_end())
+    if cxx is not None:
+        checks.append(_numpy_maths())
     if bind:
         checks.append(_bind())
     elif cxx is not None:
@@ -161,6 +163,28 @@ def _cxx17(cxx) -> Check:
             return Check("C++17", FAIL, "the test program compiled but didn't run correctly",
                          "on Windows with MinGW, its bin folder must be on PATH (the C++ runtime DLLs)")
     return Check("C++17", OK, "compiled and ran a test program")
+
+
+def _numpy_maths() -> Check:
+    """Which code np.exp, np.log, ... run here, and whether the C++ runtime runs the same, bit for
+    bit (tools/npmath_check.py, on a few thousand values per function)."""
+    try:
+        from . import npmath_check
+        r = npmath_check.check(n=4000, verbose=False)
+    except Exception as e:  # noqa: BLE001
+        return Check("NumPy's maths", WARN, f"not checked: {type(e).__name__}: {str(e)[-300:]}")
+    want, _ = r["paths"]
+    kinds = {}
+    for fn, p in want.items():
+        kinds.setdefault(p, []).append(fn)
+    label = {"svml_ha": "SVML (high accuracy)", "svml_la": "SVML (low accuracy)", "numpy_tang": "NumPy's own exp/log",
+             "numpy_own": "NumPy's own kernel", "libm": "the C library"}
+    desc = "; ".join(f"{label[k]}: {len(v)} function{'s' if len(v) > 1 else ''}" for k, v in sorted(kinds.items()))
+    if r["failures"]:
+        return Check("NumPy's maths", FAIL, desc + " -- " + r["failures"][0][:300],
+                     "the C++ does not compute np.exp & co. as NumPy does here: please report this output")
+    n = sum(c[1] for c in r["cases"] if c[3])
+    return Check("NumPy's maths", OK, f"NumPy runs {desc}; the C++ runs the same ({n:,} values compared, all bit-identical)")
 
 
 def _end_to_end() -> Check:

@@ -403,8 +403,9 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
     # ZeroDivisionError for S = K = 0.0 and T < 0 in Python, ValueError if the right side runs
     # first. Then the left side is worked out first, into a temporary.
     # Anything of the runtime may raise (a shape, an index, a float error), but for a few helpers
-    # that never do; the standard library's maths (std::exp, ...) never does.
-    _RAISING = re.compile(r"\bqt::(?!(?:pow|inf|nan|Vec|Mat|IVec|lvalue|none|norm_cdf|norm_sf|norm_pdf|norm_ppf)\b)"
+    # that never do; the standard library's maths (std::exp, ...) never does, nor NumPy's on a
+    # number (qt::npm::exp, ...: inf and NaN, as NumPy gives).
+    _RAISING = re.compile(r"\bqt::(?!(?:pow|inf|nan|Vec|Mat|IVec|lvalue|none|norm_cdf|norm_sf|norm_pdf|norm_ppf|npm::\w+)\b)"
                           r"[\w:]+\s*\(|\bthrow\b|\.at\(")
 
     def may_raise(self, e: Expr) -> bool:
@@ -587,8 +588,8 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
                               "use a float if an approximate value is enough (2.0 ** 100)")
 
     def power(self, node, L: Expr, R: Expr, ufunc: bool = False) -> Expr:
-        """L ** R on numbers (ufunc: np.power, whose fast paths square, take the square root and
-        the reciprocal for the exponents 2, 0.5 and -1, where ** calls the C library's pow)."""
+        """L ** R on numbers: ** is the C library's pow, as Python's float and NumPy's scalars call it;
+        np.power (ufunc) is NumPy's power loop, whose shortcuts depend on the release (qt::npm::power)."""
         node = node or self.current
         self.need_scalar(L, node, "**")
         self.need_scalar(R, node, "**")
@@ -620,15 +621,9 @@ class ExprTranslator(ArrayOps, StructOps, TextOps, ListOps, DictOps, StrOps, _Ob
         if self._python_raises(node):  # 0.0 ** -1 and overflow raise, as Python's float_pow
             L, R = self.promote(L, FLOAT), self.promote(R, FLOAT)
             return Expr(f"qt::py::power({self.as_double(L).code}, {self.as_double(R).code})", P_ATOM, FLOAT)
-        if ufunc and R.value is not None and not isinstance(R.value, str) and float(R.value) in (2.0, 0.5, -1.0):
-            L = self.promote(L, FLOAT)
-            v = float(R.value)
-            if v == 2.0 and L.simple and L.prec == P_ATOM:
-                return Expr(f"{L.code} * {L.code}", P_MUL, FLOAT)  # np.power(x, 2) is np.square(x)
-            if v == 0.5:
-                return Expr(f"std::sqrt({L.code})", P_ATOM, FLOAT)
-            if v == -1.0:
-                return Expr(f"1.0 / {wrap(L, P_MUL)}", P_MUL, FLOAT)
+        if ufunc:  # np.power on numbers: NumPy's power loop, its shortcuts as that release takes them
+            L, R = self.promote(L, FLOAT), self.promote(R, FLOAT)
+            return Expr(f"qt::npm::power({self.as_double(L).code}, {self.as_double(R).code})", P_ATOM, FLOAT)
         if not getattr(self, "strict", False):
             self.note("powoverflow", "float ** raises OverflowError in Python when the result "
                                      "overflows; C++ returns inf")

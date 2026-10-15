@@ -273,13 +273,17 @@ def main(argv=None):
              "NumPy already runs its loops in C. Replacing a Python loop with compiled code is not the same as "
              "beating well-vectorised NumPy by that much; the compiled loop is "
              f"{by['book_numpy'].py_ns / by['book_loop'].cpp_ns:.1f}× faster than the vectorised Python.")
-    L.append(f"- `mc_call` is {'slower' if by['mc_call'].cpp_ns > by['mc_call'].py_ns else 'faster'} in C++ "
-             f"({fmt_ns(by['mc_call'].cpp_ns)} against {fmt_ns(by['mc_call'].py_ns)}). Taken apart, the draws "
-             f"are on a par ({fmt_ns(by['mc_draws'].cpp_ns)} against {fmt_ns(by['mc_draws'].py_ns)}), and `np.exp` "
-             f"is not ({fmt_ns(by['mc_exp'].cpp_ns)} against {fmt_ns(by['mc_exp'].py_ns)}): NumPy has its own "
-             "SIMD exp (AVX-512 on this CPU), and the C++ calls the C library's exp per element, so it agrees "
-             "with Python's math.exp and only to rounding with NumPy's. Porting NumPy's exp would make it both "
-             "faster and bit-identical on such CPUs; it is on the roadmap.")
+    from qtrans.npmath_check import expected_paths
+    exp_path = {"svml_ha": "Intel's SVML, as NumPy calls it on this CPU (the high-accuracy routine)",
+                "svml_la": "Intel's SVML, as NumPy calls it on this CPU (the low-accuracy routine)",
+                "numpy_tang": "NumPy's own AVX512F kernel", "numpy_own": "NumPy's own kernel",
+                "libm": "the C library, as NumPy does here"}[expected_paths()["exp"]]
+    mc, dr, ex = by["mc_call"], by["mc_draws"], by["mc_exp"]
+    L.append(f"- `mc_call` is {mc.py_ns / mc.cpp_ns:.1f}× ({fmt_ns(mc.cpp_ns)} in C++ against {fmt_ns(mc.py_ns)}). Taken "
+             f"apart: the draws take {fmt_ns(dr.cpp_ns)} against {fmt_ns(dr.py_ns)}, and `np.exp` of 100,000 values "
+             f"{fmt_ns(ex.cpp_ns)} against {fmt_ns(ex.py_ns)}. For `np.exp` the C++ runs the code NumPy runs: "
+             f"{exp_path} (since 1.1; until then it called the C library one value at a time, 3.6× slower than "
+             "NumPy and different in the last bit on 4.4% of inputs).")
     bs = by["bs_call"]
     big = ("book_loop", "book_numpy", "ytm_book")
     worst = max(abs(btimes[n] / by[n].cpp_ns - 1.0) for n in big)

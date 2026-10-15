@@ -113,6 +113,14 @@ RULES = [
     (r"qt::(matmul|matvec|vecmat|dot|outer)\(", "products",
      "@ / np.dot by the operands' ranks (matrix, vector or both), sizes checked as NumPy does; "
      "sums run in Eigen's order, so the last bits can differ from NumPy's BLAS"),
+    (r"qt::npm::\w+\(|qt::(exp|log|log10|log2|log1p|expm1|exp2|cbrt|sin|cos|tan|sinh|cosh|tanh|arcsin|arccos|"
+     r"arctan|arcsinh|arccosh|arctanh|np_power|arctan2)\(", "library",
+     "NumPy's own float64 maths, computed by the code NumPy runs on this machine for this NumPy release "
+     "(Intel's SVML on Linux with AVX-512, NumPy's own kernels, or the C library NumPy calls), so the "
+     "result is NumPy's to the bit; np.power's shortcuts (x*x, sqrt, 1/x) follow the release"),
+    (r"qt::pow\(", "library",
+     "** on an array: NumPy's shortcuts for the exponents -1, 0, 0.5, 1 and 2 (the same in every release), "
+     "else NumPy's power kernel, as above"),
     (r"qt::norm_(cdf|sf|pdf|ppf|logcdf|logpdf)\(", "library",
      "computed the way SciPy computes it (ndtr: erf near zero, erfc in the tails), so results "
      "agree to the last bit or two"),

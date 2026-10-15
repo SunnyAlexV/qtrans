@@ -1,7 +1,7 @@
 """x ** y on Python floats is the C library's pow, which for the exponents 2 and -1 is not always
 x * x and 1 / x (glibc: about 1 value in 1,000), while a C++ compiler turns std::pow(x, 2.0) into
 x * x and std::pow(x, -1.0) into 1.0 / x. The translation calls qt::pow, which keeps the call, and
-np.power keeps NumPy's own fast paths (np.square, np.sqrt, np.reciprocal)."""
+np.power is NumPy's power loop, with the shortcuts of the NumPy release (qtrans_npmath.hpp)."""
 import platform
 import random
 import shutil
@@ -62,8 +62,10 @@ def test_power_and_np_power_keep_their_own_rules():
                          "m").header
     # (qt::py::power is qt::pow plus Python's errors; both terms may raise, so the left one first)
     assert "const double left = qt::py::power(x, 2.0);\n    return left + qt::py::power(x, -1.0);" in h
-    assert "x * x + std::sqrt(x) + 1.0 / x" in h
+    # np.power is NumPy's power loop: its shortcuts follow the NumPy release (qtrans_npmath.hpp)
+    assert "qt::npm::power(x, 2.0) + qt::npm::power(x, 0.5) + qt::npm::power(x, -1.0)" in h
     x = np.float64(1.431322935583394)
-    assert np.power(x, 2) == x * x  # NumPy's square
+    if tuple(int(p) for p in np.__version__.split(".")[:2]) >= (2, 1):
+        assert np.power(x, 2) == x * x  # NumPy's square, from 2.1
     if GLIBC:  # glibc's pow(x, 2.0) is not x * x here; macOS's and Windows's pow happen to agree for this x
         assert x ** 2 != x * x

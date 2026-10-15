@@ -316,7 +316,7 @@ inline T square(T x) { return x * x; }
 // norm_cdf: SciPy's ndtr. Near zero it uses erf; in the tails it uses erfc of |x|,
 //   which keeps full relative accuracy for tiny probabilities (1 - 0.5 * erfc(...)
 //   is only taken on the side where the result is close to 1).
-// norm_pdf: exp(-x^2 / 2) / sqrt(2 pi), as scipy.stats.norm._pdf.
+// norm_pdf: in qtrans_npmath.hpp, as it takes NumPy's exp (scipy.stats.norm._pdf calls np.exp).
 // norm_ppf: inverse CDF. Acklam's rational approximation (relative error < 1.2e-9),
 //   then one Halley step on norm_cdf(x) - p, which takes it to double precision.
 // ---------------------------------------------------------------------------------
@@ -332,9 +332,6 @@ inline double norm_cdf(double a) {
 
 inline double norm_sf(double x) { return norm_cdf(-x); }
 
-inline double norm_pdf(double x) {
-    return std::exp(-x * x / 2.0) / 2.5066282746310002;  // sqrt(2 pi)
-}
 
 inline double norm_ppf(double p) {
     if (std::isnan(p) || p < 0.0 || p > 1.0) return nan;
@@ -393,10 +390,6 @@ inline double norm_sf(double x, double loc, double scale) {
     return norm_sf((x - loc) / scale);
 }
 
-inline double norm_pdf(double x, double loc, double scale) {
-    if (!(scale > 0.0)) return nan;
-    return norm_pdf((x - loc) / scale) / scale;
-}
 
 inline double norm_ppf(double q, double loc, double scale) {
     if (!(scale > 0.0)) return nan;

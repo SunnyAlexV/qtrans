@@ -27,9 +27,12 @@ _NUMPY_SAME = [
     "cosh", "tanh", "cbrt", "exp2", "fabs", "floor", "ceil", "trunc",
 ]
 UNARY_FLOAT.update({f"numpy.{n}": f"std::{n}" for n in _NUMPY_SAME})
+# NumPy's own float64 maths: on a number as on an array, NumPy runs its loop (SVML, its own
+# kernels or the C library, by platform, CPU and release); qt::npm runs the same code (1.1)
+NUMPY_OWN = ["exp", "log", "log10", "log2", "log1p", "expm1", "exp2", "cbrt", "sin", "cos", "tan", "sinh",
+             "cosh", "tanh", "arcsin", "arccos", "arctan", "arcsinh", "arccosh", "arctanh"]
+UNARY_FLOAT.update({f"numpy.{n}": f"qt::npm::{n}" for n in NUMPY_OWN})
 UNARY_FLOAT.update({
-    "numpy.arcsin": "std::asin", "numpy.arccos": "std::acos", "numpy.arctan": "std::atan",
-    "numpy.arcsinh": "std::asinh", "numpy.arccosh": "std::acosh", "numpy.arctanh": "std::atanh",
     "numpy.rint": "std::nearbyint",  # half-to-even, like numpy
     "scipy.special.erf": "std::erf", "scipy.special.erfc": "std::erfc",
     "scipy.special.gamma": "std::tgamma", "scipy.special.gammaln": "std::lgamma",
@@ -48,7 +51,7 @@ MATH_RANGE = {"math.exp", "math.exp2", "math.expm1", "math.sinh", "math.cosh", "
 BINARY_FLOAT = {
     "math.atan2": "std::atan2", "math.hypot": "std::hypot", "math.copysign": "std::copysign",
     "math.fmod": "std::fmod",
-    "numpy.arctan2": "std::atan2", "numpy.hypot": "std::hypot",
+    "numpy.arctan2": "qt::npm::arctan2", "numpy.hypot": "std::hypot",
     "numpy.copysign": "std::copysign", "numpy.fmod": "std::fmod",
 }
 

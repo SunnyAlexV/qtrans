@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from qtrans import translate_source
-from qtrans.translator import ARRAYS_HEADER, PRINT_HEADER, PYTHON_HEADER, RANDOM_HEADER, RUNTIME_HEADER, UNICODE_HEADER
+from qtrans.translator import NPMATH_HEADERS, ARRAYS_HEADER, PRINT_HEADER, PYTHON_HEADER, RANDOM_HEADER, RUNTIME_HEADER, UNICODE_HEADER
 from qtrans.verify import find_compiler, find_eigen, verify_file
 
 DATA = Path(__file__).parent / "data"
@@ -26,7 +26,7 @@ compiled = pytest.mark.skipif(not HAVE, reason="no C++ compiler or Eigen")
 
 
 def _build(tmp_path, source):
-    for h in (RUNTIME_HEADER, PYTHON_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, UNICODE_HEADER):
+    for h in (RUNTIME_HEADER, PYTHON_HEADER, ARRAYS_HEADER, RANDOM_HEADER, PRINT_HEADER, UNICODE_HEADER, *NPMATH_HEADERS):
         shutil.copy(h, tmp_path / h.name)
     shutil.copy(DATA / source, tmp_path / "probe.cpp")
     exe = tmp_path / ("probe.exe" if sys.platform == "win32" else "probe")

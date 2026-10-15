@@ -26,12 +26,14 @@ _CMP = {ast.Lt: ("<", P_REL), ast.LtE: ("<=", P_REL), ast.Gt: (">", P_REL), ast.
         ast.Eq: ("==", P_EQ), ast.NotEq: ("!=", P_EQ)}
 _FLIP = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
 
-# elementwise functions: Eigen member (exact, same as NumPy) or qt:: helper (C library)
+# elementwise functions: Eigen member (exact, same as NumPy) or qt:: helper (NumPy's own maths,
+# qtrans_npmath.hpp, or the C library where that is what NumPy runs)
 _MEMBER = {"numpy.sqrt": "sqrt", "numpy.abs": "abs", "numpy.absolute": "abs", "numpy.fabs": "abs",
            "numpy.square": "square"}
 _HELPER = {f"numpy.{n}": f"qt::{n}" for n in (
     "exp", "log", "log10", "log2", "log1p", "expm1", "sin", "cos", "tan", "sinh", "cosh", "tanh",
-    "arcsin", "arccos", "arctan", "floor", "ceil", "trunc", "rint")}
+    "arcsin", "arccos", "arctan", "floor", "ceil", "trunc", "rint", "exp2", "cbrt", "arcsinh", "arccosh",
+    "arctanh")}
 _HELPER["numpy.sign"] = "qt::np_sign"
 _MASK_FN = {"numpy.isnan": "isNaN", "numpy.isfinite": "isFinite", "numpy.isinf": "isInf"}
 _REDUCE = {"numpy.sum": "sum", "numpy.mean": "mean", "numpy.std": "std", "numpy.var": "var",
@@ -44,7 +46,7 @@ ARRAY_FUNCS = set(_MEMBER) | set(_HELPER) | set(_MASK_FN) | set(_REDUCE) | {
     "numpy.arange", "numpy.array", "numpy.asarray", "numpy.zeros_like", "numpy.ones_like",
     "numpy.full_like", "numpy.copy", "numpy.dot", "numpy.matmul", "numpy.outer", "numpy.transpose",
     "numpy.diag", "numpy.where", "numpy.all", "numpy.any", "numpy.count_nonzero", "numpy.maximum",
-    "numpy.minimum", "numpy.power", "numpy.linalg.solve", "numpy.linalg.inv", "numpy.linalg.cholesky",
+    "numpy.minimum", "numpy.power", "numpy.arctan2", "numpy.linalg.solve", "numpy.linalg.inv", "numpy.linalg.cholesky",
     "numpy.linalg.det", "numpy.clip", "numpy.trace", "numpy.ravel", "numpy.linalg.eigh",
     "numpy.linalg.eigvalsh", "numpy.linalg.pinv"}
 # functions taking a list of arrays: np.column_stack([a, b]) ...
@@ -156,12 +158,15 @@ class ArrayOps:
         return Expr(f"{wrap(L, P_ATOM)}.transpose().replicate({wrap(R, P_ATOM)}.rows(), 1) {sym} "
                     f"{wrap(R, p - 1)}", p, MAT, dims=dr)
 
-    def array_power(self, node, L: Expr, R: Expr) -> Expr:
+    def array_power(self, node, L: Expr, R: Expr, ufunc: bool = False) -> Expr:
+        """a ** b (ufunc False) or np.power(a, b): NumPy's shortcuts for the ** operator are the same in
+        every release; np.power's depend on the release, so they are left to qt::np_power."""
+        fn = "qt::np_power" if ufunc else "qt::pow"
         if is_array(L.type) and not is_array(R.type):
             self.need_scalar(R, node, "**")
             v = R.value
             X = wrap(L, P_ATOM)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and not ufunc:
                 # the fast paths NumPy itself takes for these exponents
                 if v == 2:
                     return Expr(f"{X}.square()", P_ATOM, L.type, dims=dims_of(L))
@@ -169,16 +174,14 @@ class ArrayOps:
                     return Expr(f"{X}.sqrt()", P_ATOM, L.type, dims=dims_of(L))
                 if v == -1:
                     return Expr(f"{X}.inverse()", P_ATOM, L.type, dims=dims_of(L))
-            return Expr(f"qt::pow({L.code}, {self.as_double(R).code})", P_ATOM, L.type, dims=dims_of(L))
+            return Expr(f"{fn}({L.code}, {self.as_double(R).code})", P_ATOM, L.type, dims=dims_of(L))
         if not is_array(L.type) and is_array(R.type):
             self.need_scalar(L, node, "**")
-            return Expr(f"qt::pow({self.as_double(L).code}, {R.code})", P_ATOM, R.type, dims=dims_of(R))
+            return Expr(f"{fn}({self.as_double(L).code}, {R.code})", P_ATOM, R.type, dims=dims_of(R))
         if L.type != R.type:
             raise Unsupported(node, "** between a Vec and a Mat is not supported")
         d = _joined(dims_of(L), dims_of(R))
-        if L.type == MAT:
-            return Expr(f"qt::broadcast({L.code}, {R.code}, qt::pow_op{{}})", P_ATOM, MAT, dims=d)
-        return Expr(f"qt::pow({L.code}, {R.code})", P_ATOM, L.type, dims=d)  # broadcasts a length-1 side
+        return Expr(f"{fn}({L.code}, {R.code})", P_ATOM, L.type, dims=d)  # broadcasts
 
     def matmul(self, node, L: Expr, R: Expr) -> Expr:
         if not (is_array(L.type) and is_array(R.type)):
@@ -751,7 +754,7 @@ class ArrayOps:
                 raise Unsupported(node, f"{src}() of a boolean array (a comparison) is supported")
             fn = {"numpy.all": "all", "numpy.any": "any", "numpy.count_nonzero": "count"}[qual]
             return Expr(f"{wrap(A, P_ATOM)}.{fn}()", P_ATOM, INT if fn == "count" else BOOL)
-        if qual in ("numpy.maximum", "numpy.minimum"):
+        if qual in ("numpy.maximum", "numpy.minimum", "numpy.arctan2"):
             if len(args) != 2:
                 raise Unsupported(node, f"{src}() takes two arguments")
             a, b = args
@@ -764,7 +767,7 @@ class ArrayOps:
             d = arrs[0] if len(arrs) == 1 else _joined(*arrs)
             return Expr(f"qt::{qual.split('.')[1]}({ca}, {cb})", P_ATOM, t, dims=d)  # broadcasts a length-1 side
         if qual == "numpy.power":
-            return self.array_power(node, args[0], args[1])
+            return self.array_power(node, args[0], args[1], ufunc=True)
         if qual == "numpy.clip":
             return self._clip(node, A, node.args[1:], {k.arg: k.value for k in node.keywords})
         if qual == "numpy.trace":

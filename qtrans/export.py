@@ -443,8 +443,9 @@ def export(paths, out_dir, name=None, cases=50, seed=0, golden=True, build=True,
         (tests / "qtrans_driver.cpp").write_text(drv, encoding="utf-8")
         # the driver always uses these runtime headers; they go beside the others (one copy of
         # each, so #pragma once sees one file)
-        from .translator import LIST_HEADER, PRINT_HEADER, PYRANDOM_HEADER, PYTHON_HEADER, RUNTIME_HEADER, UNICODE_HEADER
-        for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER):
+        from .translator import (LIST_HEADER, NPMATH_HEADERS, PRINT_HEADER, PYRANDOM_HEADER, PYTHON_HEADER,
+                                 RUNTIME_HEADER, UNICODE_HEADER)
+        for h in (RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, LIST_HEADER, UNICODE_HEADER, *NPMATH_HEADERS):
             if not (inc / h.name).exists():
                 shutil.copy(h, inc / h.name)
         report.append(f"golden tests: {recorded} cases of Python's results recorded in tests/golden.txt"

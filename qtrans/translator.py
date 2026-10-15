@@ -23,6 +23,7 @@ from . import library as lib
 from .errors import Unsupported
 from .unicode_tables import header_path as unicode_header_path
 from .pyfacts import header_path as python_header_path
+from .npfacts import header_path as numpy_header_path
 from .expressions import P_ATOM, Expr, ExprTranslator, cpp_ident
 from . import classes as cls_
 from . import loops
@@ -34,7 +35,7 @@ from .report import FunctionReport, ModuleReport
 from .types import (BOOL, FLOAT, INT, MAT, NONE, RNG, STR, VEC, VOID, ArrayType, OptionalType, RngType, Scalar,
                     StructType, TupleType, ListType, DictType, IVEC, assignable, is_array, is_arraylike)
 
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 PROGRAM = "(program)"  # the report's name for a program's top-level code (int main())
 
 # Notes about behaviour that differs only on overflow or error paths, shared by most numeric
@@ -48,6 +49,10 @@ PRINT_HEADER = Path(__file__).parent / "runtime" / "qtrans_print.hpp"
 LIST_HEADER = Path(__file__).parent / "runtime" / "qtrans_list.hpp"
 UNICODE_HEADER = unicode_header_path()  # qtrans_list.hpp includes it: this Python's Unicode tables
 PYTHON_HEADER = python_header_path()  # qtrans_runtime.hpp includes it: this Python's error messages
+NPMATH_HEADER = Path(__file__).parent / "runtime" / "qtrans_npmath.hpp"  # NumPy's float64 maths, as NumPy runs it (1.1)
+NUMPY_HEADER = numpy_header_path()  # qtrans_npmath.hpp includes it: which NumPy release to reproduce
+NPMATH_HEADERS = (NPMATH_HEADER, NUMPY_HEADER, Path(__file__).parent / "runtime" / "qtrans_npy_own.hpp",
+                  Path(__file__).parent / "runtime" / "qtrans_svml_ha.hpp", Path(__file__).parent / "runtime" / "qtrans_svml_la.hpp")
 
 
 @functools.lru_cache(maxsize=None)
@@ -2870,6 +2875,10 @@ class ModuleTranslator:
         elif re.search(r"qt::(Vec|Mat|Mask2?)\b", code) or "Eigen::" in code \
                 or any(self.array_users.get(n) for n in bodies) or (self.array_users.get(PROGRAM) and "int main()" in code):
             inc_lines.append('#include "qtrans_arrays.hpp"  // Eigen, plus NumPy semantics')
+        elif re.search(r"qt::(npm::|norm_pdf\b)", code):
+            inc_lines.append('#include "qtrans_npmath.hpp"  // np.exp, np.log, ... as NumPy computes them')
+            if "qt::" in re.sub(r"qt::(py::|npm::|norm_pdf\b)", "", code):
+                inc_lines.append('#include "qtrans_runtime.hpp"')
         elif "qt::" in code.replace("qt::py::", ""):
             inc_lines.append('#include "qtrans_runtime.hpp"')
         if "qt::py::random_module()" in code:
@@ -2961,7 +2970,10 @@ def translate_file(path, out_dir=None) -> TranslationResult:
                 (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
         everything = result.header + (result.program or "")
         if result.uses_arrays or "qtrans_arrays.hpp" in everything or "qtrans_random.hpp" in everything:
-            for h in (ARRAYS_HEADER, RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER):
+            for h in (ARRAYS_HEADER, RUNTIME_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, *NPMATH_HEADERS):
+                (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
+        elif "qtrans_npmath.hpp" in everything:
+            for h in NPMATH_HEADERS:
                 (out / h.name).write_text(h.read_text(encoding="utf-8-sig"), encoding="utf-8")
         if result.uses_random or "qtrans_random.hpp" in everything:
             (out / "qtrans_random.hpp").write_text(RANDOM_HEADER.read_text(encoding="utf-8-sig"), encoding="utf-8")

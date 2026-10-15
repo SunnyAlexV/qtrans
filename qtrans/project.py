@@ -22,7 +22,7 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .translator import (ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
+from .translator import (NPMATH_HEADERS, ARRAYS_HEADER, LIST_HEADER, UNICODE_HEADER, PYTHON_HEADER, PYRANDOM_HEADER, PRINT_HEADER, RANDOM_HEADER, RUNTIME_HEADER, ModuleTranslator, TranslationResult)
 
 
 class ProjectError(Exception):
@@ -90,6 +90,8 @@ class ProjectResult:
             headers += [PRINT_HEADER, LIST_HEADER, UNICODE_HEADER]
         if self.uses_arrays or any("qtrans_arrays.hpp" in t or "qtrans_random.hpp" in t for t in texts):
             headers.append(ARRAYS_HEADER)
+        if self.uses_arrays or any(m in t for t in texts for m in ("qtrans_arrays.hpp", "qtrans_random.hpp", "qtrans_npmath.hpp")):
+            headers += list(NPMATH_HEADERS)
         if self.uses_random or any("qtrans_random.hpp" in t for t in texts):
             headers.append(RANDOM_HEADER)
         if any(r.uses_runtime or r.uses_arrays or "qtrans_print.hpp" in r.header + (r.program or "")

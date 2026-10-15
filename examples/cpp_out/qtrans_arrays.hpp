@@ -9,8 +9,10 @@
 //                               (row-major, so memory order and flat reductions match NumPy)
 //
 // Where NumPy's exact algorithm is known (pairwise summation, mean, var, quantile, linspace,
-// arange, cumsum) it is ported line for line, so results are bit-identical. Where NumPy calls
-// BLAS/LAPACK or its own SIMD maths (matmul, solve, exp, ...), results agree to rounding.
+// arange, cumsum) it is ported line for line, so results are bit-identical. NumPy's own float64
+// maths (np.exp, np.log, np.power, ...) is computed by the code NumPy runs on this machine
+// (qtrans_npmath.hpp), so it is bit-identical too. Where NumPy calls BLAS/LAPACK (matmul, solve,
+// ...), results agree to rounding.
 //
 // Shape and index errors throw instead of crashing: NumPy raises ValueError / IndexError,
 // and Eigen's internal assertions are redirected to exceptions below. Include this header
@@ -30,6 +32,7 @@
 #include <vector>
 
 #include "qtrans_runtime.hpp"
+#include "qtrans_npmath.hpp"
 
 namespace qt {
 struct shape_error : std::invalid_argument {   // NumPy: ValueError (shapes), IndexError (bounds)
@@ -199,30 +202,49 @@ auto block(A& m, std::optional<long long> r0, std::optional<long long> r1,
 }
 
 // =====================================================================================
-// Elementwise functions. These call the C library, as Python's math module and stage-1
-// code do. NumPy uses its own SIMD versions of exp/log/pow, which can differ in the last bit.
-// (sqrt, abs and + - * / are exact in both, so they are left to Eigen.)
+// Elementwise functions. NumPy's own float64 maths runs the code NumPy runs here (SVML, its own
+// kernels, or the C library: qtrans_npmath.hpp), on the whole array at once as NumPy's loops do.
+// The rest (sqrt, floor, ...) are exact everywhere, and call the C library or Eigen.
 // =====================================================================================
+#define QT_NPUNARY(NAME)                                                           \
+    template <class D>                                                             \
+    plain_t<D> NAME(const Eigen::ArrayBase<D>& a) {                                \
+        if constexpr (std::is_same_v<D, Vec> || std::is_same_v<D, Mat>) {         \
+            plain_t<D> r(a.rows(), a.cols()); /* a stored array: read in place */  \
+            npm::apply(npm::Fn::NAME, r.data(), a.derived().data(), r.size());     \
+            return r;                                                              \
+        } else {                                                                   \
+            plain_t<D> r = a.template cast<double>();                              \
+            npm::apply(npm::Fn::NAME, r.data(), r.data(), r.size());               \
+            return r;                                                              \
+        }                                                                          \
+    }
+QT_NPUNARY(exp)
+QT_NPUNARY(log)
+QT_NPUNARY(log10)
+QT_NPUNARY(log2)
+QT_NPUNARY(log1p)
+QT_NPUNARY(expm1)
+QT_NPUNARY(exp2)
+QT_NPUNARY(cbrt)
+QT_NPUNARY(sin)
+QT_NPUNARY(cos)
+QT_NPUNARY(tan)
+QT_NPUNARY(sinh)
+QT_NPUNARY(cosh)
+QT_NPUNARY(tanh)
+QT_NPUNARY(arcsin)
+QT_NPUNARY(arccos)
+QT_NPUNARY(arctan)
+QT_NPUNARY(arcsinh)
+QT_NPUNARY(arccosh)
+QT_NPUNARY(arctanh)
+#undef QT_NPUNARY
 #define QT_UNARY(NAME, FN)                                                         \
     template <class D>                                                             \
     auto NAME(const Eigen::ArrayBase<D>& a) {                                      \
         return a.unaryExpr([](double x) { return FN(static_cast<double>(x)); });   \
     }
-QT_UNARY(exp, std::exp)
-QT_UNARY(log, std::log)
-QT_UNARY(log10, std::log10)
-QT_UNARY(log2, std::log2)
-QT_UNARY(log1p, std::log1p)
-QT_UNARY(expm1, std::expm1)
-QT_UNARY(sin, std::sin)
-QT_UNARY(cos, std::cos)
-QT_UNARY(tan, std::tan)
-QT_UNARY(sinh, std::sinh)
-QT_UNARY(cosh, std::cosh)
-QT_UNARY(tanh, std::tanh)
-QT_UNARY(arcsin, std::asin)
-QT_UNARY(arccos, std::acos)
-QT_UNARY(arctan, std::atan)
 QT_UNARY(floor, std::floor)
 QT_UNARY(ceil, std::ceil)
 QT_UNARY(trunc, std::trunc)
@@ -254,7 +276,7 @@ struct add_op { double operator()(double x, double y) const { return x + y; } };
 struct sub_op { double operator()(double x, double y) const { return x - y; } };
 struct mul_op { double operator()(double x, double y) const { return x * y; } };
 struct div_op { double operator()(double x, double y) const { return x / y; } };
-struct pow_op { double operator()(double x, double y) const { return std::pow(x, y); } };
+struct pow_op { double operator()(double x, double y) const { return npm::power_pair(x, y); } };
 struct lt_op { bool operator()(double x, double y) const { return x < y; } };
 struct le_op { bool operator()(double x, double y) const { return x <= y; } };
 struct gt_op { bool operator()(double x, double y) const { return x > y; } };
@@ -387,17 +409,100 @@ void store(Dst&& dst, const Eigen::ArrayBase<Src>& src, F f = {}) {
             dst(i, j) = f(dst(i, j), y(y.rows() == 1 ? 0 : i, y.cols() == 1 ? 0 : j));
 }
 
+// a ** p (the operator): NumPy's shortcuts for p = -1, 0, 0.5, 1, 2, else its power kernel
 template <class D>
-auto pow(const Eigen::ArrayBase<D>& a, double p) {
-    return a.unaryExpr([p](double x) { return std::pow(x, p); });
+plain_t<D> pow(const Eigen::ArrayBase<D>& a, double p) {
+    plain_t<D> r = a.template cast<double>();
+    npm::power_scalar(r.data(), r.data(), p, r.size(), true);
+    return r;
+}
+// np.power(a, p): the shortcuts of NumPy's power loop, which depend on its release
+template <class D>
+plain_t<D> np_power(const Eigen::ArrayBase<D>& a, double p) {
+    plain_t<D> r = a.template cast<double>();
+    npm::power_scalar(r.data(), r.data(), p, r.size(), false);
+    return r;
+}
+// b ** a and np.power(b, a): a scalar base takes no shortcut
+template <class D>
+plain_t<D> pow(double b, const Eigen::ArrayBase<D>& a) {
+    plain_t<D> r = a.template cast<double>();
+    npm::power_base(r.data(), b, r.data(), r.size());
+    return r;
 }
 template <class D>
-auto pow(double b, const Eigen::ArrayBase<D>& a) {
-    return a.unaryExpr([b](double x) { return std::pow(b, x); });
-}
+plain_t<D> np_power(double b, const Eigen::ArrayBase<D>& a) { return pow(b, a); }
+// a ** b and np.power(a, b) on two arrays, broadcast. NumPy's loop runs along the last axis; where
+// the exponent is the same along it (a length-1 array, a column), it is a scalar to the loop,
+// whose shortcuts then apply, as in np.power(a, p).
 template <class D1, class D2>
 auto pow(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {
-    return broadcast(a, b, pow_op{});
+    if constexpr (D1::ColsAtCompileTime == 1 && D2::ColsAtCompileTime == 1) {
+        const Vec x = a.template cast<double>(), y = b.template cast<double>();
+        if (x.size() == y.size()) {
+            Vec out(x.size());
+            if (x.size() == 1) npm::power_scalar(out.data(), x.data(), y(0), 1, false);
+            else npm::apply2(npm::Fn::power, out.data(), x.data(), y.data(), x.size());
+            return out;
+        }
+        if (y.size() == 1) {
+            Vec out(x.size());
+            npm::power_scalar(out.data(), x.data(), y(0), x.size(), false);
+            return out;
+        }
+        if (x.size() == 1) {
+            Vec out(y.size());
+            npm::power_base(out.data(), x(0), y.data(), y.size());
+            return out;
+        }
+        throw shape_error("operands could not be broadcast together");
+    } else {
+        const Mat x = a.template cast<double>(), y = b.template cast<double>();
+        const Index r = broadcast_dim(x.rows(), y.rows()), c = broadcast_dim(x.cols(), y.cols());
+        Mat out(r, c), xr(1, c), yr(1, c);
+        for (Index i = 0; i < r; ++i) {
+            const Index xi = x.rows() == 1 ? 0 : i, yi = y.rows() == 1 ? 0 : i;
+            for (Index j = 0; j < c; ++j) xr(0, j) = x(xi, x.cols() == 1 ? 0 : j);
+            if (y.cols() == 1 || c == 1) {
+                npm::power_scalar(out.data() + i * c, xr.data(), y(yi, 0), c, false);
+            } else {
+                for (Index j = 0; j < c; ++j) yr(0, j) = y(yi, j);
+                npm::apply2(npm::Fn::power, out.data() + i * c, xr.data(), yr.data(), c);
+            }
+        }
+        return out;
+    }
+}
+template <class D1, class D2>
+auto np_power(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) { return pow(a, b); }
+
+// np.arctan2(a, b), broadcast; the pairs go through NumPy's kernel eight at a time
+struct atan2_op { double operator()(double y, double x) const { return npm::arctan2(y, x); } };
+template <class D1, class D2>
+auto arctan2(const Eigen::ArrayBase<D1>& a, const Eigen::ArrayBase<D2>& b) {
+    if (a.rows() == b.rows() && a.cols() == b.cols()) {
+        using P = std::conditional_t<D1::ColsAtCompileTime == 1 && D2::ColsAtCompileTime == 1, Vec, Mat>;
+        const P x = a.template cast<double>(), y = b.template cast<double>();
+        P out(x.rows(), x.cols());
+        npm::apply2(npm::Fn::arctan2, out.data(), x.data(), y.data(), x.size());
+        return out;
+    }
+    using P = std::conditional_t<D1::ColsAtCompileTime == 1 && D2::ColsAtCompileTime == 1, Vec, Mat>;
+    return P(broadcast(a, b, atan2_op{}));
+}
+template <class D>
+plain_t<D> arctan2(const Eigen::ArrayBase<D>& a, double b) {
+    plain_t<D> x = a.template cast<double>();
+    const plain_t<D> y = plain_t<D>::Constant(x.rows(), x.cols(), b);
+    npm::apply2(npm::Fn::arctan2, x.data(), x.data(), y.data(), x.size());
+    return x;
+}
+template <class D>
+plain_t<D> arctan2(double a, const Eigen::ArrayBase<D>& b) {
+    plain_t<D> y = b.template cast<double>();
+    const plain_t<D> x = plain_t<D>::Constant(y.rows(), y.cols(), a);
+    npm::apply2(npm::Fn::arctan2, y.data(), x.data(), y.data(), y.size());
+    return y;
 }
 
 // np.maximum / np.minimum propagate NaN from either side (Eigen's max/min don't).
@@ -462,7 +567,52 @@ auto where(const Eigen::ArrayBase<C>& cond, const X& x, const Y& y) {
 // NumPy's pairwise summation (numpy/_core/src/umath/loops_utils.h.src, PW_BLOCKSIZE 128):
 // fewer than 8 values are added left to right; up to 128 use eight running partial sums;
 // longer runs are split in two, recursively.
+// The same, for contiguous values: the eight partial sums are eight independent lanes, so the
+// compiler adds them as one vector, in the same order, to the same bits, as NumPy's SIMD build does.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER) && !defined(_WIN32)
+// with AVX-512, the eight partial sums are one register: the same eight sums, the same bits (not on
+// Windows, where GCC does not keep the stack aligned for AVX registers: GCC bug 54412)
+__attribute__((target("avx512f"))) inline double pairwise_block_avx512(const double* a, Index n) {
+    __m512d r = _mm512_loadu_pd(a);
+    Index i = 8;
+    const Index end = n - (n % 8);
+    for (; i < end; i += 8) r = _mm512_add_pd(r, _mm512_loadu_pd(a + i));
+    alignas(64) double v[8];
+    _mm512_store_pd(v, r);
+    double res = ((v[0] + v[1]) + (v[2] + v[3])) + ((v[4] + v[5]) + (v[6] + v[7]));
+    for (; i < n; ++i) res += a[i];
+    return res;
+}
+#define QT_PAIRWISE_AVX512 1
+#endif
+
+inline double pairwise_contiguous(const double* a, Index n) {
+#if defined(QT_PAIRWISE_AVX512)
+    if (n >= 8 && n <= 128 && npm::cpu().avx512f) return pairwise_block_avx512(a, n);
+#endif
+    if (n < 8) {
+        double res = 0.0;
+        for (Index i = 0; i < n; ++i) res += a[i];
+        return res;
+    }
+    if (n <= 128) {
+        double r[8];
+        for (int k = 0; k < 8; ++k) r[k] = a[k];
+        Index i = 8;
+        const Index end = n - (n % 8);
+        for (; i < end; i += 8)
+            for (int k = 0; k < 8; ++k) r[k] += a[i + k];
+        double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        for (; i < n; ++i) res += a[i];
+        return res;
+    }
+    Index n2 = n / 2;
+    n2 -= n2 % 8;
+    return pairwise_contiguous(a, n2) + pairwise_contiguous(a + n2, n - n2);
+}
+
 inline double pairwise(const double* a, Index n, Index stride) {
+    if (stride == 1) return pairwise_contiguous(a, n);
     if (n < 8) {
         double res = 0.0;
         for (Index i = 0; i < n; ++i) res += a[i * stride];

@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.1.0
+
+**NumPy's own maths, to the bit.** `np.exp`, `np.log`, `np.power` and 17 more float64 functions
+gave the C library's result in the C++, where NumPy runs its own code on many machines; they
+agreed to rounding. They now run the code NumPy runs, so they agree to the bit.
+
+- **What NumPy runs, measured** on 12 releases (1.21 to 2.5), with AVX-512, as an AVX2 machine and
+  at baseline: on Linux x86-64 with AVX-512, Intel's SVML for 19 functions (its high-accuracy
+  routines from NumPy 2.0, the low-accuracy ones in 1.22 to 1.26); NumPy's own `exp` / `log`
+  (Tang's method) on other AVX-512 machines and in NumPy 1.21 to 1.22; NumPy's own `tanh` on any
+  CPU with FMA SIMD (AVX2 PCs, ARM64, so Windows and Apple Silicon too); the C library elsewhere.
+  `sin` / `cos`, `power` / `arctan2` and `tanh` moved between these in particular releases.
+- **NumPy's code, not a rewrite.** The runtime carries NumPy's SVML assembly verbatim
+  (`qtrans_svml_ha.hpp`, `qtrans_svml_la.hpp`) and NumPy's own C kernels (`qtrans_npy_own.hpp`),
+  written by `tools/vendor_svml.py` from NumPy's source distribution (checked against PyPI's
+  SHA-256), under NumPy's BSD-3 licence; `tanh` is a lane-by-lane port of NumPy's kernel.
+  `qtrans_npmath.hpp` picks among them at the first call as NumPy does: platform, CPU, NumPy's
+  `NPY_DISABLE_CPU_FEATURES` / `NPY_ENABLE_CPU_FEATURES` (read as each release reads them), and
+  the NumPy release qtrans ran with (`qtrans_numpy.hpp`, new; `-DQTRANS_NUMPY_VERSION` overrides).
+  On Linux it binds the glibc symbol versions NumPy's wheels call, so even NumPy's C-library
+  path matches, NaN signs included.
+- **Powers as NumPy computes them.** `a ** s` keeps NumPy's shortcuts (-1, 0, 0.5, 1, 2), now also
+  for an exponent known only at run time; `np.power(a, s)` follows its release (no shortcut before
+  2.1, `x * x` from 2.1, all five from 2.3: the 1.x translation of `np.power(x, 2)` as `x * x`
+  was right only from NumPy 2.1); an array exponent that is constant along NumPy's loop is a
+  scalar to it, here too. `np.arctan2` on arrays, and `np.exp2`, `np.cbrt`, `np.arcsinh`,
+  `np.arccosh`, `np.arctanh` on arrays, are translated; `scipy.stats.norm.pdf` uses NumPy's
+  `exp`, as SciPy does.
+- **Checked:** `qtrans.npmath_check` compares the runtime with the running NumPy on every function
+  (arrays, numbers, all bit patterns, the edges, each power form); `tools/npmath_versions.py`
+  runs it on each release and CPU setting ([docs/NUMPY_MATHS.md](docs/NUMPY_MATHS.md): 204,574,320 values on 12 releases in 3 CPU settings, 0 different);
+  `tests/test_npmath.py` runs it on every CI platform; `qtrans doctor` on yours.
+- **`np.sum` faster, the same bits:** its eight partial sums are one AVX-512 register where the
+  CPU has it (not on Windows: GCC bug 54412), added in NumPy's order; checked on every length.
+- **Results:** in the examples, 45 of the 87 functions are bit-identical to Python (32 in 1.0),
+  5 of the 8 Monte Carlo pricers among them; vectorised `np.exp` is 1.2× NumPy's speed (it was
+  3.6× slower). `qtrans doctor` reports which code NumPy's maths runs on your machine.
+- The spec ([docs/SPEC.md](docs/SPEC.md), new section 12.1) says so, and its versioning rule now
+  says what this release does: where 1.x agreed with Python to rounding, a later 1.x may agree
+  to the bit, never the other way.
+
 ## 1.0.2
 
 The benchmark page made self-contained and its protocol complete, after review. What a
