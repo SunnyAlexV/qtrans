@@ -31,7 +31,9 @@ agreed to rounding. They now run the code NumPy runs, so they agree to the bit.
 - **Checked:** `qtrans.npmath_check` compares the runtime with the running NumPy on every function
   (arrays, numbers, all bit patterns, the edges, each power form); `tools/npmath_versions.py`
   runs it on each release and CPU setting ([docs/NUMPY_MATHS.md](docs/NUMPY_MATHS.md): 204,574,320 values on 12 releases in 3 CPU settings, 0 different);
-  `tests/test_npmath.py` runs it on every CI platform; `qtrans doctor` on yours.
+  `tests/test_npmath.py` runs it on every CI platform; `qtrans doctor` on yours. Where a value
+  differs, it reports the bits, and how NumPy and the C++ treat that value alone, in pairs, at each
+  place of a short array and strided, so one report shows where the difference comes from.
 - **`np.sum` faster, the same bits:** its eight partial sums are one AVX-512 register where the
   CPU has it (not on Windows: GCC bug 54412), added in NumPy's order; checked on every length.
 - **`np.sum` of more than 8192 values follows the NumPy release.** Before NumPy 2.3 a reduction

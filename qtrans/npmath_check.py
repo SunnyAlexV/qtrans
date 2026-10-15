@@ -164,6 +164,35 @@ def inputs(fn: str, rng, n: int) -> np.ndarray:
     return np.concatenate([wide, near, bits, edge, rng.uniform(0.9, 1.1, n - 3 * k - len(edge))])
 
 
+def hexbits(v) -> str:
+    return f"{np.float64(v).view(np.uint64):016x}"
+
+
+def layouts(exe: Path, fn: str, x: np.ndarray, j: int) -> str:
+    """One value that differs, in several layouts: NumPy on a number, alone, first or second of a
+    pair, at each place of an 8-value array, at its own place in the array; the C++ the same way."""
+    f = getattr(np, fn)
+    v = x[j]
+    out = [f"np.{fn}(number)={hexbits(f(np.float64(v)))}", f"[x]={hexbits(f(np.array([v]))[0])}",
+           f"[x,1]={hexbits(f(np.array([v, 1.0]))[0])}", f"[1,x]={hexbits(f(np.array([1.0, v]))[1])}"]
+    by_place = []
+    for k in range(8):
+        a = np.ones(8)
+        a[k] = v
+        by_place.append(hexbits(f(a)[k]))
+    out.append("in 8, places 0-7=" + ",".join(by_place))
+    lo = max(0, j - 4)
+    out.append(f"x[{lo}:{j + 5}] place {j - lo}={hexbits(f(x[lo:j + 5])[j - lo])}")
+    out.append(f"strided={hexbits(f(np.repeat(x[j:j + 1], 2)[::2])[0])}")
+    try:
+        cx = [hexbits(run(exe, f"scalar {fn} 1", np.array([v]))[0]), hexbits(run(exe, f"unary {fn} 1", np.array([v]))[0]),
+              ",".join(hexbits(run(exe, f"unary {fn} 8", np.where(np.arange(8) == k, v, 1.0))[k]) for k in range(8))]
+        out.append(f"c++: number={cx[0]} [x]={cx[1]} in 8, places 0-7={cx[2]}")
+    except Exception as e:  # noqa: BLE001 - a report, not a check
+        out.append(f"c++: {e}")
+    return "; ".join(out)
+
+
 def same_bits(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return a.view(np.uint64) == b.view(np.uint64)
 
@@ -179,21 +208,27 @@ def check(n: int = 200_000, seed: int = 0, cxx: str | None = None, verbose: bool
     failures = [f"{fn}: the C++ runs {got.get(fn)}, NumPy runs {p}" for fn, p in want.items() if got.get(fn) != p]
     cases = []
 
-    def record(name, ref, out, exact, x=None):
+    def record(name, ref, out, exact, x=None, fn=None):
         bad = ~same_bits(ref, out)
         cases.append((name, len(ref), int(bad.sum()), exact))
         if exact and bad.any():
             i = np.flatnonzero(bad)[:3]
-            failures.append(f"{name}: {int(bad.sum())} of {len(ref)} differ, e.g. x={x[i] if x is not None else '?'} "
-                            f"numpy={ref[i]} c++={out[i]}")
+            msg = (f"{name}: {int(bad.sum())} of {len(ref)} differ, e.g. x={x[i] if x is not None else '?'} "
+                   f"numpy={ref[i]} c++={out[i]}")
+            # the bits, and how NumPy and the C++ treat that value in other layouts, so one report says why
+            for j in i:
+                msg += f"\n    at {j} of {len(ref)}: x={hexbits(x[j]) if x is not None else '?'} numpy={hexbits(ref[j])} c++={hexbits(out[j])}"
+                if fn is not None and x is not None:
+                    msg += "\n    " + layouts(exe, fn, x, j)
+            failures.append(msg)
 
     for fn in UNARY:
         x = inputs(fn, rng, n)
         exact = want[fn] != "libm" or SAME_LIBM
-        record(f"np.{fn}(array)", getattr(np, fn)(x), run(exe, f"unary {fn} {len(x)}", x), exact, x)
+        record(f"np.{fn}(array)", getattr(np, fn)(x), run(exe, f"unary {fn} {len(x)}", x), exact, x, fn)
         xs = x[:: max(1, len(x) // 3000)]
         ref = np.array([getattr(np, fn)(np.float64(v)) for v in xs])
-        record(f"np.{fn}(number)", ref, run(exe, f"scalar {fn} {len(xs)}", xs), exact, xs)
+        record(f"np.{fn}(number)", ref, run(exe, f"scalar {fn} {len(xs)}", xs), exact, xs, fn)
     # np.power and np.arctan2 of two arrays
     base = np.concatenate([np.abs(inputs("exp", rng, n // 2)), rng.uniform(0, 10, n // 2)])
     ex = np.concatenate([rng.uniform(-50, 50, len(base) // 2),

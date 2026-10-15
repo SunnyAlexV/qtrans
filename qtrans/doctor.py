@@ -181,7 +181,7 @@ def _numpy_maths() -> Check:
              "numpy_own": "NumPy's own kernel", "libm": "the C library"}
     desc = "; ".join(f"{label[k]}: {len(v)} function{'s' if len(v) > 1 else ''}" for k, v in sorted(kinds.items()))
     if r["failures"]:
-        return Check("NumPy's maths", FAIL, desc + " -- " + r["failures"][0][:300],
+        return Check("NumPy's maths", FAIL, desc + " -- " + "\n".join(r["failures"][:2])[:3000],
                      "the C++ does not compute np.exp & co. as NumPy does here: please report this output")
     n = sum(c[1] for c in r["cases"] if c[3])
     return Check("NumPy's maths", OK, f"NumPy runs {desc}; the C++ runs the same ({n:,} values compared, all bit-identical)")
