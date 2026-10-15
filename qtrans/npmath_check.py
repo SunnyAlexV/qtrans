@@ -152,7 +152,10 @@ def inputs(fn: str, rng, n: int) -> np.ndarray:
     edge = np.array([0.0, -0.0, np.inf, -np.inf, np.nan, -np.nan, 1.0, -1.0, 0.5, -0.5, 2.0, 5e-324, -5e-324,
                      2.2250738585072014e-308, 1e-300, 1e300, -1e300, 709.782712893384, 709.7827128933841,
                      -708.3964185322641, -745.1332191019411, -745.1332191019412, 1.0 - 2**-53, 1.0 + 2**-52,
-                     np.pi / 2, np.pi, 1e22, 0.9375, 1.06640625])
+                     np.pi / 2, np.pi, 1e22, 0.9375, 1.06640625]
+                    + list(np.array([0x7ff4000000000001, 0xfff4000000000001, 0x7ffc00000000beef, 0xfffc00000000beef,
+                                     0x7ff0000000000001, 0xffffffffffffffff], dtype=np.uint64).view(np.float64)))
+    # signalling and payload NaNs of both signs: which code quiets a NaN, keeps its sign, keeps its payload
     dom = {"log": np.exp(rng.uniform(-745, 709, k)), "log2": np.exp(rng.uniform(-745, 709, k)),
            "log10": np.exp(rng.uniform(-745, 709, k)), "log1p": np.expm1(rng.uniform(-40, 700, k)),
            "arccosh": 1 + np.exp(rng.uniform(-40, 700, k)), "arcsin": rng.uniform(-1, 1, k),

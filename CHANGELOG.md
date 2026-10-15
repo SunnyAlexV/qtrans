@@ -20,7 +20,8 @@ agreed to rounding. They now run the code NumPy runs, so they agree to the bit.
   `NPY_DISABLE_CPU_FEATURES` / `NPY_ENABLE_CPU_FEATURES` (read as each release reads them), and
   the NumPy release qtrans ran with (`qtrans_numpy.hpp`, new; `-DQTRANS_NUMPY_VERSION` overrides).
   On Linux it binds the glibc symbol versions NumPy's wheels call, so even NumPy's C-library
-  path matches, NaN signs included.
+  path matches, NaN signs included; on Apple ARM it does as NumPy's `npy_sin` / `npy_cos` /
+  `npy_tan` do there, `x - x` for an infinity or NaN (found by CI: Apple's `cos(-nan)` is `+nan`).
 - **Powers as NumPy computes them.** `a ** s` keeps NumPy's shortcuts (-1, 0, 0.5, 1, 2), now also
   for an exponent known only at run time; `np.power(a, s)` follows its release (no shortcut before
   2.1, `x * x` from 2.1, all five from 2.3: the 1.x translation of `np.power(x, 2)` as `x * x`

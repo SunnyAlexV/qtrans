@@ -641,7 +641,10 @@ old `log` gives +NaN for `log(-1.0)`, today's -NaN).
 | `tanh` | NumPy's own (1.23+; SVML in 1.22) | NumPy's own | NumPy's own with AVX2+FMA or on ARM64, else the C library |
 
 SVML's high-accuracy routines from NumPy 2.0, its low-accuracy ones before. NumPy's own
-`exp` / `log` are only built before NumPy 2.4 for AVX512F alone. `docs/NUMPY_MATHS.md` (written by
+`exp` / `log` are only built before NumPy 2.4 for AVX512F alone. Where NumPy's "C library" path
+is not the C library alone, the C++ does what NumPy does: on Linux, the glibc symbol versions
+NumPy's wheels call; on Apple ARM, `sin`, `cos` and `tan` of an infinity or NaN are `x - x`, as
+NumPy computes them there (Apple's `cos(-nan)` is `+nan`, NumPy's is `-nan`). `docs/NUMPY_MATHS.md` (written by
 `tools/npmath_versions.py`) has the check on each release from 1.21 to 2.5, and `qtrans doctor`
 runs it on your machine. On a number, `np.exp(x)` runs the same loop on one value:
 

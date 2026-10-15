@@ -275,7 +275,18 @@ inline double npy_pow(double x, double y) {
 #endif
 }
 
+// NumPy's npy_sin / npy_cos / npy_tan (npymath/npy_math_internal.h.src, every release from 1.21 to
+// 2.5): on arm64 macOS, where Apple's sin, cos and tan don't raise "invalid" for an infinity, NumPy
+// returns x - x for an infinite or NaN x and calls the C library only for finite ones. x - x keeps a
+// NaN's sign and payload (quieted), where Apple's cos(-nan) gives +nan.
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+#define QT_NPM_APPLE_TRIG 1
+#endif
+
 inline double libm1(Fn f, double x) {
+#if defined(QT_NPM_APPLE_TRIG)
+    if ((f == Fn::sin || f == Fn::cos || f == Fn::tan) && !std::isfinite(x)) return x - x;
+#endif
     switch (f) {
         case Fn::exp: return npy_exp(x);
         case Fn::log: return npy_log(x);

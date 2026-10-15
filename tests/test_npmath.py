@@ -67,6 +67,14 @@ def test_power_shortcut_rules_by_release():
     assert "numpy_version >= 20300" in hpp and "numpy_version >= 20100 && s == 2.0" in hpp
 
 
+def test_apple_trig_rule():
+    """NumPy on arm64 macOS (npy_math_internal.h.src, 1.21 to 2.5): sin, cos, tan of a non-finite x
+    are x - x, not the C library's; the C++ the same (checked bit for bit by the macOS CI job)."""
+    hpp = (ROOT / "qtrans" / "runtime" / "qtrans_npmath.hpp").read_text()
+    assert "defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))" in hpp
+    assert "(f == Fn::sin || f == Fn::cos || f == Fn::tan) && !std::isfinite(x)) return x - x;" in hpp
+
+
 def test_svml_headers_are_numpy_s():
     """The vendored assembly says where it came from, and carries NumPy's licence."""
     for v in ("ha", "la"):
